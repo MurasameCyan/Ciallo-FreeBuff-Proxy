@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ciallo FreeBuff Proxy · 管理面板</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<a class="skip" href="#main">跳到主内容</a>
+
+<header class="top">
+  <div class="brand">
+    <span class="mark" aria-hidden="true">✦</span>
+    <span class="name">Ciallo<em>FreeBuff</em></span>
+  </div>
+
+  <div class="top-actions">
+    <span class="build">
+      <span class="bid" id="verBadge" title="版本">—</span>
+    </span>
+    <button type="button" class="btn tiny" id="copyTokens">复制全部 Token</button>
+    <button type="button" class="btn tiny" id="refreshBtn">刷新</button>
+    <button type="button" class="btn tiny icon" id="logoutBtn" title="退出登录" aria-label="退出登录">
+      <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor"
+           stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+        <polyline points="16 17 21 12 16 7"/>
+        <line x1="21" y1="12" x2="9" y2="12"/>
+      </svg>
+    </button>
+  </div>
+</header>
+
+<main id="main">
+
+  <!-- ── 概况 ───────────────────────────────────────────── -->
+  <section class="card" aria-labelledby="h-overview">
+    <div class="card-head"><h2 id="h-overview">概况</h2></div>
+    <div class="stats">
+      <article class="stat">
+        <h3>账号总数</h3>
+        <p class="big" id="sTotal">—</p>
+        <p class="sub" id="sTotalSub">全部已载入账号</p>
+      </article>
+      <article class="stat">
+        <h3>存活</h3>
+        <p class="big ok" id="sAlive">—</p>
+        <p class="sub">token 有效,可用会话</p>
+      </article>
+      <article class="stat">
+        <h3>异常 / 受限</h3>
+        <p class="big warn" id="sWarn">—</p>
+        <p class="sub">额度用完 / 地区受限 / 锁定</p>
+      </article>
+      <article class="stat">
+        <h3>失效 / 封禁</h3>
+        <p class="big bad" id="sBad">—</p>
+        <p class="sub">token 失效 / 已被封禁</p>
+      </article>
+    </div>
+  </section>
+
+  <!-- ── 接入信息 ─────────────────────────────────────── -->
+  <section class="card" aria-labelledby="h-conn">
+    <div class="card-head"><h2 id="h-conn">接入</h2></div>
+
+    <div class="box">
+      <div class="field">
+        <span class="lbl row">接入地址与 Key</span>
+        <span class="copyrow">
+          <button type="button" class="btn tiny" data-copy-proto="openai">OpenAI 地址</button>
+          <button type="button" class="btn tiny" data-copy-proto="anthropic">Anthropic 地址</button>
+          <button type="button" class="btn tiny" data-copy-proto="responses">Responses</button>
+        </span>
+        <span class="copyrow" style="margin-top:8px;">
+          <button type="button" class="btn tiny" data-copy-key>复制 API Key</button>
+          <span class="hint" id="key-mask" style="font-family:var(--mono);"></span>
+        </span>
+      </div>
+    </div>
+
+    <div class="box">
+      <div class="field">
+        <span class="lbl">可用模型 <em class="hint">别名以 ⟶ 标记</em></span>
+        <ul class="models" id="models"></ul>
+        <p class="empty" id="models-empty" hidden>加载中…</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── 账号池 ─────────────────────────────────────────── -->
+  <section class="card" aria-labelledby="h-accounts">
+    <div class="card-head">
+      <h2 id="h-accounts">账号池 <span class="hint" id="acctCount"></span></h2>
+      <button type="button" class="btn tiny" id="btn-testall">全部探测</button>
+    </div>
+    <table class="tbl">
+      <thead><tr><th>账号</th><th>状态</th><th>额度</th><th>操作</th></tr></thead>
+      <tbody id="acctBody"><tr><td colspan="4" class="empty">加载中…</td></tr></tbody>
+    </table>
+  </section>
+
+  <!-- ── 配置 ───────────────────────────────────────────── -->
+  <section class="card" aria-labelledby="h-cfg">
+    <div class="card-head"><h2 id="h-cfg">配置</h2></div>
+
+    <div class="box">
+      <div class="field">
+        <span class="lbl">手动添加账号</span>
+        <form id="addForm" style="display:grid; gap:10px;">
+          <input type="text" id="authToken" placeholder="authToken(必填)" autocomplete="off" spellcheck="false">
+          <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
+            <input type="text" id="email" placeholder="邮箱">
+            <input type="text" id="name" placeholder="备注名">
+          </div>
+          <button type="submit" class="btn primary wide" id="addBtn">添加并探测</button>
+        </form>
+      </div>
+    </div>
+
+    <div class="box">
+      <div class="field">
+        <span class="lbl">Freebuff 登录</span>
+        <p class="hint">生成授权链接(可复制到手机打开),用 Google 账号完成授权后 token 自动加入账号池。</p>
+        <div class="row-actions">
+          <button type="button" class="btn ghost" id="oauthStart">开始授权</button>
+        </div>
+        <div class="login-url" id="loginUrl" hidden></div>
+        <p class="hint" id="oauthStatus"></p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── 模型映射 ───────────────────────────────────────── -->
+  <section class="card" aria-labelledby="h-alias">
+    <div class="card-head">
+      <h2 id="h-alias">模型映射 <span class="hint" id="aliasCount"></span></h2>
+    </div>
+    <p class="hint" style="margin-bottom:10px;">
+      自定义别名 → Freebuff 模型 ID。别名调用不消耗会话、无需 /v1/models 请求,保存即生效。
+    </p>
+    <table class="tbl">
+      <thead><tr><th>别名</th><th>映射到</th><th style="width:70px">操作</th></tr></thead>
+      <tbody id="aliasBody"><tr><td colspan="3" class="empty">加载中…</td></tr></tbody>
+    </table>
+    <div class="alias-add">
+      <input type="text" id="newAlias" placeholder="别名,如 gpt-5" autocomplete="off" spellcheck="false">
+      <input type="text" id="newAliasTarget" placeholder="模型 ID,如 deepseek/deepseek-v4-flash" autocomplete="off" spellcheck="false">
+      <button type="button" class="btn primary" id="aliasAdd">添加</button>
+    </div>
+    <p class="hint" id="aliasMsg" style="margin-top:8px;"></p>
+  </section>
+
+</main>
+
+<div class="toasts" id="toasts" aria-live="polite" aria-atomic="false"></div>
+
+<script type="module" src="/static/app.js"></script>
+</body>
+</html>

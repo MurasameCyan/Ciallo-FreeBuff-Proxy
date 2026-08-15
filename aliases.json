@@ -1,0 +1,7 @@
+{
+  "aliases": {
+    "fast": "deepseek/deepseek-v4-flash",
+    "pro": "deepseek/deepseek-v4-pro",
+    "claude": "anthropic/claude-fable-5"
+  }
+}

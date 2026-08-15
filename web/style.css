@@ -1,0 +1,364 @@
+/* ============================================================
+   Ciallo FreeBuff Proxy — 视觉层
+   设计取向:深色控制台(借鉴 Ciallo-Zen-Proxy)。信息密度优先,
+   强调色只给"活着的东西"(存活账号、主按钮),其余一律降噪。
+   ============================================================ */
+
+:root {
+  --bg:        #0b0e13;
+  --bg-2:      #11151d;
+  --card:      #141922;
+  --card-2:    #1a2029;
+  --line:      #232b37;
+  --line-2:    #2e3846;
+
+  --fg:        #e6ebf2;
+  --fg-2:      #9aa6b8;
+  --fg-3:      #64708333;
+
+  --mint:      #5eead4;
+  --mint-dim:  #2dd4bf;
+  --amber:     #fbbf24;
+  --rose:      #fb7185;
+  --violet:    #a78bfa;
+
+  --r:    14px;
+  --r-sm: 9px;
+  --mono: ui-monospace, "SF Mono", "Cascadia Mono", "JetBrains Mono", Consolas, monospace;
+  --sans: ui-sans-serif, system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+
+  --shadow: 0 1px 2px #0006, 0 8px 24px -12px #0009;
+}
+
+/* 浅色模式:同一套语义变量换值,组件规则不用改 */
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f4f6fa; --bg-2: #eceff5; --card: #fff; --card-2: #f7f9fc;
+    --line: #e2e7ef; --line-2: #cfd7e3;
+    --fg: #131820; --fg-2: #5b6779; --fg-3: #97a3b433;
+    --mint: #0d9488; --mint-dim: #0f766e;
+    --rose: #e11d48; --amber: #b45309; --violet: #7c3aed;
+    --shadow: 0 1px 2px #0f172a0f, 0 8px 24px -14px #0f172a26;
+  }
+}
+
+* { box-sizing: border-box; }
+html { color-scheme: dark light; scrollbar-gutter: stable; }
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  font: 14px/1.55 var(--sans);
+  color: var(--fg);
+  background:
+    radial-gradient(900px 500px at 88% -10%, #5eead40e, transparent 60%),
+    radial-gradient(700px 400px at 5% 0%,  #a78bfa0d, transparent 55%),
+    var(--bg);
+  -webkit-font-smoothing: antialiased;
+}
+
+h1, h2, h3 { margin: 0; font-weight: 600; letter-spacing: -.01em; }
+p { margin: 0; }
+ul, ol { margin: 0; padding: 0; list-style: none; }
+
+:focus-visible {
+  outline: 2px solid var(--mint);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+.skip {
+  position: absolute; left: 12px; top: -50px; z-index: 99;
+  padding: 9px 14px; border-radius: var(--r-sm);
+  background: var(--mint); color: #04201c; font-weight: 600;
+  text-decoration: none; transition: top .16s;
+}
+.skip:focus { top: 12px; }
+
+/* ── 顶栏 ─────────────────────────────────────────────── */
+
+.top {
+  position: sticky; top: 0; z-index: 20;
+  display: flex; align-items: center; gap: 20px;
+  padding: 13px 22px;
+  border-bottom: 1px solid var(--line);
+  background: color-mix(in oklab, var(--bg) 82%, transparent);
+  backdrop-filter: blur(14px);
+}
+
+.brand { display: flex; align-items: center; gap: 9px; }
+.brand .mark {
+  display: grid; place-items: center;
+  width: 27px; height: 27px; border-radius: 8px;
+  background: linear-gradient(140deg, var(--mint), var(--violet));
+  color: #04201c; font-size: 14px;
+}
+.brand .name { font-size: 15px; font-weight: 650; letter-spacing: -.015em; }
+.brand em {
+  font-style: normal; font-weight: 500;
+  color: var(--fg-2); margin-left: 5px;
+  font-family: var(--mono); font-size: 12px;
+}
+
+.top-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; margin-left: auto; }
+.build { display: inline-flex; align-items: stretch; gap: 6px; }
+.bid {
+  display: inline-flex; align-items: center;
+  padding: 0 10px;
+  border: 1px solid var(--line-2); border-radius: var(--r-sm);
+  background: var(--card-2); color: var(--fg-2);
+  font: 12px var(--mono); letter-spacing: .02em;
+  text-decoration: none; white-space: nowrap;
+}
+.bid:hover { color: var(--fg); }
+.bid.new { color: var(--amber); border-color: color-mix(in oklab, var(--amber) 45%, var(--line-2)); }
+
+/* ── 布局 ─────────────────────────────────────────────── */
+
+#main {
+  max-width: 1240px;
+  margin: 0 auto;
+  padding: 22px 22px 56px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 340px;
+  gap: 16px;
+}
+/* 右侧列(第三列)的卡片内部使用 flex 布局,让最后一个小卡片撑满剩余空间 */
+#main > .card:nth-child(1),
+#main > .card:nth-child(2) {
+  display: flex;
+  flex-direction: column;
+}
+#main > .card:nth-child(1) .stats { flex: 1; }
+
+.grid { display: grid; gap: 16px; }
+.span2 { grid-column: span 2; }
+.span3 { grid-column: 1 / -1; }
+
+.fill { display: flex; flex-direction: column; }
+
+@media (max-width: 1080px) {
+  #main { grid-template-columns: minmax(0, 1fr); }
+  .span2 { grid-column: auto; }
+}
+@media (max-width: 660px) {
+  .top { flex-wrap: wrap; }
+  #main { padding: 16px 14px 40px; }
+  .card-head .hint { margin-left: 0; text-align: left; }
+}
+
+/* ── 卡片 ─────────────────────────────────────────────── */
+
+.card {
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  background: linear-gradient(180deg, var(--card), var(--bg-2));
+  box-shadow: var(--shadow);
+  padding: 16px;
+  min-width: 0;
+}
+
+.card-head {
+  display: flex; align-items: baseline; gap: 12px;
+  flex-wrap: wrap; margin-bottom: 13px;
+}
+.card-head h2 { font-size: 14px; }
+.hint { color: var(--fg-2); font-size: 12px; line-height: 1.5; }
+.card-head .hint { margin-left: auto; text-align: right; }
+
+/* ── 概览数字 ─────────────────────────────────────────── */
+
+.stats {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+.stats .stat {
+  padding: 11px 12px 12px;
+  border-radius: var(--r-sm);
+  background: var(--card-2);
+}
+
+.stat {
+  container-type: inline-size;
+  min-width: 0;
+  padding: 0; border-radius: 0; background: transparent;
+}
+.stat h3 {
+  font-size: 11px; font-weight: 500; letter-spacing: .07em;
+  text-transform: uppercase; color: var(--fg-2);
+}
+.stat .big {
+  font-family: var(--mono);
+  font-size: clamp(18px, 18cqi, 27px); font-weight: 600;
+  letter-spacing: -.02em;
+  margin: 7px 0 5px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.stat .big.ok   { color: var(--mint); }
+.stat .big.warn { color: var(--amber); }
+.stat .big.bad  { color: var(--rose); }
+.stat .sub { color: var(--fg-2); font-size: 12px; font-variant-numeric: tabular-nums; }
+
+@media (max-width: 660px) {
+  .stats { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* ── 表格(账号池 / 模型映射) ────────────────────────── */
+
+.tbl { width: 100%; border-collapse: collapse; font-size: 13px; }
+.tbl th {
+  text-align: left; padding: 6px 8px;
+  font-size: 11px; font-weight: 500; letter-spacing: .05em;
+  text-transform: uppercase; color: var(--fg-2);
+  border-bottom: 1px solid var(--line);
+}
+.tbl td { padding: 9px 8px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+.tbl tr:last-child td { border-bottom: 0; }
+.tbl .nm { font-weight: 600; }
+.tbl .mono { font-family: var(--mono); font-size: 11px; color: var(--fg-2); }
+.tbl code { font-family: var(--mono); font-size: 11px; color: var(--fg); }
+.tbl .empty { color: var(--fg-2); font-size: 13px; padding: 14px 2px; }
+
+.actions { display: flex; gap: 6px; }
+
+/* 状态灯 */
+.pill {
+  display: inline-flex; align-items: center; gap: 7px;
+  padding: 4px 10px 4px 8px;
+  border: 1px solid var(--line); border-radius: 999px;
+  background: var(--card);
+  font-size: 12px; color: var(--fg-2); white-space: nowrap;
+}
+.pill .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--fg-2); flex: none; }
+.pill.ok   { color: var(--fg); border-color: color-mix(in oklab, var(--mint) 35%, var(--line)); }
+.pill.ok   .dot { background: var(--mint); box-shadow: 0 0 0 3px color-mix(in oklab, var(--mint) 18%, transparent); }
+.pill.warn .dot { background: var(--amber); }
+.pill.danger .dot { background: var(--rose); }
+.pill.muted .dot { background: var(--fg-2); }
+.pill.warn   { color: var(--amber); border-color: color-mix(in oklab, var(--amber) 35%, var(--line)); }
+.pill.danger { color: var(--rose); border-color: color-mix(in oklab, var(--rose) 35%, var(--line)); }
+
+/* 配额展示 */
+.quota { font-size: 11px; color: var(--fg-2); line-height: 1.6; }
+.quota b { color: var(--fg); font-family: var(--mono); }
+
+/* ── 小卡片(接入 / 配置 / 添加账号) ────────────────── */
+
+.box {
+  padding: 11px 12px 12px;
+  border-radius: var(--r-sm);
+  background: var(--card-2);
+  margin-bottom: 12px;
+}
+.box:last-child { margin-bottom: 0; }
+
+.field { display: block; margin-bottom: 13px; }
+.lbl {
+  display: block; margin-bottom: 6px;
+  font-size: 12px; color: var(--fg-2);
+}
+.lbl.row { display: flex; align-items: center; gap: 10px; }
+.lbl.row .pill { margin-left: auto; padding: 2px 9px 2px 7px; font-size: 11px; }
+.lbl.row .hint { margin-left: auto; font-family: var(--mono); font-size: 11px; font-style: normal; }
+
+input[type=text], input[type=url], input[type=number], input[type=password], textarea {
+  width: 100%; padding: 9px 11px;
+  border: 1px solid var(--line-2); border-radius: var(--r-sm);
+  background: var(--bg); color: var(--fg);
+  font: 13px var(--mono);
+  text-overflow: ellipsis;
+}
+input::placeholder, textarea::placeholder { color: var(--fg-2); opacity: .65; }
+input:focus-visible, textarea:focus-visible { border-color: var(--mint); outline-offset: 1px; }
+textarea { resize: vertical; min-height: 44px; line-height: 1.5; }
+
+.copyrow { display: flex; gap: 7px; flex-wrap: wrap; }
+.copyrow .btn { flex: 1 1 auto; }
+
+.err { color: var(--rose); font-size: 12px; margin-bottom: 10px; }
+
+/* 模型映射添加行 */
+.alias-add { display: flex; gap: 8px; margin-top: 10px; }
+.alias-add input { margin: 0; flex: 1; }
+.alias-add input:first-child { flex: 1; }
+.alias-add input:nth-child(2) { flex: 2; }
+.alias-add .btn { margin: 0; flex: 0 0 auto; }
+
+/* ── 按钮 ─────────────────────────────────────────────── */
+
+.btn {
+  border: 1px solid var(--line-2); border-radius: var(--r-sm);
+  background: var(--card-2); color: var(--fg);
+  padding: 8px 14px; font: 500 13px var(--sans);
+  cursor: pointer;
+  transition: background .13s, border-color .13s, transform .08s;
+}
+.btn:hover:not(:disabled) { background: var(--line); border-color: var(--fg-2); }
+.btn:active:not(:disabled) { transform: translateY(1px); }
+.btn:disabled { opacity: .5; cursor: not-allowed; }
+
+.btn.primary {
+  background: var(--mint); color: #04201c;
+  border-color: transparent; font-weight: 600;
+}
+.btn.primary:hover:not(:disabled) { background: color-mix(in oklab, var(--mint) 88%, #fff); }
+.btn.warn { color: var(--amber); border-color: color-mix(in oklab, var(--amber) 35%, var(--line-2)); }
+.btn.danger { color: var(--rose); border-color: color-mix(in oklab, var(--rose) 35%, var(--line-2)); }
+.btn.ghost { background: transparent; }
+.btn.tiny { padding: 7px 10px; font-size: 12px; }
+.btn.wide { width: 100%; }
+.btn.icon {
+  display: inline-grid; place-items: center;
+  padding: 0 9px; line-height: 0; color: var(--fg-2);
+}
+.btn.icon:hover:not(:disabled) { color: var(--fg); }
+.btn.icon svg { pointer-events: none; }
+
+.row-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 13px; }
+.row-actions .btn { flex: 1 1 auto; }
+
+/* ── 登录框(Freebuff OAuth) ─────────────────────────── */
+
+.login-box { padding: 4px 2px 2px; }
+.login-box p { font-size: 12px; color: var(--fg-2); line-height: 1.7; margin-bottom: 10px; }
+.login-url {
+  background: var(--bg); border: 1px solid var(--line-2); border-radius: var(--r-sm);
+  padding: 9px 11px; font-size: 11px; font-family: var(--mono);
+  word-break: break-all; color: var(--mint); margin-bottom: 10px; display: none;
+  cursor: pointer;
+}
+#oauthStatus { font-size: 12px; }
+
+/* ── Toast ────────────────────────────────────────────── */
+
+.toasts {
+  position: fixed; right: 18px; bottom: 18px; z-index: 60;
+  display: grid; gap: 9px; justify-items: end;
+  pointer-events: none;
+}
+.toast {
+  padding: 10px 15px;
+  border: 1px solid var(--line-2); border-radius: var(--r-sm);
+  background: var(--card); color: var(--fg);
+  font-size: 13px; box-shadow: var(--shadow);
+  animation: rise .22s cubic-bezier(.2,.8,.3,1);
+  max-width: 340px;
+}
+.toast.ok   { border-color: color-mix(in oklab, var(--mint) 45%, transparent); }
+.toast.err  { border-color: color-mix(in oklab, var(--rose) 50%, transparent); }
+
+@keyframes rise { from { opacity: 0; transform: translateY(8px); } }
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation-duration: .01ms !important; transition-duration: .01ms !important; }
+}
+
+/* ── 登录页 ───────────────────────────────────────────── */
+
+body.login { display: grid; place-items: center; padding: 24px; }
+.login-card { width: 100%; max-width: 344px; padding: 22px; }
+.login-card .brand { margin-bottom: 18px; }
+.login-card h2 { font-size: 15px; margin-bottom: 4px; }
+.login-card code { font-family: var(--mono); font-size: 11px; color: var(--fg); }

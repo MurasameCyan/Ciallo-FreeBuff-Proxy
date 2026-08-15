@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>登录 · Ciallo FreeBuff Proxy</title>
+<!-- 和面板同一份样式表:变量、卡片、表单、按钮全是现成的 -->
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="login">
+
+<main class="card login-card" aria-labelledby="h-login">
+  <div class="brand">
+    <span class="mark" aria-hidden="true">✦</span>
+    <span class="name">Ciallo<em>FreeBuff</em></span>
+  </div>
+
+  <h2 id="h-login">登录</h2>
+  <p class="hint" style="margin:4px 0 16px;">管理面板 · 账号池 · 模型映射</p>
+
+  <!-- 真表单 + autocomplete:密码管理器认这个形状 -->
+  <form id="login-form" novalidate>
+    <label class="field">
+      <span class="lbl">管理密码</span>
+      <input type="password" id="f-pass" name="password" autocomplete="current-password"
+             placeholder="ADMIN_PASSWORD 环境变量" required autofocus>
+    </label>
+
+    <p class="err" id="login-err" role="alert" hidden></p>
+    <button type="submit" class="btn primary wide" id="btn-login">进入面板</button>
+  </form>
+
+  <p class="hint" style="margin-top:14px;">
+    未设置 <code>ADMIN_PASSWORD</code> 时面板免密进入,仅建议内网使用。<br>
+    公网部署请务必通过环境变量 <code>ADMIN_PASSWORD</code> 设置密码。
+  </p>
+</main>
+
+<script type="module" src="/static/login.js"></script>
+</body>
+</html>
