@@ -5,10 +5,13 @@
   "private": true,
   "description": "Ciallo-FreeBuff-Proxy — freebuff 免费模型转 OpenAI/Anthropic/Responses 兼容 API，带 Web 管理面板与账号池管理",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node --watch server.js"
+    "start": "node --env-file-if-exists=.env server.js",
+    "dev": "node --watch --env-file-if-exists=.env server.js"
   },
   "engines": {
     "node": ">=20"
+  },
+  "dependencies": {
+    "undici": "6.28.0"
   }
 }

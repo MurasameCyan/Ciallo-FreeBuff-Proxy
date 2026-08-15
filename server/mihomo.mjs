@@ -122,7 +122,17 @@ export function createMihomoManager({ bin, configPath, dataDir, ctrlPort, logger
     return start();
   }
 
-  return { start, stop, restart, isRunning, getVersion, isSpawned };
+  // 端口是由 proxy service 封装管理的实现细节，但状态/日志层仍需要
+  // 展示控制端口。用 getter 暴露只读值，避免调用方修改后与实际监听端口不一致。
+  return {
+    start,
+    stop,
+    restart,
+    isRunning,
+    getVersion,
+    isSpawned,
+    get ctrlPort() { return ctrlPort; },
+  };
 }
 
 // 轻量 fs 辅助（避免顶部 import 一堆）

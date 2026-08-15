@@ -32,10 +32,15 @@ wrangler.toml
 .env
 .env.*
 
+# 本地临时/运行产物统一目录（日志、.tmp、旧截图等），绝不提交
+.local/
+
 # 本地日志分析文件，绝不提交
 logs/
 server.out.log
 server.err.log
+preview.out.log
+preview.err.log
 aliases.json.tmp
 
 # mihomo 运行时数据（订阅缓存、配置），本地运行不提交

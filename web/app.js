@@ -9,6 +9,7 @@ const POLL_MS = 5000;
 
 const S = {
   accounts: [], health: {}, aliases: {},
+  models: [], proxy: null,
   build: '', buildUrl: '', repoUrl: '', trackRef: '', latest: '',
 };
 
@@ -114,7 +115,7 @@ function statePill(s) {
 function quotaHtml(probe) {
   if (!probe || !probe.quota || !probe.quota.length) return '<span class="quota">—</span>';
   return '<div class="quota">' + probe.quota.map(q =>
-    `<div><b>${esc(q.model)}</b> ${q.used}/${q.limit}${q.resetAt ? '<br><span>' + esc(formatResetAt(q.resetAt)) + '</span>' : ''}</div>`
+    `<div><b>${esc(q.model)}</b><span class="quota-count">已用 ${esc(q.used ?? '—')} / 总量 ${esc(q.limit ?? '—')}</span>${q.resetAt ? '<span class="quota-reset">重置 ' + esc(formatResetAt(q.resetAt)) + '</span>' : ''}</div>`
   ).join('') + '</div>';
 }
 
@@ -122,7 +123,7 @@ function quotaHtml(probe) {
 // 去掉 T / 毫秒 / 英文 Z，统一 YYYY-MM-DD HH:mm（本地时区，北京时间即 UTC+8）
 function formatResetAt(iso) {
   const d = new Date(iso);
-  if (isNaN(d.getTime())) return iso;
+  if (isNaN(d.getTime())) return '日期未知';
   const pad = (n) => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
@@ -144,9 +145,11 @@ function renderStats() {
 }
 
 function renderAccounts() {
+  const table = document.querySelector('.account-table');
+  table.classList.toggle('is-empty', S.accounts.length === 0);
   $('acctCount').textContent = `${S.accounts.length} 个`;
   if (!S.accounts.length) {
-    $('acctBody').innerHTML = '<tr><td colspan="4" class="empty">暂无账号,在「配置」里添加</td></tr>';
+    $('acctBody').innerHTML = '<tr><td colspan="4" class="empty">暂无账号，请切换到「添加」</td></tr>';
     return;
   }
   $('acctBody').innerHTML = S.accounts.map(a => {
@@ -224,18 +227,110 @@ async function saveAliases(next) {
 function renderModels() {
   const ul = $('models');
   const list = Array.isArray(S.models) ? S.models : [];
+  const modelCount = $('modelCount');
+  if (modelCount) modelCount.textContent = `${list.length} 个`;
   $('models-empty').hidden = list.length > 0;
   ul.replaceChildren(...list.map((m) => {
     const li = document.createElement('li');
     li.textContent = m.id;
     li.title = li.textContent;
-    // 只有免费账号实测可用的模型打 free 胶囊；其余模型不带任何 tag
-    if (m.free) li.append(' ', tag('pill free', 'free'));
+    // 只有免费账号实测可用的模型打“免费”胶囊；其余模型不带任何 tag
+    if (m.free) li.append(' ', tag('pill free', '免费'));
     return li;
   }));
   // 溢出项给键盘可达
   for (const li of ul.children) {
     if (li.scrollWidth > li.clientWidth + 1) li.tabIndex = 0;
+  }
+}
+
+/** 代理订阅状态只显示服务端脱敏结果，浏览器不接触完整订阅 URL。 */
+function renderProxy() {
+  const p = S.proxy || {};
+  const labels = {
+    disabled: '未配置', starting: '启动中', ready: '已连接',
+    error: '异常', stopped: '已停止', muted: '未知',
+  };
+  const state = String(p.state || (p.configured ? 'starting' : 'disabled')).toLowerCase();
+  const status = $('proxyStatus');
+  if (status) {
+    status.className = `proxy-status ${['disabled', 'starting', 'ready', 'error', 'stopped'].includes(state) ? state : 'muted'}`;
+    status.textContent = labels[state] || '未知';
+  }
+  const put = (id, value, fallback = '—') => {
+    const el = $(id);
+    if (el) el.textContent = value == null || value === '' ? fallback : String(value);
+  };
+  put('proxyUrl', p.urlMasked || p.subscriptionUrlMasked, p.configured ? '已配置（地址已隐藏）' : '未配置');
+  put('proxyNodeCount', p.nodeCount, '—');
+  put('proxyHealthyCount', p.healthyCount, '—');
+  put('proxyCurrentNode', p.currentNode, state === 'ready' ? '自动选择' : '直连');
+  put('proxyVersion', p.version ? `mihomo ${p.version}` : '', '—');
+  put('proxyLastRefresh', p.lastRefreshAt ? formatResetAt(p.lastRefreshAt) : '', '—');
+  put('proxyError', p.error, '');
+  const msg = $('proxyMessage');
+  if (msg) msg.textContent = p.envLocked ? '订阅由环境变量管理，面板仅可查看' : '';
+  const subscriptionInput = $('proxySubscription');
+  const subscriptionSave = $('proxySubscriptionSave');
+  if (subscriptionInput) {
+    subscriptionInput.disabled = Boolean(p.envLocked) || state === 'starting';
+    subscriptionInput.placeholder = p.envLocked ? '由 SUBSCRIPTION_URL 环境变量管理' : '粘贴订阅链接，保存后自动解析';
+  }
+  if (subscriptionSave) subscriptionSave.disabled = Boolean(p.envLocked) || state === 'starting';
+
+  const rawNodes = Array.isArray(p.nodes) ? p.nodes : [];
+  // 后端已按延迟升序排序（失效节点垫底），前端只如实呈现顺序与延迟。
+  const nodes = rawNodes.map((node) => typeof node === 'string'
+    ? { name: node, healthy: null, delay: null }
+    : { name: String(node?.name || node?.id || ''), healthy: node?.healthy ?? null, delay: node?.delay ?? null }
+  ).filter((node) => node.name);
+  const mode = String(p.mode || p.nodeMode || 'auto').toLowerCase() === 'manual' ? 'manual' : 'auto';
+  const selectedNode = String(p.selectedNode || p.currentNode || '');
+  const nodeSelect = $('proxyNode');
+  if (nodeSelect) {
+    const signature = nodes.map((node) => `${node.name}:${node.healthy}:${node.delay ?? ''}`).join('|');
+    if (nodeSelect.dataset.signature !== signature) {
+      nodeSelect.dataset.signature = signature;
+      const values = nodes.length ? nodes : [{ name: '', healthy: null, delay: null }];
+      nodeSelect.replaceChildren(...values.map((node) => {
+        const option = document.createElement('option');
+        option.value = node.name;
+        const dot = node.healthy === true ? '● ' : node.healthy === false ? '○ ' : '';
+        const delay = Number.isFinite(node.delay) && node.delay > 0 ? ` · ${node.delay}ms` : '';
+        option.textContent = node.name ? `${dot}${node.name}${delay}` : '暂无可用节点';
+        return option;
+      }));
+    }
+    if (selectedNode && nodes.some((node) => node.name === selectedNode)) nodeSelect.value = selectedNode;
+    nodeSelect.disabled = mode !== 'manual' || !nodes.length || state !== 'ready';
+  }
+  for (const [id, active] of [['proxyModeAuto', mode === 'auto'], ['proxyModeManual', mode === 'manual']]) {
+    const btn = $(id);
+    if (!btn) continue;
+    btn.classList.toggle('active', active);
+    btn.setAttribute('aria-pressed', String(active));
+    btn.disabled = state !== 'ready';
+  }
+
+  const healthEnabled = p.autoHealthCheck ?? p.healthCheck?.enabled ?? false;
+  const rawInterval = Number(p.healthCheckInterval ?? p.healthCheck?.interval ?? 300);
+  const healthToggle = $('proxyHealthEnabled');
+  const healthSelect = $('proxyHealthInterval');
+  if (healthToggle) {
+    healthToggle.checked = Boolean(healthEnabled);
+    healthToggle.disabled = state === 'disabled' || state === 'starting';
+  }
+  if (healthSelect) {
+    const seconds = rawInterval > 3600 ? Math.round(rawInterval / 1000) : rawInterval;
+    const value = String(Number.isFinite(seconds) && seconds > 0 ? seconds : 300);
+    if (![...healthSelect.options].some((option) => option.value === value)) {
+      const option = document.createElement('option');
+      option.value = value;
+      option.textContent = `${value} 秒`;
+      healthSelect.append(option);
+    }
+    healthSelect.value = value;
+    healthSelect.disabled = !healthEnabled || state === 'disabled' || state === 'starting';
   }
 }
 
@@ -245,6 +340,7 @@ async function refresh() {
   try {
     const cfg = await api('/config').catch(() => null);
     const acc = await api('/accounts').catch(() => null);
+    const proxy = await api('/proxy').catch(() => null);
     if (cfg) {
       S.aliases = cfg.aliases || {};
       S.apiKey = cfg.apiKey || 'freebuff-default-key';
@@ -255,10 +351,11 @@ async function refresh() {
       renderBuild();
     }
     if (acc) { S.accounts = acc.accounts || []; S.health = acc.health || {}; S.readonly = acc.readonly; }
+    if (proxy) S.proxy = proxy.proxy || proxy;
     // /v1/models 是 worker 路由,带 key 头直连
     const models = await rawApi('/v1/models', { headers: { 'Authorization': 'Bearer ' + S.apiKey } }).catch(() => null);
     if (models) S.models = models.data || [];
-    renderStats(); renderAccounts(); renderAliases(); renderModels();
+    renderStats(); renderAccounts(); renderAliases(); renderModels(); renderProxy();
   } catch (e) {
     if (e.message !== '未登录') toast('加载失败:' + e.message, 'err');
   }
@@ -270,11 +367,27 @@ function wire() {
   // 账号池分段切换:管理 | 添加
   const segBtns = document.querySelectorAll('.seg-btn[data-pane]');
   const panes = document.querySelectorAll('.pane[data-pane]');
+  const activatePane = (btn, focus = false) => {
+    const pane = btn.dataset.pane;
+    segBtns.forEach(b => {
+      const active = b === btn;
+      b.classList.toggle('active', active);
+      b.setAttribute('aria-selected', active);
+      b.tabIndex = active ? 0 : -1;
+    });
+    panes.forEach(p => p.hidden = p.dataset.pane !== pane);
+    if (focus) btn.focus();
+  };
   segBtns.forEach(btn => {
-    btn.addEventListener('click', () => {
-      const pane = btn.dataset.pane;
-      segBtns.forEach(b => { b.classList.toggle('active', b === btn); b.setAttribute('aria-selected', b === btn); });
-      panes.forEach(p => p.hidden = p.dataset.pane !== pane);
+    btn.addEventListener('click', () => activatePane(btn));
+    btn.addEventListener('keydown', (event) => {
+      if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+      event.preventDefault();
+      const current = [...segBtns].indexOf(btn);
+      const next = event.key === 'Home' ? 0
+        : event.key === 'End' ? segBtns.length - 1
+        : (current + (event.key === 'ArrowRight' ? 1 : -1) + segBtns.length) % segBtns.length;
+      activatePane(segBtns[next], true);
     });
   });
 
@@ -348,6 +461,85 @@ function wire() {
     const alive = Object.values(S.health).filter(h => h.state === 'ok').length;
     return `${alive}/${S.accounts.length} 存活`;
   }));
+
+  // 代理订阅：完整 URL 只随保存请求发给服务端，后续轮询只接收脱敏地址。
+  const proxyForm = $('proxySubscriptionForm');
+  const proxySave = $('proxySubscriptionSave');
+  if (proxyForm && proxySave) {
+    proxyForm.addEventListener('submit', (event) => {
+      event.preventDefault();
+      run(proxySave, '保存订阅', async () => {
+        const value = $('proxySubscription').value.trim();
+        let parsed;
+        try { parsed = new URL(value); } catch { throw new Error('请输入有效的订阅地址'); }
+        if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('订阅地址只支持 http 或 https');
+        const saved = await api('/proxy/subscription', {
+          method: 'PUT', body: JSON.stringify({ url: value }),
+        });
+        // 后端在这个单一请求内完成持久化、重载 mihomo 与订阅解析。
+        S.proxy = saved?.proxy || saved || S.proxy;
+        $('proxySubscription').value = '';
+        renderProxy();
+        return '节点已重新解析';
+      });
+    });
+  }
+
+  const saveProxyNode = (btn, mode, node = '') => run(btn, '切换节点', async () => {
+    const selected = node || $('proxyNode')?.value || '';
+    if (mode === 'manual' && !selected) throw new Error('暂无节点，请先刷新订阅');
+    const r = await api('/proxy/node', {
+      method: 'PUT', body: JSON.stringify({ mode, node: mode === 'manual' ? selected : '' }),
+    });
+    S.proxy = r?.proxy || r || S.proxy;
+    renderProxy();
+    return mode === 'auto' ? '已启用自动选择' : `已固定 ${selected}`;
+  });
+  $('proxyModeAuto')?.addEventListener('click', (event) => saveProxyNode(event.currentTarget, 'auto'));
+  $('proxyModeManual')?.addEventListener('click', (event) => saveProxyNode(event.currentTarget, 'manual'));
+  $('proxyNode')?.addEventListener('change', async (event) => {
+    const select = event.currentTarget;
+    const node = select.value;
+    if (!node) return;
+    select.disabled = true;
+    try {
+      const r = await api('/proxy/node', {
+        method: 'PUT', body: JSON.stringify({ mode: 'manual', node }),
+      });
+      S.proxy = r?.proxy || r || S.proxy;
+      toast(`已切换到 ${node}`, 'ok');
+    } catch (e) {
+      toast(`切换节点失败:${e.message}`, 'err');
+    } finally {
+      renderProxy();
+      refresh();
+    }
+  });
+
+  let healthSaving = false;
+  const saveProxyHealth = async () => {
+    if (healthSaving) return;
+    healthSaving = true;
+    const toggle = $('proxyHealthEnabled');
+    const interval = $('proxyHealthInterval');
+    toggle.disabled = true; interval.disabled = true;
+    try {
+      const r = await api('/proxy/health', {
+        method: 'PUT',
+        body: JSON.stringify({ enabled: toggle.checked, interval: Number(interval.value) }),
+      });
+      S.proxy = r?.proxy || r || S.proxy;
+      toast('自动测活设置已保存', 'ok');
+    } catch (e) {
+      toast(`保存测活设置失败:${e.message}`, 'err');
+    } finally {
+      healthSaving = false;
+      renderProxy();
+      refresh();
+    }
+  };
+  $('proxyHealthEnabled')?.addEventListener('change', saveProxyHealth);
+  $('proxyHealthInterval')?.addEventListener('change', saveProxyHealth);
 
   // 手动添加账号
   $('addForm').addEventListener('submit', (e) => {

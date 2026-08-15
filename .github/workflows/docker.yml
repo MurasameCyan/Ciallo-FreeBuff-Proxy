@@ -21,8 +21,13 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      # 零依赖，没有 npm install 这一步
+      # 代理出站依赖 undici；使用锁文件确保测试与镜像解析一致。
+      - run: npm ci --ignore-scripts
+      - run: node --check web/app.js
+      - run: node --check web/login.js
       - run: node test/unit.test.mjs
+      - run: node test/proxy.test.mjs
+      - run: node test/web-layout.test.mjs
 
   build:
     needs: test

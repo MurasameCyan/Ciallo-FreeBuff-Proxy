@@ -39,8 +39,9 @@ RUN apk add --no-cache ca-certificates su-exec
 COPY --from=kernel /out/mihomo /usr/local/bin/mihomo
 
 WORKDIR /app
-# 没有依赖要装（本项目零 npm 依赖），直接拷源码
-COPY package.json ./
+# 代理出站使用 undici.ProxyAgent；锁定依赖版本，保证本地、CI 与镜像行为一致。
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev --ignore-scripts
 COPY worker.js ./
 COPY server.js ./
 COPY server ./server

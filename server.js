@@ -4,7 +4,20 @@ import { resolve, dirname, join, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import crypto from 'node:crypto';
 import { buildInfo, checkUpdate } from './server/build.mjs';
-import { initProxy, stopProxy, setLogger, getUpstreamFetch, mihomo } from './server/proxy.mjs';
+import {
+  initProxy,
+  stopProxy,
+  setLogger,
+  getUpstreamFetch,
+  getProxyStatus,
+  setProxySubscription,
+  setProxyNode,
+  setProxyHealth,
+  refreshSubscription,
+  getConfiguredSubscription,
+  isProxyEnvLocked,
+  mihomo,
+} from './server/proxy.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -57,7 +70,9 @@ const CFG = {
   debug: env.FREEBUFF_DEBUG === 'true',
   // 出口代理订阅地址（可选）。配置后启动 mihomo 内核，上游流量经订阅节点出站。
   // 格式：机场订阅 URL（clash/v2ray base64 均可，mihomo proxy-providers 自动解析）
-  subscriptionUrl: env.SUBSCRIPTION_URL || '',
+  // 代理服务会把 data/.mihomo/proxy-settings.json 合并进来；环境变量
+  // 非空时由服务端锁定并优先于持久化配置。
+  subscriptionUrl: getConfiguredSubscription(),
 };
 
 // === API Key 持久化（面板「重置 Key」生成的随机 key 存这里，env 未设时生效） ===
@@ -404,6 +419,35 @@ function loadModelAliases() {
   return merged;
 }
 
+// 代理管理接口的错误只返回可操作的中文提示；订阅 URL、控制器响应等内部
+// 细节不能从管理面板泄漏。proxy service 本身也会对启动/刷新错误脱敏，
+// 这里再做一层边界保护，避免未来新增实现把原始异常直接吐给浏览器。
+function proxyApiError(res, error) {
+  const code = error?.code || '';
+  const raw = String(error?.message || '代理操作失败');
+  if (code === 'ENV_LOCKED') return err(res, 409, 'SUBSCRIPTION_URL 由环境变量配置，面板不可覆盖', 'env_locked');
+  if (/订阅地址|必须以|必须是|模式|间隔|整数|节点不存在|选择节点|enabled/i.test(raw)) {
+    return err(res, 400, raw.slice(0, 180), 'invalid_proxy_config');
+  }
+  if (/mihomo 未运行|内核未运行/i.test(raw)) {
+    return err(res, 409, 'mihomo 尚未运行，请先配置并刷新订阅', 'proxy_not_ready');
+  }
+  return err(res, 503, '代理暂不可用，请稍后重试', 'proxy_unavailable');
+}
+
+async function readJsonObject(req) {
+  let body;
+  try {
+    body = JSON.parse((await readBody(req)).toString('utf-8') || '{}');
+  } catch {
+    throw Object.assign(new Error('Invalid JSON'), { code: 'INVALID_JSON' });
+  }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    throw Object.assign(new Error('请求体必须是 JSON 对象'), { code: 'INVALID_JSON' });
+  }
+  return body;
+}
+
 // worker.js 读取的 env（含动态账号池 → FREEBUFF_TOKEN）
 function buildWorkerEnv() {
   const tokens = allTokens();
@@ -460,6 +504,82 @@ async function handleWebApi(req, res, url) {
 
   // ---------- 以下接口需要管理员会话 ----------
   if (!requireAdmin(req, res)) return err(res, 401, '未登录或会话已过期', 'auth_error');
+
+  // ---------- 出口代理订阅 / 节点 ----------
+  // GET /_api/proxy
+  // PUT /_api/proxy[/subscription] { url }
+  // POST /_api/proxy/refresh
+  // PUT /_api/proxy/node { mode: auto|manual, node? }
+  // PUT /_api/proxy/health { enabled, interval }
+  // 旧面板曾使用 PUT /_api/proxy，保留为订阅设置的兼容入口。
+  if (seg === 'proxy') {
+    if (method === 'GET' && !sub) {
+      try {
+        const proxy = await getProxyStatus();
+        return json(res, 200, { ...proxy, envLocked: proxy.envLocked ?? isProxyEnvLocked() });
+      } catch (e) {
+        return proxyApiError(res, e);
+      }
+    }
+
+    if (method === 'POST' && sub === 'refresh') {
+      try {
+        const proxy = await refreshSubscription();
+        return json(res, 200, { ok: proxy.ok, proxy });
+      } catch (e) {
+        return proxyApiError(res, e);
+      }
+    }
+
+    if (method === 'PUT' && (!sub || sub === 'subscription')) {
+      let body;
+      try { body = await readJsonObject(req); } catch (e) {
+        return e.code === 'INVALID_JSON' ? err(res, 400, e.message) : proxyApiError(res, e);
+      }
+      const value = body.url ?? body.subscriptionUrl;
+      if (value === undefined) return err(res, 400, '缺少订阅地址字段 url', 'invalid_proxy_config');
+      try {
+        const proxy = await setProxySubscription(value);
+        CFG.subscriptionUrl = getConfiguredSubscription();
+        return json(res, 200, { ok: proxy.ok, proxy });
+      } catch (e) {
+        return proxyApiError(res, e);
+      }
+    }
+
+    if (method === 'PUT' && sub === 'node') {
+      let body;
+      try { body = await readJsonObject(req); } catch (e) {
+        return e.code === 'INVALID_JSON' ? err(res, 400, e.message) : proxyApiError(res, e);
+      }
+      const mode = body.mode ?? body.nodeMode;
+      const node = body.node ?? body.selectedNode;
+      try {
+        const proxy = await setProxyNode({ mode, node });
+        return json(res, 200, { ok: proxy.ok, proxy });
+      } catch (e) {
+        return proxyApiError(res, e);
+      }
+    }
+
+    if (method === 'PUT' && sub === 'health') {
+      let body;
+      try { body = await readJsonObject(req); } catch (e) {
+        return e.code === 'INVALID_JSON' ? err(res, 400, e.message) : proxyApiError(res, e);
+      }
+      try {
+        const proxy = await setProxyHealth({
+          enabled: body.enabled,
+          interval: body.interval ?? body.healthCheckInterval,
+        });
+        return json(res, 200, { ok: proxy.ok, proxy });
+      } catch (e) {
+        return proxyApiError(res, e);
+      }
+    }
+
+    return err(res, 405, 'method not allowed');
+  }
 
   // 账号池
   if (seg === 'accounts') {
@@ -676,15 +796,27 @@ if (!env.MODEL_ALIASES_FILE) {
   }
 }
 
-// 出口代理（可选）：配了 SUBSCRIPTION_URL 才起 mihomo，否则保持直连。
-// mihomo 就绪后 getUpstreamFetch() 返回走代理的 fetch，注入 worker env。
-if (CFG.subscriptionUrl) {
+// 出口代理（可选）：订阅既可以来自 SUBSCRIPTION_URL，也可以来自
+// data/.mihomo/proxy-settings.json。环境变量非空时由 proxy service 锁定，
+// 面板不能覆盖；内核/订阅失败则保持 getUpstreamFetch() 为空，上游直连。
+const startupSubscription = getConfiguredSubscription();
+if (startupSubscription) {
   setLogger((level, msg) => console.log(`[${level}] ${msg}`));
-  await initProxy(CFG.subscriptionUrl)
-    .then(() => console.log(`[ciallo] proxy: mihomo @ mixed-port ${mihomo.mixedPort} (ctrl ${mihomo.ctrlPort})`))
-    .catch((e) => console.error(`[ciallo] proxy 初始化失败(保持直连): ${e.message}`));
+  try {
+    const proxyFetch = await initProxy();
+    const proxyStatus = await getProxyStatus();
+    CFG.subscriptionUrl = getConfiguredSubscription();
+    if (proxyFetch && proxyStatus.ok) {
+      console.log(`[ciallo] proxy: mihomo @ mixed-port ${mihomo.mixedPort} (ctrl ${mihomo.ctrlPort})`);
+    } else {
+      console.error(`[ciallo] proxy 初始化失败(保持直连): ${proxyStatus.error || 'mihomo 未就绪'}`);
+    }
+  } catch (e) {
+    // 初始化异常不能阻止主服务启动；代理服务内部会尽量清理内核并回落直连。
+    console.error(`[ciallo] proxy 初始化失败(保持直连): ${String(e?.message || e).slice(0, 180)}`);
+  }
 } else {
-  console.log('[ciallo] proxy: 未配置 SUBSCRIPTION_URL，上游直连');
+  console.log('[ciallo] proxy: 未配置订阅，上游直连');
 }
 
 // 加载 worker（顶层 await，Node 20+ 支持）
