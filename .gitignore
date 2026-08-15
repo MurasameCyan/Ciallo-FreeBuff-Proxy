@@ -33,6 +33,12 @@ wrangler.toml
 
 # 本地日志分析文件，绝不提交
 logs/
+server.out.log
+server.err.log
+aliases.json.tmp
+
+# mihomo 运行时数据（订阅缓存、配置），本地运行不提交
+.mihomo/
 
 # Hermes 本地计划、实验补丁和会话资料，仅本地保存
 .hermes/

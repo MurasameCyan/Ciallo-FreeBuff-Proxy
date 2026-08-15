@@ -3,6 +3,8 @@ import { readFileSync, readdirSync, existsSync, writeFileSync, mkdirSync, statSy
 import { resolve, dirname, join, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import crypto from 'node:crypto';
+import { buildInfo, checkUpdate } from './server/build.mjs';
+import { initProxy, stopProxy, setLogger, getUpstreamFetch, mihomo } from './server/proxy.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -36,7 +38,25 @@ const CFG = {
   // 是否禁止前端修改账号池（只读部署）
   readonlyAccounts: env.FREEBUFF_READONLY === 'true',
   debug: env.FREEBUFF_DEBUG === 'true',
+  // 出口代理订阅地址（可选）。配置后启动 mihomo 内核，上游流量经订阅节点出站。
+  // 格式：机场订阅 URL（clash/v2ray base64 均可，mihomo proxy-providers 自动解析）
+  subscriptionUrl: env.SUBSCRIPTION_URL || '',
 };
+
+// === API Key 持久化（面板「重置 Key」生成的随机 key 存这里，env 未设时生效） ===
+const KEY_FILE = resolve(__dirname, 'credentials/server-key.txt');
+function currentApiKey() {
+  if (env.FREEBUFF_API_KEY) return env.FREEBUFF_API_KEY; // env 显式配置优先
+  try {
+    const saved = readFileSync(KEY_FILE, 'utf-8').trim();
+    if (saved) return saved;
+  } catch {}
+  return 'freebuff-default-key';
+}
+function saveApiKey(key) {
+  ensureCredDir();
+  writeFileSync(KEY_FILE, key + '\n', 'utf-8');
+}
 
 // === 账号池存储（JSON 文件，结构对齐 freebuff_tools/extract_freebuff.py） ===
 function ensureCredDir() {
@@ -166,8 +186,10 @@ async function upstreamJson(method, path, token, body, extraHeaders = {}, timeou
   Object.assign(headers, extraHeaders);
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  // 走代理（配了订阅时）或直连：getUpstreamFetch() 无代理返回 null → 用全局 fetch
+  const upstreamFetch = getUpstreamFetch() || fetch;
   try {
-    const resp = await fetch(CFG.codebuffApi + path, {
+    const resp = await upstreamFetch(CFG.codebuffApi + path, {
       method, headers, body: body !== undefined ? JSON.stringify(body) : undefined, signal: ctrl.signal,
     });
     const text = await resp.text();
@@ -362,12 +384,14 @@ function buildWorkerEnv() {
   const aliasStr = [...loadModelAliases().entries()].map(([k, v]) => `${k}=${v}`).join(',');
   return {
     FREEBUFF_TOKEN: tokens.join(','),
-    FREEBUFF_API_KEY: env.FREEBUFF_API_KEY || 'freebuff-default-key',
+    FREEBUFF_API_KEY: currentApiKey(),
     API_KEY: env.API_KEY || '',
     FREEBUFF_DEBUG: env.FREEBUFF_DEBUG || 'false',
     CODEBUFF_API: env.CODEBUFF_API || '',
     RELAY_KEY: env.RELAY_KEY || '',
     MODEL_ALIASES: aliasStr,
+    // 出口代理注入（有订阅且 mihomo 就绪时返回走代理的 fetch；否则 undefined → worker 直连）
+    FREEBUFF_UPSTREAM_FETCH: getUpstreamFetch() || undefined,
   };
 }
 
@@ -520,17 +544,42 @@ async function handleWebApi(req, res, url) {
 
   // ---------- 其他 ----------
   if (seg === 'config' && method === 'GET') {
-    const workerApiKey = env.FREEBUFF_API_KEY || 'freebuff-default-key';
+    const workerApiKey = currentApiKey();
     return json(res, 200, {
       readonly: CFG.readonlyAccounts,
       debug: CFG.debug,
       version: '2.0.0',
       modelCount: 0,
       apiKey: workerApiKey,
+      // env 配置的 key 是否允许面板重置（env 显式配置时不重置，改它会和部署环境冲突）
+      keyRotatable: !env.FREEBUFF_API_KEY,
       // 自定义模型映射（只读展示；编辑走 aliases.json / env）
       aliases: Object.fromEntries(loadModelAliases()),
       aliasesFile: CFG.aliasFile,
+      // build / buildUrl / repoUrl / trackRef：面板右上角那个 hash 徽标。
+      // 搭 config 轮询的车带过去，不另开一个路由 —— 它是常量，不值得再来一次请求
+      ...buildInfo(),
     });
+  }
+
+  // ---------- 检查更新（只在用户点的时候出站，消耗 GitHub 匿名配额） ----------
+  // 错误统一走返回值的 error 字段（HTTP 仍 200）：检查失败不该让按钮变成 500，
+  // 「为什么失败」要能显示给用户看（限流 / 分支不存在 / 网络）。
+  if (seg === 'check-update' && method === 'POST') {
+    const r = await checkUpdate();
+    return json(res, 200, r);
+  }
+
+  // ---------- API Key 重置（生成随机 key，写入 credentials/server-key.txt） ----------
+  if (seg === 'key' && sub === 'rotate' && method === 'POST') {
+    if (env.FREEBUFF_API_KEY) return err(res, 403, 'FREEBUFF_API_KEY 由环境变量配置，面板不可重置', 'readonly_key');
+    const key = 'fb-' + crypto.randomBytes(24).toString('base64url');
+    try {
+      saveApiKey(key);
+    } catch (e) {
+      return err(res, 500, '写入 key 失败: ' + e.message, 'io_error');
+    }
+    return json(res, 200, { ok: true, apiKey: key });
   }
 
   // ---------- 自定义模型映射管理（写入 aliases.json，热生效） ----------
@@ -581,6 +630,17 @@ function sanitizeUser(user) {
 // ===========================================================================
 ensureCredDir();
 
+// 出口代理（可选）：配了 SUBSCRIPTION_URL 才起 mihomo，否则保持直连。
+// mihomo 就绪后 getUpstreamFetch() 返回走代理的 fetch，注入 worker env。
+if (CFG.subscriptionUrl) {
+  setLogger((level, msg) => console.log(`[${level}] ${msg}`));
+  await initProxy(CFG.subscriptionUrl)
+    .then(() => console.log(`[ciallo] proxy: mihomo @ mixed-port ${mihomo.mixedPort} (ctrl ${mihomo.ctrlPort})`))
+    .catch((e) => console.error(`[ciallo] proxy 初始化失败(保持直连): ${e.message}`));
+} else {
+  console.log('[ciallo] proxy: 未配置 SUBSCRIPTION_URL，上游直连');
+}
+
 // 加载 worker（顶层 await，Node 20+ 支持）
 const worker = await import('./worker.js');
 const handler = worker.default;
@@ -590,4 +650,15 @@ server.listen(CFG.port, CFG.host, () => {
   console.log(`[ciallo] listening on http://${CFG.host}:${CFG.port}`);
   console.log(`[ciallo] web panel: http://localhost:${CFG.port}/  (admin password: ${CFG.adminPassword ? 'set' : 'NOT SET (内网建议设置)'})`);
   console.log(`[ciallo] accounts: ${n} (file: ${CFG.credFile})`);
+});
+
+// 优雅退出：停 mihomo（容器 SIGTERM 时）
+process.on('SIGTERM', async () => {
+  console.log('[ciallo] SIGTERM, 正在退出...');
+  try { await stopProxy(); } catch {}
+  process.exit(0);
+});
+process.on('SIGINT', async () => {
+  try { await stopProxy(); } catch {}
+  process.exit(0);
 });

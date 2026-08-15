@@ -1,7 +1,7 @@
 const CODEBUFF_API = "https://www.codebuff.com";
 const DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
 const DEFAULT_API_KEY = "freebuff-default-key";
-const VERSION = "1.9.0";
+const VERSION = "1.9.1";
 const CONTEXT_PRUNER_AGENT = "context-pruner";
 
 // 自定义模型映射（alias → freebuff 模型 id）。
@@ -349,6 +349,16 @@ const MODELS = [
   { id: "mimo/mimo-v2.5", session: "mimo/mimo-v2.5", agent: "base2-free-mimo", upstream: "mimo/mimo-v2.5" },
 ];
 
+// 实测（2026-08-15）免费账号可用的模型白名单：
+//   deepseek-v4-flash / mimo-v2.5 —— 其余模型（v4-pro、luna、m3、glm 等）
+//   上游返回 409 session_model_mismatch / 403 free_mode_invalid_agent_model，
+//   "Limited free access is only available with DeepSeek V4 Flash or MiMo 2.5"。
+//   面板 /v1/models 只对这两个打 free tag。
+const FREE_AVAILABLE_MODELS = new Set([
+  "deepseek/deepseek-v4-flash",
+  "mimo/mimo-v2.5",
+]);
+
 // ---------------------------------------------------------------------------
 // 额度池说明（逆向自官方源码 freebuff-models.ts，2026-08-10 实证）
 //
@@ -399,6 +409,12 @@ const DESKTOP_INCLUDE_RATE_LIMITS = { "x-freebuff-include-unused-rate-limits": "
 
 export default {
   async fetch(request, env) {
+    // 上游出站 fetch 注入（Node adapter 配了订阅时传入走 mihomo 的 fetch）。
+    // env 可放函数（Node 的 env 是普通对象）；Cloudflare Worker 的 env 是 KV 型
+    // 对象拿不到函数，保持默认全局 fetch 直连。
+    if (env && typeof env.FREEBUFF_UPSTREAM_FETCH === "function") {
+      upstreamFetch = env.FREEBUFF_UPSTREAM_FETCH;
+    }
     const url = new URL(request.url);
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders() });
 
@@ -453,7 +469,53 @@ export default {
 // ---------------------------------------------------------------------------
 
 let accountIdx = 0;
-const cooldowns = new Map();      // token -> 冷却到期 ms
+// session 失效安全窗口（v1.9.1，参考 kele68108/Freebuff2API-Optimized 的
+// _last_invalidated_at）：同一个 token:model 的 session 被判失效（409/428/410）
+// 并重建后，短时间内如果再被判失效，说明上游 session 服务正处于坏状态
+// （或我们在同一个坏实例上反复创建）。此时不再无脑重建（会 409 循环打爆
+// 上游），而是直接冷却该号、换号，让其他号兜底。
+// 用法：
+//   markSessionInvalidated(token, model)  在 deleteUpstreamSession 前调用
+//   wasRecentlyInvalidated(token, model)  在重建前检查；true 则放弃重建
+const sessionInvalidated = new Map();  // `${token}:${model}` -> lastInvalidatedAt(ms)
+const INVALIDATION_WINDOW_MS = 30 * 1000; // 30s 内视为「刚失效过」
+
+// single-flight session 创建去重（v1.9.1，参考 trefeon/freebuff-proxy）：
+// 多个并发请求同时拿到同一个 token:model 且缓存未命中时，若各自走
+// createSession 的 POST，会并发创建多个 session，后建的把先建的顶掉
+// （上游 409 session_superseded："Only one instance per account is allowed"）。
+// 用 in-flight Promise 去重：第一个请求真正建 session，其余请求等同一个结果。
+const sessionCreateFlights = new Map(); // `${token}:${model}` -> Promise
+
+/** single-flight 包装：同 key 并发只执行一次 fn，返回同一个 Promise */
+function singleFlight(key, fn) {
+  const existing = sessionCreateFlights.get(key);
+  if (existing) return existing;
+  const p = fn().finally(() => sessionCreateFlights.delete(key));
+  sessionCreateFlights.set(key, p);
+  return p;
+}
+
+function markSessionInvalidated(token, model) {
+  if (!token) return;
+  sessionInvalidated.set(token + ":" + (model || ""), Date.now());
+}
+
+function wasRecentlyInvalidated(token, model, now = Date.now()) {
+  if (!token) return false;
+  const ts = sessionInvalidated.get(token + ":" + (model || ""));
+  return Boolean(ts) && (now - ts) < INVALIDATION_WINDOW_MS;
+}
+
+
+//   { until, retryAfterMs, reason }
+//   until      到期时刻 ms；now < until 期间 pickToken 跳过该号
+//   retryAfterMs  上游给的重试间隔（429 响应里的 retryAfterMs / Retry-After），
+//               0 表示未知。本地 429 锁在 executeChat 开头用它算 Retry-After 头
+//   reason      'quota'（上游限流/额度）/ 'error'（交互失败）/ 'invalidation'
+// 参考 trefeon/freebuff-proxy：token 撞上游配额时本地直接回 429+Retry-After，
+// 不再打上游（无意义地烧池子）。
+const cooldowns = new Map();
 const sessCache = new Map();      // `${token}:${sessionModel}` -> { instanceId, model, remainingMs, expiresAt }（必须带 token，多账号防串号）
 
 
@@ -569,7 +631,7 @@ function pickToken(env, sessionModel) {
   if (sessionModel) {
     for (const acct of finalPool) {
       const t = acct.token;
-      if (cooldowns.has(t) && cooldowns.get(t) > Date.now()) continue;
+      if (inCooldown(t)) continue;
       const cached = sessCache.get(t + ":" + sessionModel);
       if (isUsableSession(cached)) {
         return acct;
@@ -582,10 +644,15 @@ function pickToken(env, sessionModel) {
     const acct = finalPool[accountIdx % finalPool.length];
     accountIdx = (accountIdx + 1) % finalPool.length;
     const t = acct.token;
-    if (!cooldowns.has(t) || cooldowns.get(t) <= Date.now()) return acct;
+    if (!inCooldown(t)) return acct;
   }
-  const oldest = [...cooldowns.entries()].sort((a, b) => a[1] - b[1])[0];
-  if (oldest) cooldowns.delete(oldest[0]);
+  // 全部在冷却中：找最早过期的那个，删掉它的冷却（放行一个号让请求继续），
+  // 由上游 429 再收回去。不要一直卡死整个池子。
+  let oldestToken = null, oldestUntil = Infinity;
+  for (const [t, c] of cooldowns) {
+    if (c.until < oldestUntil) { oldestUntil = c.until; oldestToken = t; }
+  }
+  if (oldestToken) cooldowns.delete(oldestToken);
   return finalPool[0];
 }
 
@@ -620,8 +687,42 @@ function logAccountRoute(enabled, pool, token, model, attempt, reason) {
   } catch {}
 }
 
-function cooldown(token, ms) {
-  if (ms > 0) cooldowns.set(token, Date.now() + ms);
+/**
+ * 冷却一个 token。三种调用形式兼容：
+ *   cooldown(token, ms)                      —— 旧形式，reason=error
+ *   cooldown(token, ms, retryAfterMs)        —— 429 限流，带上游重试间隔
+ *   cooldown(token, ms, {reason, retryAfterMs})
+ * 幂等合并：已存在的冷却如果更长则保留（避免短冷却覆盖长冷却）。
+ */
+function cooldown(token, ms, opts) {
+  if (!(ms > 0)) return;
+  let reason = "error";
+  let retryAfterMs = null;
+  if (opts && typeof opts === "object") {
+    reason = opts.reason || reason;
+    retryAfterMs = opts.retryAfterMs != null ? opts.retryAfterMs : null;
+  } else if (typeof opts === "number" && opts > 0) {
+    retryAfterMs = opts;
+    reason = "quota";
+  } else if (typeof opts === "string") {
+    reason = opts;
+  }
+  const until = Date.now() + ms;
+  const prev = cooldowns.get(token);
+  if (prev && prev.until > until) return; // 已有更长的冷却，保留
+  cooldowns.set(token, { until, retryAfterMs, reason });
+}
+
+/** 读取冷却记录；未冷却/已过期返回 null */
+function cooldownInfo(token, now = Date.now()) {
+  const c = cooldowns.get(token);
+  if (!c || c.until <= now) { cooldowns.delete(token); return null; }
+  return c;
+}
+
+/** 该 token 是否处于冷却中 */
+function inCooldown(token, now = Date.now()) {
+  return cooldownInfo(token, now) !== null;
 }
 
 // Official Freebuff session-gate recovery requires matching both the HTTP
@@ -728,9 +829,16 @@ function invalidateSessionCache(token) {
   }
 }
 
-async function deleteUpstreamSession(token, instanceId) {
+async function deleteUpstreamSession(token, instanceId, model) {
   invalidateSessionCache(token);
   if (!instanceId) return;
+  // 失效安全窗口内同一 token:model 不重复 DELETE 上游（避免连续 409 时
+  // 疯狂 DELETE+POST 循环打爆上游）。窗口信息在调用方重建前用
+  // wasRecentlyInvalidated 检查，这里只是记录时间戳 + 跳过重复 DELETE。
+  const key = token + ":" + (model || "");
+  const last = sessionInvalidated.get(key);
+  if (last && Date.now() - last < INVALIDATION_WINDOW_MS) return;
+  sessionInvalidated.set(key, Date.now());
   try {
     await enqueueUp("DELETE", "/api/v1/freebuff/session", token, undefined,
       { "x-freebuff-instance-id": instanceId }, SESSION_TIMEOUT_MS);
@@ -758,14 +866,43 @@ const SESSION_TIMEOUT_MS = 10000;  // session/run 等短交互更快失败
 // 额度仍在时不 abort、不切号，继续等待上游。
 const STREAM_NO_DATA_PROBE_DELAY_MS = 20000;
 
+// ── 出站 header 清洗 + 请求抖动（轻量 stealth，v1.9.1）──────────────────
+// 纯应用层隐身：规范化出站 header（不留代理特征）、给串行队列的请求间隔加
+// 轻微随机抖动（降低被上游按"恒定节奏批量请求"风控的概率）。
+// 不动 TLS 指纹层 —— Node fetch/undici 改不了指纹，uTLS 需要换 HTTP 栈，
+// 那是单独任务。这里只做零成本、纯逻辑的部分。
+const STEALTH_JITTER_MIN_MS = 100;   // 最小额外间隔
+const STEALTH_JITTER_MAX_MS = 400;   // 最大额外间隔
+// 统一出站 UA：桌面版协议签名（真实 CLI 特征，不是代理特征）
+const STEALTH_UA = "Freebuff-CLI/0.0.138";
+// 统一 Accept：和官方 CLI 一致的浏览器风格
+const STEALTH_ACCEPT = "application/json";
+
+function jitterMs() {
+  return STEALTH_JITTER_MIN_MS +
+    Math.floor(Math.random() * (STEALTH_JITTER_MAX_MS - STEALTH_JITTER_MIN_MS + 1));
+}
+
+// 上游出站 fetch。默认全局 fetch（Cloudflare Worker / 无代理环境直连）。
+// Node adapter（server.js）可注入 env.FREEBUFF_UPSTREAM_FETCH：
+// 配置了订阅时 server/proxy.mjs 会构造一个「带 undici ProxyAgent 指向本地
+// mihomo mixed-port」的 fetch 传进来，上游流量就经代理节点出站。
+let upstreamFetch = typeof fetch === "function" ? fetch : globalThis.fetch;
+
 async function up(method, path, token, body, extraHeaders = {}, timeoutMs = UPSTREAM_TIMEOUT_MS) {
+  // 出站前加入随机抖动，让请求节奏不规则（CHAIN_GAP_MS 之外）
+  await sleep(jitterMs());
   const headers = {};
-  // 桌面版协议：不手动设置 User-Agent（fetch 默认），只带必要的业务头
+  // 桌面版协议：带真实 CLI UA + 统一 Accept，不留代理/脚本特征。
+  // 不设 Origin —— 上游对 Origin 可能有 CORS 校验，桌面版协议实测不带任何
+  // Origin，保持原样（ads 调用会显式覆盖 UA，见 runNormalClientBehavior）。
   if (token) headers.Authorization = `Bearer ${token}`;
   if (body !== undefined) headers["Content-Type"] = "application/json";
+  headers["User-Agent"] = extraHeaders["User-Agent"] || STEALTH_UA;
+  headers["Accept"] = extraHeaders["Accept"] || STEALTH_ACCEPT;
   Object.assign(headers, extraHeaders);
 
-  const resp = await fetch(CODEBUFF_API + path, {
+  const resp = await upstreamFetch(CODEBUFF_API + path, {
     method,
     headers,
     body: body !== undefined ? JSON.stringify(body) : undefined,
@@ -798,7 +935,7 @@ async function freshQuotaProbe(token, sessionModel) {
 // 才强制刷新账号额度；额度未知或仍有额度时，原请求继续等待。
 async function fetchStreamWithQuotaGuard(url, init, token, sessionModel) {
   const controller = new AbortController();
-  const request = fetch(url, { ...init, signal: controller.signal });
+  const request = upstreamFetch(url, { ...init, signal: controller.signal });
   let probeTimer = null;
   const armProbe = () => new Promise((_, reject) => {
     probeTimer = setTimeout(() => {
@@ -930,21 +1067,23 @@ async function runNormalClientBehavior(token, clientFingerprint) {
   return failures;
 }
 
-async function createSession(token, sessionModel, forceCreate = false) {
-  // 0) 正常客户端行为：广告链 + usage 触碰（30 分钟节流，失败静默）
-  try { await runNormalClientBehavior(token, stableFingerprint(token)); } catch {}
-  // 1) 缓存命中且未过期（剩 >60s）直接复用，避免每次请求都打上游 session 接口
-  if (!forceCreate) {
-    const cached = sessCache.get(token + ":" + sessionModel);
-    if (isUsableSession(cached)) {
-      return cached;
-    }
-    if (cached) sessCache.delete(token + ":" + sessionModel);
-  }
-  // 1) 查上游当前 session，同模型直接复用（forceCreate 时跳过：僵尸 active session 会被 GET 反复复用，
-  //    导致 chat 一直 428；强制 POST 拿全新实例）
-  //    桌面版签名：GET 带 include-unused-rate-limits（模型选择器额度快照头）
-  if (!forceCreate) {
+// 复用阈值（v1.9.1，optimistic reuse / verify window，参考 FreebuffSessionLease）：
+//   - SESSION_REUSE_SAFE_MS：剩余有效期 ≥ 此值时直接复用缓存，不打上游
+//   - SESSION_VERIFY_WINDOW_MS：剩余有效期在 (SAFE 以下, SAFE) 之间的临界区，
+//     乐观复用 + 后台异步 GET 验证一次；验证发现失效就删缓存，下次自然重建。
+//     避免长流场景下"过期前 60s"被反复强制重建。
+const SESSION_REUSE_SAFE_MS = 60 * 1000;       // 原 isUsableSession 阈值
+const SESSION_VERIFY_WINDOW_MS = 30 * 1000;    // 临界区宽度（剩余 30-60s）
+
+function sessionRemainingMs(session, now = Date.now()) {
+  const exp = session && session.expiresAt ? Date.parse(session.expiresAt) : NaN;
+  return Number.isFinite(exp) ? exp - now : NaN;
+}
+
+// 后台异步验证缓存的 session：GET 上游，若返回非 active 或模型对不上就删缓存。
+// 只读不改，不抛错；并发安全由调用方 single-flight 保证。
+async function verifySessionInBackground(token, sessionModel) {
+  try {
     const cur = await enqueueUp("GET", "/api/v1/freebuff/session", token, undefined,
       DESKTOP_INCLUDE_RATE_LIMITS, SESSION_TIMEOUT_MS);
     recordAccountObservation(token, cur.status, cur.data, {
@@ -952,55 +1091,106 @@ async function createSession(token, sessionModel, forceCreate = false) {
       uid: cur.data?.uid || null,
       retryAfterMs: cur.data?.retryAfterMs,
     });
-    if (cur.status === 200 && cur.data?.status === "active" && cur.data?.instanceId) {
-      const cm = cur.data.model;
-      if (!cm || cm === sessionModel) {
-        const s = normalizeSession(cur.data, sessionModel);
-        sessCache.set(token + ":" + sessionModel, s);
-        return s;
+    if (!(cur.status === 200 && cur.data?.status === "active" && cur.data?.instanceId)) {
+      const key = token + ":" + sessionModel;
+      if (sessCache.has(key)) sessCache.delete(key);
+      return;
+    }
+    const cm = cur.data.model;
+    if (cm && cm !== sessionModel) {
+      const key = token + ":" + sessionModel;
+      if (sessCache.has(key)) sessCache.delete(key);
+    }
+  } catch { /* 后台验证失败静默，下次请求自然重建 */ }
+}
+
+async function createSession(token, sessionModel, forceCreate = false) {
+  // 0) 正常客户端行为：广告链 + usage 触碰（30 分钟节流，失败静默）
+  try { await runNormalClientBehavior(token, stableFingerprint(token)); } catch {}
+  const key = token + ":" + sessionModel;
+
+  // 1) 缓存命中 → optimistic reuse（verify window）：
+  //    剩余 ≥ SESSION_REUSE_SAFE_MS（60s）直接复用，不打上游；
+  //    临界区（30-60s）乐观复用 + 后台异步验证一次，避免长流被反复重建。
+  if (!forceCreate) {
+    const cached = sessCache.get(key);
+    if (cached) {
+      const remain = sessionRemainingMs(cached);
+      if (remain >= SESSION_REUSE_SAFE_MS) return cached;
+      if (remain > 0 && remain >= SESSION_REUSE_SAFE_MS - SESSION_VERIFY_WINDOW_MS) {
+        // 临界区：先复用，同时后台验证（验证失败删缓存，下次请求重建）
+        verifySessionInBackground(token, sessionModel).catch(() => {});
+        return cached;
       }
-      await deleteUpstreamSession(token, cur.data.instanceId);
+      // 剩余不足 30s（或已过期）：删除，走重建
+      sessCache.delete(key);
     }
   }
 
-
-  // 2) create（可能 queue）。桌面版签名：POST 带预生成 x-freebuff-instance-id（客户端 UUID）。
-  //    ⚠️ 实测（2026-08-10）：multi-session:1 创建的实例 chat 报 428 waiting_room_required
-  //    （服务端 chat gate 不识别多会话实例），所以这里用单会话 + 预生成 instance-id：
-  //    既保留桌面版客户端预生成实例的指纹，又确保 chat 能被识别。
-  const instId = crypto.randomUUID();
-  const r = await enqueueUp("POST", "/api/v1/freebuff/session", token, undefined,
-    { "x-freebuff-model": sessionModel, "x-freebuff-instance-id": instId, "Content-Type": "application/json" }, SESSION_TIMEOUT_MS);
-  recordAccountObservation(token, r.status, r.data, {
-    quota: r.data?.rateLimitsByModel || null,
-    uid: r.data?.uid || null,
-    retryAfterMs: r.data?.retryAfterMs,
-  });
-  if (r.status === 200 && r.data?.status === "active" && r.data?.instanceId) {
-    const s = normalizeSession(r.data, sessionModel);
-    sessCache.set(token + ":" + sessionModel, s);
-    return s;
-  }
-  if (r.status === 200 && r.data?.status === "queued" && r.data?.instanceId) {
-    const inst = r.data.instanceId;
-    for (let i = 0; i < 8; i++) {
-      await sleep(1500);
-      const q = await enqueueUp("GET", "/api/v1/freebuff/session", token, undefined, { "x-freebuff-instance-id": inst }, SESSION_TIMEOUT_MS);
-      recordAccountObservation(token, q.status, q.data, {
-        quota: q.data?.rateLimitsByModel || null,
-        uid: q.data?.uid || null,
-        retryAfterMs: q.data?.retryAfterMs,
+  // 2) 真正建 session（single-flight 去重：并发请求共享同一次 POST）。
+  //    forceCreate=true 也必须走 single-flight —— 强制重建场景多个并发
+  //    请求同时重建，也会互相顶掉（409 session_superseded 的根源）。
+  return singleFlight(key + (forceCreate ? ":force" : ""), async () => {
+    // 查上游当前 session，同模型直接复用（forceCreate 时跳过：僵尸 active session
+    // 会被 GET 反复复用，导致 chat 一直 428；强制 POST 拿全新实例）
+    // 桌面版签名：GET 带 include-unused-rate-limits（模型选择器额度快照头）
+    if (!forceCreate) {
+      const cur = await enqueueUp("GET", "/api/v1/freebuff/session", token, undefined,
+        DESKTOP_INCLUDE_RATE_LIMITS, SESSION_TIMEOUT_MS);
+      recordAccountObservation(token, cur.status, cur.data, {
+        quota: cur.data?.rateLimitsByModel || null,
+        uid: cur.data?.uid || null,
+        retryAfterMs: cur.data?.retryAfterMs,
       });
-      if (q.status === 200 && q.data?.status === "active") {
-        const s = normalizeSession({ ...q.data, instanceId: q.data.instanceId || inst }, sessionModel);
-        sessCache.set(token + ":" + sessionModel, s);
-        return s;
+      if (cur.status === 200 && cur.data?.status === "active" && cur.data?.instanceId) {
+        const cm = cur.data.model;
+        if (!cm || cm === sessionModel) {
+          const s = normalizeSession(cur.data, sessionModel);
+          sessCache.set(key, s);
+          return s;
+        }
+        await deleteUpstreamSession(token, cur.data.instanceId, sessionModel);
       }
     }
-    throw new Error("session stayed queued (retry later)");
-  }
-  if (r.status === 409) throw new Error("session_model_mismatch: " + String(r.data?.message || r.data?.error || "上游拒绝该模型"));
-  throw new Error("create session failed: " + r.status + " " + (r.text || "").slice(0, 300));
+
+    // 3) create（可能 queue）。桌面版签名：POST 带预生成 x-freebuff-instance-id（客户端 UUID）。
+    //    ⚠️ 实测（2026-08-10）：multi-session:1 创建的实例 chat 报 428 waiting_room_required
+    //    （服务端 chat gate 不识别多会话实例），所以这里用单会话 + 预生成 instance-id：
+    //    既保留桌面版客户端预生成实例的指纹，又确保 chat 能被识别。
+    const instId = crypto.randomUUID();
+    const r = await enqueueUp("POST", "/api/v1/freebuff/session", token, undefined,
+      { "x-freebuff-model": sessionModel, "x-freebuff-instance-id": instId, "Content-Type": "application/json" }, SESSION_TIMEOUT_MS);
+    recordAccountObservation(token, r.status, r.data, {
+      quota: r.data?.rateLimitsByModel || null,
+      uid: r.data?.uid || null,
+      retryAfterMs: r.data?.retryAfterMs,
+    });
+    if (r.status === 200 && r.data?.status === "active" && r.data?.instanceId) {
+      const s = normalizeSession(r.data, sessionModel);
+      sessCache.set(key, s);
+      return s;
+    }
+    if (r.status === 200 && r.data?.status === "queued" && r.data?.instanceId) {
+      const inst = r.data.instanceId;
+      for (let i = 0; i < 8; i++) {
+        await sleep(1500);
+        const q = await enqueueUp("GET", "/api/v1/freebuff/session", token, undefined, { "x-freebuff-instance-id": inst }, SESSION_TIMEOUT_MS);
+        recordAccountObservation(token, q.status, q.data, {
+          quota: q.data?.rateLimitsByModel || null,
+          uid: q.data?.uid || null,
+          retryAfterMs: q.data?.retryAfterMs,
+        });
+        if (q.status === 200 && q.data?.status === "active") {
+          const s = normalizeSession({ ...q.data, instanceId: q.data.instanceId || inst }, sessionModel);
+          sessCache.set(key, s);
+          return s;
+        }
+      }
+      throw new Error("session stayed queued (retry later)");
+    }
+    if (r.status === 409) throw new Error("session_model_mismatch: " + String(r.data?.message || r.data?.error || "上游拒绝该模型"));
+    throw new Error("create session failed: " + r.status + " " + (r.text || "").slice(0, 300));
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1407,6 +1597,20 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode) {
     if (!token) break;
     logAccountRoute(debug, pool, token, mc.session, acctTry + 1,
       isUsableSession(sessCache.get(token + ":" + mc.session)) ? "active_session" : "quota_or_round_robin");
+    // 429 本地锁（与 executeChat 一致）：冷却中的 quota 号直接本地回 429
+    const lock = cooldownInfo(token);
+    if (lock && lock.reason === "quota") {
+      const retryAfterSec = lock.retryAfterMs
+        ? Math.max(1, Math.ceil(lock.retryAfterMs / 1000))
+        : Math.max(1, Math.ceil((lock.until - Date.now()) / 1000));
+      return jsonResponse({
+        error: {
+          message: `账号额度已用完,请 ${retryAfterSec}s 后重试`,
+          type: "rate_limit_exceeded",
+          retryAfterMs: lock.retryAfterMs || (lock.until - Date.now()),
+        },
+      }, 429, { "Retry-After": String(retryAfterSec), "X-RateLimit-Local": "1" });
+    }
     let rootRunId = null;
     let reviewerRunId = null;
     try {
@@ -1423,7 +1627,7 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode) {
         "Content-Type": "application/json",
         "x-freebuff-instance-id": sess.instanceId,
       };
-      const resp = await fetch(CODEBUFF_API + "/api/v1/chat/completions", {
+      const resp = await upstreamFetch(CODEBUFF_API + "/api/v1/chat/completions", {
         method: "POST",
         headers,
         body: JSON.stringify(payload),
@@ -1433,7 +1637,12 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode) {
         const text = await resp.text();
         recordAccountObservation(token, resp.status, text);
         lastErrMsg = "reviewer upstream error: " + text.slice(0, 300);
-        cooldown(token, parseCooldown(text, resp.status));
+        if (resp.status === 429) {
+          const ra = parseCooldown(text, 429);
+          cooldown(token, ra, { reason: "quota", retryAfterMs: ra });
+        } else {
+          cooldown(token, parseCooldown(text, resp.status));
+        }
         throw new Error(lastErrMsg);
       }
 
@@ -1487,6 +1696,25 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
     if (!token) break;
     logAccountRoute(debug, pool, token, mc.session, acctTry + 1,
       isUsableSession(sessCache.get(token + ":" + mc.session)) ? "active_session" : "quota_or_round_robin");
+
+    // 429 本地锁：该号正在上游限流冷却（reason=quota）且未到期。
+    // 直接本地回 429+Retry-After，不打上游 —— 打了也还是 429，白烧池子。
+    // 参考 trefeon/freebuff-proxy 的 429 本地锁语义。
+    const lock = cooldownInfo(token);
+    if (lock && lock.reason === "quota") {
+      const retryAfterSec = lock.retryAfterMs
+        ? Math.max(1, Math.ceil(lock.retryAfterMs / 1000))
+        : Math.max(1, Math.ceil((lock.until - Date.now()) / 1000));
+      if (debug) console.log(`[acct ${acctTry + 1}] local 429 lock (${retryAfterSec}s), skip upstream`);
+      return jsonResponse({
+        error: {
+          message: `账号额度已用完,请 ${retryAfterSec}s 后重试`,
+          type: "rate_limit_exceeded",
+          retryAfterMs: lock.retryAfterMs || (lock.until - Date.now()),
+        },
+      }, 429, { "Retry-After": String(retryAfterSec), "X-RateLimit-Local": "1" });
+    }
+
     try {
       // 1) session
       const sess = await createSession(token, mc.session);
@@ -1519,15 +1747,21 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
         try {
           resp = isStream
             ? await fetchStreamWithQuotaGuard(CODEBUFF_API + "/api/v1/chat/completions", chatInit, token, mc.session)
-            : await fetch(CODEBUFF_API + "/api/v1/chat/completions", {
+            : await upstreamFetch(CODEBUFF_API + "/api/v1/chat/completions", {
                 ...chatInit,
                 signal: AbortSignal.timeout(NONSTREAM_TIMEOUT_MS),
               });
         } catch (error) {
           // 空流只视为当前账号的同模型 session 疑似脏状态：
           // 删除上游旧实例，重建同模型 session，再重试一次；绝不改成别的模型。
+          // 同样受失效安全窗口约束：窗口内再空流 → 冷却换号，不无限重建。
           if (error instanceof EmptyUpstreamStreamError && attempt === 0) {
-            await deleteUpstreamSession(token, sessForChat.instanceId);
+            if (wasRecentlyInvalidated(token, mc.session)) {
+              if (debug) console.log(`[acct ${acctTry + 1}][chat] empty stream within invalidation window, cooldown`);
+              cooldown(token, INVALIDATION_WINDOW_MS, { reason: "invalidation", retryAfterMs: INVALIDATION_WINDOW_MS });
+              break;
+            }
+            await deleteUpstreamSession(token, sessForChat.instanceId, mc.session);
             if (debug) console.log(`[acct ${acctTry + 1}][chat] empty stream, same-model session recovery`);
             sessForChat = await createSession(token, mc.session, true);
             continue;
@@ -1541,20 +1775,34 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
         errText = await resp.text();
         recordAccountObservation(token, resp.status, errText);
         // 428 waiting_room_required（无活跃 session）/ 409 session_superseded（被新 session 顶替）
-        // 都说明缓存 instance 已失效 → 清缓存强制重建后重试一次；不是限流，不计冷却
+        // 都说明缓存 instance 已失效 → 清缓存强制重建后重试一次；不是限流，不计冷却。
+        // 失效安全窗口：该号刚才（30s 内）已经失效重建过一次还再次失效，
+        // 说明上游 session 服务对这个号正处于坏状态，继续重建只会 409 循环。
+        // 此时放弃重建，冷却该号（reason=invalidation，不会触发 429 本地锁），
+        // 交给外层换号。
         const staleSession =
           isStaleSessionGate(resp.status, errText) ||
           // Older upstream wrappers returned model mismatch as HTTP 502.
           (resp.status === 502 && (errText.includes("session_model_mismatch") || errText.includes("not valid for limited access")));
         if (staleSession && attempt === 0) {
-          await deleteUpstreamSession(token, sessForChat.instanceId);
+          if (wasRecentlyInvalidated(token, mc.session)) {
+            if (debug) console.log(`[acct ${acctTry + 1}][chat] session stale again within window, cooldown (skip recreate)`);
+            cooldown(token, INVALIDATION_WINDOW_MS, { reason: "invalidation", retryAfterMs: INVALIDATION_WINDOW_MS });
+            break;
+          }
+          await deleteUpstreamSession(token, sessForChat.instanceId, mc.session);
           if (debug) console.log(`[acct ${acctTry + 1}][chat] session stale (${resp.status}), recreate…`);
           sessForChat = await createSession(token, mc.session, true);
           continue;
         }
         // 重建后仍失败：该号 session 状态异常，冷却交给外层换号
-        if (staleSession) cooldown(token, 60 * 1000);
-        cooldown(token, parseCooldown(errText, resp.status));
+        if (staleSession) cooldown(token, 60 * 1000, { reason: "invalidation", retryAfterMs: 60 * 1000 });
+        if (resp.status === 429) {
+          const ra = parseCooldown(errText, 429);
+          cooldown(token, ra, { reason: "quota", retryAfterMs: ra });
+        } else {
+          cooldown(token, parseCooldown(errText, resp.status));
+        }
         break;
       }
       if (!resp.ok) {
@@ -1580,7 +1828,8 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
       // 额度探测确认耗尽：清除当前模型 session，按上游 retryAfterMs 冷却后切号。
       if (e instanceof QuotaExhaustedError) {
         sessCache.delete(token + ":" + mc.session);
-        cooldown(token, e.retryAfterMs || 5 * 60 * 1000);
+        const ra = e.retryAfterMs || 5 * 60 * 1000;
+        cooldown(token, ra, { reason: "quota", retryAfterMs: ra });
       }
       if (e instanceof EmptyUpstreamStreamError) {
         cooldown(token, 60 * 1000);
@@ -1589,7 +1838,12 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
       // createSession 429（额度耗尽）按 retryAfterMs/文本冷却，不能固定 60s。
       if (/create session failed|stayed queued|start_run failed|session_model_mismatch|abort|timeout|timed out|terminated/i.test(msg)) {
         const m429 = msg.match(/429/);
-        cooldown(token, m429 ? parseCooldown(msg, 429) : 60 * 1000);
+        if (m429) {
+          const ra = parseCooldown(msg, 429);
+          cooldown(token, ra, { reason: "quota", retryAfterMs: ra });
+        } else {
+          cooldown(token, 60 * 1000);
+        }
       }
       lastErrMsg = msg;
       if (debug) console.log(`[acct ${acctTry + 1}] exception: ${msg.slice(0, 120)}, switch account`);
@@ -2358,10 +2612,11 @@ function cleanCache() {
   } catch {}
 }
 
-// /v1/models 返回 硬编码 MODELS + 动态官方清单（合并去重）+ 自定义别名
+// /v1/models 返回 硬编码 MODELS + 动态官方清单（合并去重）
 // ⚠️ 不要在这里查上游 GET /api/v1/freebuff/session（额度/状态）：
 // 该接口会占用账号 session，而 Freebuff 一个号同一时间只能一个客户端在线，
 // 查询会干扰/顶掉正在进行的 chat 会话（428 waiting_room_required）。
+// 自定义别名不在此展示（面板单独管理），避免污染客户端模型列表。
 async function handleModels() {
   let modelList = MODELS;
   try {
@@ -2370,11 +2625,23 @@ async function handleModels() {
       modelList = mergeModelTables(MODELS, dyn.models);
     }
   } catch {}
-  const data = modelList.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: "freebuff" }));
-  // 自定义别名作为额外条目展示（同 object:model），目标模型标记在 owned_by 便于识别
-  for (const [alias, target] of currentAliases) {
-    data.push({ id: alias, object: "model", created: Math.floor(Date.now() / 1000), owned_by: "alias→" + target });
-  }
+  const data = modelList
+    .map((m) => {
+      // 实测（2026-08-15）：免费账号只有 Flash / MiMo 2.5 两个模型能建会话
+      // （上游 409 session_model_mismatch / 403 free_mode_invalid_agent_model 拒绝其余模型）。
+      // 只给这两个打 free 标记，其余模型不带任何 tag。
+      const free = FREE_AVAILABLE_MODELS.has(m.id);
+      return {
+        id: m.id,
+        object: "model",
+        created: Math.floor(Date.now() / 1000),
+        owned_by: "freebuff",
+        // free 优先排序：可用模型排最前，其余按原顺序（排序后移除内部字段）
+        ...(free ? { free: true, _sort: 0 } : { _sort: 1 }),
+      };
+    })
+    .sort((a, b) => a._sort - b._sort)
+    .map(({ _sort, ...m }) => m);
   return jsonResponse({ object: "list", data }, 200, { "X-Freebuff2api-Version": VERSION });
 }
 

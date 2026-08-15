@@ -1,0 +1,38 @@
+# Ciallo-FreeBuff-Proxy —— 一键部署
+# 用法：
+#   cp .env.example .env   # 填上 PANEL_PASS 和（可选）SUBSCRIPTION_URL
+#   docker compose up -d
+# 端口只绑回环，本机访问 http://127.0.0.1:8787
+services:
+  freebuff-proxy:
+    image: ghcr.io/murasamecyan/ciallo-freebuff-proxy:latest
+    container_name: freebuff-proxy
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8787:8787"
+    environment:
+      # 面板登录密码（必填，未设则面板不鉴权）
+      PANEL_PASS: ${ADMIN_PASSWORD:-}
+      # 出口代理订阅地址（可选）：机场 clash/v2ray 订阅 URL，
+      # 配置后上游流量经 mihomo 节点出站；留空则直连
+      SUBSCRIPTION_URL: ${SUBSCRIPTION_URL:-}
+      # 面板 API Key（可选）：不设则首次启动生成并持久化
+      # FREEBUFF_API_KEY: ${FREEBUFF_API_KEY:-}
+      # 账号池 token（可选，多账号用逗号分隔；也可以在面板里添加）
+      # FREEBUFF_TOKEN: ${FREEBUFF_TOKEN:-}
+      # 上游 API 地址（一般不用改）
+      # CODEBUFF_API: ${CODEBUFF_API:-}
+      # 账号池只读（true=禁止面板改账号）
+      # FREEBUFF_READONLY: ${FREEBUFF_READONLY:-false}
+    volumes:
+      # 账号池、API Key、mihomo 缓存都放命名卷
+      - freebuff-data:/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:'+(process.env.PORT||8787)+'/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  freebuff-data:

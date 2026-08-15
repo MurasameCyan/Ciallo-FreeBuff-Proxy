@@ -17,11 +17,24 @@
   </div>
 
   <div class="top-actions">
+    <!-- 构建标识。hash 链到那次 commit;⟳ 只在点的时候才去问 GitHub
+         (匿名 API 每小时 60 次,自动查会烧光);最后一个直接开仓库。
+         三个当一组不拆开,窄屏时整组一起折行。 -->
     <span class="build">
-      <span class="bid" id="verBadge" title="版本">—</span>
+      <span class="bid" id="build-id" title="构建标识">—</span>
+      <button type="button" class="btn tiny icon" id="btn-update" title="检查更新" aria-label="检查更新">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <polyline points="23 4 23 10 17 10"/>
+          <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+        </svg>
+      </button>
+      <a class="bid" id="repo-link" href="https://github.com/MurasameCyan/Ciallo-FreeBuff-Proxy"
+         target="_blank" rel="noopener noreferrer" title="GitHub 仓库">
+        <svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor" aria-hidden="true"
+             style="vertical-align:-2px"><path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91.58.11.79-.25.79-.56v-2.17c-3.2.7-3.87-1.36-3.87-1.36-.52-1.33-1.28-1.68-1.28-1.68-1.04-.71.08-.7.08-.7 1.15.08 1.76 1.18 1.76 1.18 1.03 1.75 2.69 1.25 3.34.95.1-.74.4-1.25.72-1.54-2.55-.29-5.23-1.28-5.23-5.68 0-1.26.45-2.28 1.18-3.09-.12-.29-.51-1.46.11-3.05 0 0 .96-.31 3.15 1.18a10.9 10.9 0 0 1 5.74 0c2.19-1.49 3.15-1.18 3.15-1.18.62 1.59.23 2.76.11 3.05.74.81 1.18 1.83 1.18 3.09 0 4.41-2.69 5.38-5.25 5.67.41.35.77 1.05.77 2.12v3.14c0 .31.21.68.8.56A11.52 11.52 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5z"/></svg>
+      </a>
     </span>
-    <button type="button" class="btn tiny" id="copyTokens">复制全部 Token</button>
-    <button type="button" class="btn tiny" id="refreshBtn">刷新</button>
     <button type="button" class="btn tiny icon" id="logoutBtn" title="退出登录" aria-label="退出登录">
       <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor"
            stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -72,10 +85,10 @@
         <span class="copyrow">
           <button type="button" class="btn tiny" data-copy-proto="openai">OpenAI 地址</button>
           <button type="button" class="btn tiny" data-copy-proto="anthropic">Anthropic 地址</button>
-          <button type="button" class="btn tiny" data-copy-proto="responses">Responses</button>
         </span>
         <span class="copyrow" style="margin-top:8px;">
-          <button type="button" class="btn tiny" data-copy-key>复制 API Key</button>
+          <button type="button" class="btn tiny" data-copy-key>复制 Key</button>
+          <button type="button" class="btn tiny warn" data-reset-key>重置 Key</button>
           <span class="hint" id="key-mask" style="font-family:var(--mono);"></span>
         </span>
       </div>
@@ -90,45 +103,53 @@
     </div>
   </section>
 
-  <!-- ── 账号池 ─────────────────────────────────────────── -->
-  <section class="card" aria-labelledby="h-accounts">
+  <!-- ── 账号池(管理 | 添加) ───────────────────────────── -->
+  <section class="card span2" aria-labelledby="h-accounts">
     <div class="card-head">
       <h2 id="h-accounts">账号池 <span class="hint" id="acctCount"></span></h2>
-      <button type="button" class="btn tiny" id="btn-testall">全部探测</button>
+      <nav class="seg" role="tablist" aria-label="账号池视图">
+        <button type="button" class="seg-btn active" data-pane="manage" role="tab" aria-selected="true">管理</button>
+        <button type="button" class="seg-btn" data-pane="add" role="tab" aria-selected="false">添加</button>
+      </nav>
     </div>
-    <table class="tbl">
-      <thead><tr><th>账号</th><th>状态</th><th>额度</th><th>操作</th></tr></thead>
-      <tbody id="acctBody"><tr><td colspan="4" class="empty">加载中…</td></tr></tbody>
-    </table>
-  </section>
 
-  <!-- ── 配置 ───────────────────────────────────────────── -->
-  <section class="card" aria-labelledby="h-cfg">
-    <div class="card-head"><h2 id="h-cfg">配置</h2></div>
-
-    <div class="box">
-      <div class="field">
-        <span class="lbl">手动添加账号</span>
-        <form id="addForm" style="display:grid; gap:10px;">
-          <input type="text" id="authToken" placeholder="authToken(必填)" autocomplete="off" spellcheck="false">
-          <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
-            <input type="text" id="email" placeholder="邮箱">
-            <input type="text" id="name" placeholder="备注名">
-          </div>
-          <button type="submit" class="btn primary wide" id="addBtn">添加并探测</button>
-        </form>
+    <!-- 管理:账号表格 -->
+    <div class="pane" data-pane="manage" role="tabpanel">
+      <div class="pane-bar">
+        <button type="button" class="btn tiny" id="btn-testall">全部探测</button>
       </div>
+      <table class="tbl">
+        <thead><tr><th>账号</th><th>状态</th><th>额度</th><th>操作</th></tr></thead>
+        <tbody id="acctBody"><tr><td colspan="4" class="empty">加载中…</td></tr></tbody>
+      </table>
     </div>
 
-    <div class="box">
-      <div class="field">
-        <span class="lbl">Freebuff 登录</span>
-        <p class="hint">生成授权链接(可复制到手机打开),用 Google 账号完成授权后 token 自动加入账号池。</p>
-        <div class="row-actions">
-          <button type="button" class="btn ghost" id="oauthStart">开始授权</button>
+    <!-- 添加:手动添加 + Freebuff 登录 -->
+    <div class="pane" data-pane="add" role="tabpanel" hidden>
+      <div class="box">
+        <div class="field">
+          <span class="lbl">手动添加账号</span>
+          <form id="addForm" style="display:grid; gap:10px;">
+            <input type="text" id="authToken" placeholder="authToken(必填)" autocomplete="off" spellcheck="false">
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
+              <input type="text" id="email" placeholder="邮箱">
+              <input type="text" id="name" placeholder="备注名">
+            </div>
+            <button type="submit" class="btn primary wide" id="addBtn">添加并探测</button>
+          </form>
         </div>
-        <div class="login-url" id="loginUrl" hidden></div>
-        <p class="hint" id="oauthStatus"></p>
+      </div>
+
+      <div class="box">
+        <div class="field">
+          <span class="lbl">Freebuff 登录</span>
+          <p class="hint">生成授权链接(可复制到手机打开),用 Google 账号完成授权后 token 自动加入账号池。</p>
+          <div class="row-actions">
+            <button type="button" class="btn ghost" id="oauthStart">开始授权</button>
+          </div>
+          <div class="login-url" id="loginUrl" hidden></div>
+          <p class="hint" id="oauthStatus"></p>
+        </div>
       </div>
     </div>
   </section>

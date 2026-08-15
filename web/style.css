@@ -166,6 +166,26 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
 .hint { color: var(--fg-2); font-size: 12px; line-height: 1.5; }
 .card-head .hint { margin-left: auto; text-align: right; }
 
+/* 分段切换(管理 | 添加) */
+.seg {
+  display: inline-flex; align-items: center;
+  border: 1px solid var(--line-2); border-radius: var(--r-sm);
+  background: var(--bg); padding: 2px; gap: 2px;
+}
+.seg-btn {
+  border: 0; background: transparent; color: var(--fg-2);
+  padding: 5px 14px; border-radius: 7px;
+  font: 500 12px var(--sans); cursor: pointer;
+  transition: background .13s, color .13s;
+}
+.seg-btn:hover:not(.active) { color: var(--fg); }
+.seg-btn.active {
+  background: var(--card-2); color: var(--fg);
+  box-shadow: 0 1px 2px #0004;
+}
+/* 面板切换区 */
+.pane-bar { display: flex; justify-content: flex-end; margin-bottom: 8px; }
+
 /* ── 概览数字 ─────────────────────────────────────────── */
 
 .stats {
@@ -239,6 +259,15 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
 .pill.muted .dot { background: var(--fg-2); }
 .pill.warn   { color: var(--amber); border-color: color-mix(in oklab, var(--amber) 35%, var(--line)); }
 .pill.danger { color: var(--rose); border-color: color-mix(in oklab, var(--rose) 35%, var(--line)); }
+
+/* 模型列表里的 free 胶囊（比普通 pill 更小更紧凑） */
+.pill.free {
+  font-size: 10px; padding: 1px 7px; border-radius: 999px;
+  color: var(--mint); border-color: color-mix(in oklab, var(--mint) 30%, transparent);
+  background: transparent; margin-left: 6px; vertical-align: 1px;
+}
+.models li { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.models { display: grid; gap: 5px; }
 
 /* 配额展示 */
 .quota { font-size: 11px; color: var(--fg-2); line-height: 1.6; }
@@ -315,6 +344,8 @@ textarea { resize: vertical; min-height: 44px; line-height: 1.5; }
 }
 .btn.icon:hover:not(:disabled) { color: var(--fg); }
 .btn.icon svg { pointer-events: none; }
+.btn.icon.spin svg { animation: spin .9s linear infinite; }
+@keyframes spin { to { transform: rotate(1turn); } }
 
 .row-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 13px; }
 .row-actions .btn { flex: 1 1 auto; }

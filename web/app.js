@@ -9,6 +9,7 @@ const POLL_MS = 5000;
 
 const S = {
   accounts: [], health: {}, aliases: {},
+  build: '', buildUrl: '', repoUrl: '', trackRef: '', latest: '',
 };
 
 // ── HTTP ────────────────────────────────────────────────
@@ -80,6 +81,25 @@ function tag(cls, text) {
 
 // ── 渲染 ────────────────────────────────────────────────
 
+/** 构建标识：hash 链到那次 commit，有新版本时徽标高亮 */
+function hasNewer(latest, build) {
+  return !!latest && !!build && latest !== build;
+}
+
+function renderBuild() {
+  const el = $('build-id');
+  el.textContent = S.build || '—';
+  if (S.repoUrl) $('repo-link').href = S.repoUrl;
+
+  const stale = hasNewer(S.latest, S.build);
+  el.classList.toggle('new', stale);
+  // 徽标只有 7 个字符，「跟谁比的」放 title 里 —— 不然「有新版本」这个状态
+  // 看不出是拿哪个分支比出来的
+  el.title = S.build
+    ? `当前构建 ${S.build}${S.trackRef ? ` · 跟随 ${S.trackRef} 分支` : ''}${stale ? ` · 有新版本 ${S.latest}` : ''}`
+    : '构建标识未知(构建时没注入 GIT_COMMIT)';
+}
+
 function statePill(s) {
   const map = {
     ok: ['ok', '存活'], token_invalid: ['danger', '失效'], banned: ['danger', '封禁'],
@@ -94,8 +114,17 @@ function statePill(s) {
 function quotaHtml(probe) {
   if (!probe || !probe.quota || !probe.quota.length) return '<span class="quota">—</span>';
   return '<div class="quota">' + probe.quota.map(q =>
-    `<div><b>${esc(q.model)}</b> ${q.used}/${q.limit}${q.resetAt ? '<br><span>' + esc(q.resetAt) + '</span>' : ''}</div>`
+    `<div><b>${esc(q.model)}</b> ${q.used}/${q.limit}${q.resetAt ? '<br><span>' + esc(formatResetAt(q.resetAt)) + '</span>' : ''}</div>`
   ).join('') + '</div>';
+}
+
+// ISO 时间戳（2026-08-16T07:00:00.000Z）→ 本地化日期时间（2026-08-16 15:00）
+// 去掉 T / 毫秒 / 英文 Z，统一 YYYY-MM-DD HH:mm（本地时区，北京时间即 UTC+8）
+function formatResetAt(iso) {
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return iso;
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
 function renderStats() {
@@ -198,11 +227,10 @@ function renderModels() {
   $('models-empty').hidden = list.length > 0;
   ul.replaceChildren(...list.map((m) => {
     const li = document.createElement('li');
-    li.textContent = m.owned_by && m.owned_by.startsWith('alias→')
-      ? `${m.id} ⟶ ${m.owned_by.slice(6)}`
-      : m.id;
+    li.textContent = m.id;
     li.title = li.textContent;
-    if (m.owned_by && m.owned_by.startsWith('alias→')) li.classList.add('alias');
+    // 只有免费账号实测可用的模型打 free 胶囊；其余模型不带任何 tag
+    if (m.free) li.append(' ', tag('pill free', 'free'));
     return li;
   }));
   // 溢出项给键盘可达
@@ -220,8 +248,11 @@ async function refresh() {
     if (cfg) {
       S.aliases = cfg.aliases || {};
       S.apiKey = cfg.apiKey || 'freebuff-default-key';
-      $('verBadge').textContent = 'v' + (cfg.version || '—');
+      S.keyRotatable = cfg.keyRotatable !== false;
+      S.build = cfg.build || ''; S.buildUrl = cfg.buildUrl || ''; S.repoUrl = cfg.repoUrl || '';
+      S.trackRef = cfg.trackRef || '';
       $('key-mask').textContent = S.apiKey.slice(0, 8) + '…';
+      renderBuild();
     }
     if (acc) { S.accounts = acc.accounts || []; S.health = acc.health || {}; S.readonly = acc.readonly; }
     // /v1/models 是 worker 路由,带 key 头直连
@@ -236,44 +267,77 @@ async function refresh() {
 // ── 交互 ────────────────────────────────────────────────
 
 function wire() {
-  $('refreshBtn').addEventListener('click', refresh);
+  // 账号池分段切换:管理 | 添加
+  const segBtns = document.querySelectorAll('.seg-btn[data-pane]');
+  const panes = document.querySelectorAll('.pane[data-pane]');
+  segBtns.forEach(btn => {
+    btn.addEventListener('click', () => {
+      const pane = btn.dataset.pane;
+      segBtns.forEach(b => { b.classList.toggle('active', b === btn); b.setAttribute('aria-selected', b === btn); });
+      panes.forEach(p => p.hidden = p.dataset.pane !== pane);
+    });
+  });
+
+  // 检查更新:只在点的时候出站(GitHub 匿名 API 每小时 60 次,自动查会烧光)
+  $('btn-update').addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    btn.classList.add('spin');
+    try {
+      const r = await api('/check-update', { method: 'POST' });
+      S.latest = r?.latest || '';
+      if (r?.error) toast(`检查更新失败:${r.error}`, 'err');
+      else if (r?.hasUpdate) toast(`有新版本 ${r.latest} —— 拉取最新代码后重启服务`, 'ok');
+      else toast(`已是最新${r?.current ? ` ${r.current}` : ''}`, 'ok');
+    } catch (err) {
+      toast(`检查更新失败:${err.message}`, 'err');
+    } finally {
+      btn.disabled = false;
+      btn.classList.remove('spin');
+      renderBuild();
+    }
+  });
 
   $('logoutBtn').addEventListener('click', async () => {
     try { await api('/logout', { method: 'POST' }); } catch { /* 照样跳 */ }
     location.replace('/');
   });
 
-  $('copyTokens').addEventListener('click', async () => {
-    const toks = S.accounts.filter(a => a.hasToken).map(a => a.token).join('\n');
-    if (!toks) return toast('没有可复制的 token', 'err');
-    try {
-      await navigator.clipboard.writeText(toks);
-      toast('已复制 ' + S.accounts.filter(a => a.hasToken).length + ' 个 token');
-    } catch { toast('复制失败', 'err'); }
-  });
-
-  // 接入地址:两个协议各复制自己的 base URL
+  // 接入地址:各协议复制自己的 base URL
   for (const btn of document.querySelectorAll('[data-copy-proto]')) {
     btn.addEventListener('click', async () => {
       const p = btn.dataset.copyProto;
       const base = location.origin;
-      const url = p === 'openai' ? `${base}/v1` : p === 'anthropic' ? base : `${base}/v1/responses`;
+      const url = p === 'openai' ? `${base}/v1` : base;
       try {
         await navigator.clipboard.writeText(url);
-        toast('已复制 ' + (p === 'openai' ? 'OpenAI 地址' : p === 'anthropic' ? 'Anthropic 地址' : 'Responses 地址'));
+        toast('已复制 ' + (p === 'openai' ? 'OpenAI 地址' : 'Anthropic 地址'));
       } catch { toast('复制失败', 'err'); }
     });
   }
 
-  // 复制 API Key(真值来自 config 接口,屏幕只显示掩码)
+  // 复制 Key(真值来自 config 接口,屏幕只显示掩码)
   const keyBtn = document.querySelector('[data-copy-key]');
   if (keyBtn) {
     keyBtn.addEventListener('click', async () => {
       try {
         await navigator.clipboard.writeText(S.apiKey || '');
-        toast('已复制 API Key', 'ok');
+        toast('已复制 Key', 'ok');
       } catch { toast('复制失败', 'err'); }
     });
+  }
+
+  // 重置 Key:生成新随机 key,旧 key 立即失效
+  const resetBtn = document.querySelector('[data-reset-key]');
+  if (resetBtn) {
+    resetBtn.addEventListener('click', () => run(resetBtn, '重置', async () => {
+      if (!S.keyRotatable) throw new Error('当前 Key 由环境变量 FREEBUFF_API_KEY 配置,面板不可重置');
+      if (!confirm('重置后旧 Key 立即失效,正在使用该 Key 的客户端需要更新。继续?')) return '已取消';
+      const r = await api('/key/rotate', { method: 'POST' });
+      S.apiKey = r.apiKey;
+      $('key-mask').textContent = S.apiKey.slice(0, 8) + '…';
+      return '新 Key 已生效';
+    }));
   }
 
   // 全部探测
