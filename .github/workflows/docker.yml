@@ -89,11 +89,24 @@ jobs:
           set -eux
           docker build --load -t verify:local --build-arg GIT_COMMIT="$GITHUB_SHA" .
           docker run -d --name verify -e ADMIN_PASSWORD=ci-test -p 8787:8787 verify:local
-          for i in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:8787/healthz | grep -q '"status":"ok"'; then break; fi
-            [ "$i" = 30 ] && { docker logs verify; exit 1; }
+          # 等 healthz 就绪：容器冷启 + 首个请求可能偏慢，给足 60s。
+          # 失败时打全量诊断（最后响应体 / curl -v / 容器健康态 / 日志），一眼定位。
+          ok=""
+          for i in $(seq 1 60); do
+            body=$(curl -fsS http://127.0.0.1:8787/healthz 2>/dev/null || true)
+            if printf '%s' "$body" | grep -q '"status":"ok"'; then
+              ok=1; echo "healthz 就绪（第 ${i} 次）: ${body}"; break
+            fi
             sleep 1
           done
+          if [ -z "$ok" ]; then
+            echo "healthz 60s 内未就绪，最后响应: [${body}]"
+            echo "--- curl -v ---";      curl -v http://127.0.0.1:8787/healthz || true
+            echo "--- docker ps -a ---"; docker ps -a
+            echo "--- health state ---"; docker inspect -f '{{json .State.Health}}' verify || true
+            echo "--- docker logs ---";  docker logs verify
+            exit 1
+          fi
           # 面板必须挡住匿名访问
           code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8787/_api/config)
           [ "$code" = 401 ] || { echo "面板没鉴权! 返回 $code"; docker logs verify; exit 1; }

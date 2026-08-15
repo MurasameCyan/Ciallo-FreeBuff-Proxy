@@ -1,0 +1,20 @@
+# 换行规范。仓库里没有它时，Windows 检出（core.autocrlf=true）会把 LF 转成 CRLF，
+# 而带 CRLF 的 #!/bin/sh 进到 Linux 容器会「bad interpreter」——入口脚本在关键启动
+# 路径上，一旦被转就是「容器起不来」级别的故障，且极难排查。这里把在容器里执行的
+# 文本文件钉死为 LF，与平台/个人 git 配置无关。
+
+# Shell 脚本必须 LF（docker-entrypoint.sh 等）
+*.sh            text eol=lf
+
+# 容器内运行 / 由 Linux 侧消费的文本，统一 LF
+Dockerfile      text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+*.mjs           text eol=lf
+*.js            text eol=lf
+*.json          text eol=lf
+
+# 二进制产物不做换行转换（避免被误判为文本而损坏）
+*.gz            binary
+*.png           binary
+*.ico           binary

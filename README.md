@@ -17,6 +17,24 @@ docker compose up -d
 
 打开 http://127.0.0.1:8787 ，用 `.env` 里的密码登录面板，在「账号池 → 添加」里粘贴 Freebuff token。
 
+### 数据目录（账号文件）
+
+账号池、API Key、模型映射、mihomo 缓存都持久化在数据目录。`docker-compose.yml` 默认把它
+绑挂到 compose 文件同级的 `./data`，方便直接在宿主机查看和管理：
+
+```
+data/
+├─ credentials/
+│  ├─ freebuff_credentials.json   # 账号池（token）
+│  └─ server-key.txt              # 面板 API Key
+└─ aliases.json                   # 自定义模型别名
+```
+
+容器以 `node`(uid 1000) 运行，入口脚本启动时会把 `/data` 属主修正为 `node`，所以宿主目录
+属主对不上也不会 permission denied，**无需手动 chown**。想让数据交给 Docker 托管、不落宿主
+目录，把 `docker-compose.yml` 里的挂载换成命名卷 `- freebuff-data:/data`（文件内有说明）。
+
+
 ### 局域网 / 容器互通（可选）
 
 默认端口只绑本机回环。想让同机其它 compose 项目（agent 容器）按容器名访问，解开

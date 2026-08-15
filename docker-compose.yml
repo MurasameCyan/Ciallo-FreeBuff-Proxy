@@ -6,7 +6,7 @@
 services:
   freebuff-proxy:
     image: ghcr.io/murasamecyan/ciallo-freebuff-proxy:latest
-    container_name: freebuff-proxy
+    container_name: ciallo-freebuff-proxy
     restart: unless-stopped
     ports:
       - "127.0.0.1:8787:8787"
@@ -37,8 +37,15 @@ services:
       # 账号池只读（true=禁止面板改账号）
       # FREEBUFF_READONLY: ${FREEBUFF_READONLY:-false}
     volumes:
-      # 账号池、API Key、模型映射、mihomo 缓存都放命名卷
-      - freebuff-data:/data
+      # 账号池 / API Key / 模型映射 / mihomo 缓存都落这里。
+      # 绑挂到宿主 ./data，方便直接查看和管理账号文件
+      # （账号池在 ./data/credentials/freebuff_credentials.json）。
+      # 容器以 node(uid 1000) 运行，入口脚本启动时会把 /data 属主修正为 node，
+      # 宿主目录属主对不上也不会 permission denied，无需手动 chown。
+      - ./data:/data
+      # 如果更想用 Docker 命名卷（数据不落宿主目录、交给 Docker 托管），
+      # 改用下面这行，并解注释文件末尾的 volumes 段。
+      # - freebuff-data:/data
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:'+(process.env.PORT||8787)+'/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 30s
@@ -46,8 +53,11 @@ services:
       retries: 3
       start_period: 20s
 
-volumes:
-  freebuff-data:
+# 默认用 services 里的 ./data 绑挂（数据落在 compose 文件同级的 data 目录，便于管理），
+# 不需要顶层 volumes 声明。要改用 Docker 命名卷：把上面 volumes 换成
+# `- freebuff-data:/data`，并解注释下面两行。
+# volumes:
+#   freebuff-data:
 
 # 配合上面 services.freebuff-proxy.networks 一起解注释。external: true 是「这个网络我在
 # 外面建好了，别管它的生命周期」—— compose down 不会把它删掉，别的项目还连着。

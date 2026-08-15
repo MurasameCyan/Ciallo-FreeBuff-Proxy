@@ -33,7 +33,8 @@ RUN set -eux; \
 FROM node:22-alpine
 # ca-certificates 是给 mihomo 的：Go 从 /etc/ssl/certs 读根证书，
 # 没有它拉 https 订阅会失败。Node 自己带了一套编进去的，不受影响。
-RUN apk add --no-cache ca-certificates
+# su-exec 给入口脚本用：以 root 修正挂载卷属主后降权到 node（见 docker-entrypoint.sh）。
+RUN apk add --no-cache ca-certificates su-exec
 
 COPY --from=kernel /out/mihomo /usr/local/bin/mihomo
 
@@ -46,13 +47,16 @@ COPY server ./server
 COPY web ./web
 COPY aliases.json ./
 COPY scripts ./scripts
+# 入口脚本要可执行（Windows 检出可能丢失执行位，这里显式补上）
+RUN chmod +x /app/scripts/docker-entrypoint.sh
 
-# 用镜像自带的 node 用户，不跑 root。只用 mixed-port 不开 TUN，
-# 所以不需要 NET_ADMIN 之类的权限。
-# 这里先建好 /data 并归属 node：命名卷首次创建时会继承这个属主，
-# 挂上去才写得进（换成 bind mount 就得自己 chown，见 README）。
+# 只用 mixed-port 不开 TUN，所以不需要 NET_ADMIN 之类的权限。
+# 这里先建好 /data 并归属 node：命名卷首次创建时会继承这个属主。
+# 绑挂宿主目录（./data:/data）时属主常是 root —— 交给入口脚本启动时
+# chown 一次再降权到 node（见 docker-entrypoint.sh），用户无需手动 chown。
+# 因此这里不写 USER node：容器以 root 起，入口脚本修正属主后用 su-exec 落到 node，
+# 应用进程本身仍以非 root 运行。
 RUN mkdir -p /data && chown -R node:node /data
-USER node
 
 ENV NODE_ENV=production \
     PORT=8787
@@ -75,4 +79,6 @@ VOLUME ["/data"]
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||8787)+'/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
+# 入口脚本先以 root 修正 /data 属主，再用 su-exec 降权到 node 执行 CMD。
+ENTRYPOINT ["/app/scripts/docker-entrypoint.sh"]
 CMD ["node", "server.js"]
