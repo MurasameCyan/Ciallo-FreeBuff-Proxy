@@ -145,6 +145,18 @@ function requireAdmin(req, res) {
   if (sid && sessions.has(sid) && sessions.get(sid).exp > Date.now()) return true;
   // 未设置 ADMIN_PASSWORD 时，允许直连（内网部署便利，公网请务必设置）
   if (!CFG.adminPassword) return true;
+  // HTTP Basic auth：便于 curl / 监控探针 / CI 脚本免 Cookie 直接访问 /_api/*。
+  // 用户名忽略，只校验密码 == ADMIN_PASSWORD（和 /_api/login 的口令同源）。
+  // 刻意不回 WWW-Authenticate：否则浏览器打开面板会弹原生 Basic 登录框，
+  // 与我们自己的登录页冲突；curl -u 会预发 Authorization 头，无需质询。
+  const auth = req.headers.authorization || '';
+  const m = /^Basic\s+(.+)$/i.exec(auth);
+  if (m) {
+    let decoded = '';
+    try { decoded = Buffer.from(m[1], 'base64').toString('utf-8'); } catch { decoded = ''; }
+    const idx = decoded.indexOf(':');
+    if (idx >= 0 && decoded.slice(idx + 1) === CFG.adminPassword) return true;
+  }
   return false;
 }
 

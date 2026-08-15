@@ -423,10 +423,22 @@ export default {
       // 健康检查只读 Worker 最近一次真实请求形成的本地快照。
       // 不因为公开探针访问就向上游 fan-out GET /session 和 /me；这类请求
       // 会产生额外行为，也可能干扰同一账号正在进行的会话。
+      //
+      // 顶层 status 表示「服务存活」：只要进程能应答就是 ok，存活探针（Docker
+      // HEALTHCHECK / k8s liveness / CI 冒烟）据此判定。账号池健康是另一回事——
+      // 0 账号是正常初始态（用户还没加号），不该让存活探针失败——单列到 pool_status。
+      // 之前把 summarizeAccountHealth 直接展开，其 status 会覆盖顶层 status，
+      // 空池时变成 "critical"，导致 CI 冒烟 grep '"status":"ok"' 一直失败。
+      const poolHealth = summarizeAccountHealth(parseAccounts(env), acctHealth);
       return jsonResponse({
         status: "ok",
         version: VERSION,
-        ...summarizeAccountHealth(parseAccounts(env), acctHealth),
+        pool_status: poolHealth.status,
+        accounts: poolHealth.accounts,
+        alive_accounts: poolHealth.alive_accounts,
+        unknown_accounts: poolHealth.unknown_accounts,
+        account_states: poolHealth.account_states,
+        account_details: poolHealth.account_details,
         health_source: "worker_cache",
         time: new Date().toISOString(),
       }, 200);
