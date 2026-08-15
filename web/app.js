@@ -112,20 +112,37 @@ function statePill(s) {
   return `<span class="pill ${cls}"><span class="dot ${cls}"></span>${label}</span>`;
 }
 
-function quotaHtml(probe) {
-  if (!probe || !probe.quota || !probe.quota.length) return '<span class="quota">—</span>';
-  return '<div class="quota">' + probe.quota.map(q =>
-    `<div class="quota-row"><b>${esc(q.model)}</b><span class="quota-count">已用 ${esc(q.used ?? '—')} / 总量 ${esc(q.limit ?? '—')}</span>${q.resetAt ? '<span class="quota-reset">重置 ' + esc(formatResetAt(q.resetAt)) + '</span>' : ''}</div>`
-  ).join('') + '</div>';
+// 额度是「池级」共享计数：同一池（STANDARD=flash/mimo、PREMIUM 等）下所有模型
+// 共用一份每日次数，因此免费号的可用模型用量完全一致、每日 07:00 UTC 统一重置。
+// 账号级用量取用量最高的池呈现（免费号只有一个池，等价于账号通用）。
+function accountUsage(probe) {
+  if (!probe || !Array.isArray(probe.quota) || !probe.quota.length) return null;
+  let top = null;
+  for (const q of probe.quota) {
+    if (typeof q.limit !== 'number') continue;
+    if (!top || Number(q.used ?? 0) > Number(top.used ?? 0)) top = q;
+  }
+  return top;
 }
 
-// ISO 时间戳（2026-08-16T07:00:00.000Z）→ 本地化日期时间（2026-08-16 15:00）
-// 去掉 T / 毫秒 / 英文 Z，统一 YYYY-MM-DD HH:mm（本地时区，北京时间即 UTC+8）
+// 可用模型列：只列账号的可用模型 +（池级统一的）重置时间；用量已上移到账号名后。
+function modelsCellHtml(probe) {
+  if (!probe || !Array.isArray(probe.quota) || !probe.quota.length) return '<span class="quota">—</span>';
+  const models = probe.quota.map(q => `<b>${esc(q.model)}</b>`).join('');
+  const reset = probe.quota.map(q => q.resetAt).find(Boolean);
+  const resetHtml = reset ? `<span class="quota-reset">重置 ${esc(formatResetAt(reset))}</span>` : '';
+  return `<div class="quota"><div class="quota-models">${models}</div>${resetHtml}</div>`;
+}
+
+// ISO 时间戳（2026-08-16T07:00:00.000Z）→ 固定北京时间（UTC+8）YYYY-MM-DD HH:mm。
+// 额度按上游太平洋日 07:00 UTC 每日结算（= 北京 15:00），这里显式折算到东八区，
+// 不依赖浏览器/服务器所在时区，任何环境下都稳定显示北京时间。
 function formatResetAt(iso) {
   const d = new Date(iso);
   if (isNaN(d.getTime())) return '日期未知';
+  const bj = new Date(d.getTime() + 8 * 3600 * 1000);
   const pad = (n) => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  return `${bj.getUTCFullYear()}-${pad(bj.getUTCMonth() + 1)}-${pad(bj.getUTCDate())} ${pad(bj.getUTCHours())}:${pad(bj.getUTCMinutes())}`;
 }
 
 function renderStats() {
@@ -154,14 +171,18 @@ function renderAccounts() {
   }
   $('acctBody').innerHTML = S.accounts.map(a => {
     const h = S.health[a.key];
+    const usage = accountUsage(h);
+    const usageHtml = usage
+      ? ` <span class="acct-usage" title="已用 / 总量（每日额度，池级共享）">( ${esc(usage.used ?? '—')} / ${esc(usage.limit ?? '—')} )</span>`
+      : '';
     return `<tr>
       <td>
-        <div class="nm">${esc(a.name || a.email || a.key)}</div>
+        <div class="nm">${esc(a.name || a.email || a.key)}${usageHtml}</div>
         <div class="mono">${esc(a.email || '')}</div>
         <div class="mono">${esc(a.tokenShort || '')}</div>
       </td>
       <td>${h ? statePill(h.state) : '<span class="pill muted">未探测</span>'}</td>
-      <td>${quotaHtml(h)}</td>
+      <td>${modelsCellHtml(h)}</td>
       <td>
         <div class="actions">
           <button class="btn tiny" data-probe="${esc(a.key)}">探测</button>

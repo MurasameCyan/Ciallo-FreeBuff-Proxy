@@ -96,10 +96,17 @@ assert.match(css, /@media\s*\(max-width:\s*480px\)/,
 assert.match(css, /@media\s*\(max-width:\s*660px\)/,
   '手机端侧栏必须退化为单列');
 assert.ok(html.includes('aria-live="polite"'), 'OAuth 状态变化必须可被辅助技术播报');
-assert.match(app, /已用 .*总量/, '额度展示必须明确“已用/总量”语义');
-assert.match(app, /class="quota-row"/, '额度每个模型必须用单行 quota-row 承载（紧凑布局）');
-assert.match(css, /\.quota-row\s*\{[^}]*flex-wrap:\s*wrap/s,
-  '额度行必须内联并允许换行，而非每项独占一行撑高条目');
+assert.match(html, /<th>可用模型\(重置时间\)<\/th>/, '额度列标题必须改为“可用模型(重置时间)”');
+assert.ok(app.includes('esc(usage.used') && app.includes('esc(usage.limit'),
+  '账号用量必须移动到账号名之后（池级共享，视作账号通用）呈现 (已用/总量)');
+assert.match(app, /class="acct-usage"/, '账号名后必须有 acct-usage 承载用量');
+assert.match(app, /class="quota-models"/, '可用模型列必须列出账号可用模型');
+assert.match(app, /8 \* 3600 \* 1000/, '重置时间必须显式折算到北京时间（UTC+8）');
+assert.match(app, /getUTCHours\(\)/, '北京时间格式化必须基于 UTC 偏移而非浏览器本地时区');
+assert.ok(!app.includes('quota-row'), '旧的每模型 quota-row 用量行必须移除');
+assert.match(css, /\.acct-usage\s*\{[^}]*white-space:\s*nowrap/s, '账号用量必须单行不换行');
+assert.match(css, /\.quota-models\s*\{[^}]*flex-wrap:\s*wrap/s,
+  '可用模型必须内联并允许换行，而非每项独占一行撑高条目');
 assert.match(html, /id="repo-link"[^>]*aria-label="GitHub 仓库"/s,
   '纯图标仓库链接必须有可访问名称');
 assert.match(html, /id="tab-manage"[^>]*aria-controls="pane-manage"/s,
