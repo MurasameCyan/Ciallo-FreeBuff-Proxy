@@ -57,6 +57,10 @@ USER node
 ENV NODE_ENV=production \
     PORT=8787
 
+# 数据目录固定指到挂载卷（账号池/API Key/模型映射/内核缓存都落这里，
+# /app 对 node 用户是只读的）
+ENV FREEBUFF_DATA_DIR=/data
+
 # 构建标识。面板右上角显示它，「检查更新」拿它和 GitHub 上 beta 的 HEAD 比。
 # 刻意放在最后：这个值每次提交都变，放前面会把后面所有层的缓存全打掉。
 # 不传也能构建，只是面板显示 unknown 且不会报「有新版本」（见 server/build.mjs）。

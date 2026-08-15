@@ -8,6 +8,23 @@ import { initProxy, stopProxy, setLogger, getUpstreamFetch, mihomo } from './ser
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
+// 持久化数据目录：账号池、API Key、模型映射、mihomo 缓存都放这里。
+// Docker 里是挂载的 /data 卷（容器内以 node 用户运行，/app 只读写不进）；
+// 本地开发默认 ./data。FREEBUFF_DATA_DIR 显式设置优先。
+// 容器检测：/.dockerenv 是 docker 创建的标记文件（非 Windows 虚拟根映射）。
+function isDocker() {
+  try {
+    return existsSync('/.dockerenv');
+  } catch {
+    return false;
+  }
+}
+const DATA_DIR = process.env.FREEBUFF_DATA_DIR
+  || (isDocker() ? '/data' : resolve(__dirname, 'data'));
+function dataFile(...parts) {
+  return resolve(DATA_DIR, ...parts);
+}
+
 // ===========================================================================
 // Ciallo-FreeBuff-Proxy 服务端
 // ---------------------------------------------------------------------------
@@ -29,10 +46,10 @@ const CFG = {
   adminPassword: env.ADMIN_PASSWORD || '',
   // 会话有效期（小时）
   sessionTtlHours: parseFloat(env.ADMIN_SESSION_TTL_HOURS || '24'),
-  // 账号池文件路径
-  credFile: env.FREEBUFF_CREDENTIALS_FILE || resolve(__dirname, 'credentials/freebuff_credentials.json'),
-  // 自定义模型映射文件路径（可选，格式同 MODEL_ALIASES env：别名=模型id 逗号分隔）
-  aliasFile: env.MODEL_ALIASES_FILE || resolve(__dirname, 'aliases.json'),
+  // 账号池文件路径（数据目录可写，Docker 里是 /data 卷）
+  credFile: env.FREEBUFF_CREDENTIALS_FILE || dataFile('credentials', 'freebuff_credentials.json'),
+  // 自定义模型映射文件路径（面板可改，需落盘 → 放数据目录。格式同 MODEL_ALIASES env：别名=模型id 逗号分隔）
+  aliasFile: env.MODEL_ALIASES_FILE || dataFile('aliases.json'),
   // 上游（与 worker.js 的 CODEBUFF_API 保持一致）
   codebuffApi: env.CODEBUFF_API || 'https://www.codebuff.com',
   // 是否禁止前端修改账号池（只读部署）
@@ -44,7 +61,7 @@ const CFG = {
 };
 
 // === API Key 持久化（面板「重置 Key」生成的随机 key 存这里，env 未设时生效） ===
-const KEY_FILE = resolve(__dirname, 'credentials/server-key.txt');
+const KEY_FILE = dataFile('credentials', 'server-key.txt');
 function currentApiKey() {
   if (env.FREEBUFF_API_KEY) return env.FREEBUFF_API_KEY; // env 显式配置优先
   try {
@@ -629,6 +646,23 @@ function sanitizeUser(user) {
 // 启动
 // ===========================================================================
 ensureCredDir();
+
+// 一次性迁移：老版本 aliases.json 在项目根（/app/aliases.json），
+// 现在默认读到数据目录。若数据目录还没有、项目根却有（用户加过映射），
+// 复制过去，避免面板「模型映射」丢失用户配置。容器里 /app 只读，
+// 复制到 /data 后 /app 那份就不用再动了。
+if (!env.MODEL_ALIASES_FILE) {
+  try {
+    const legacyAliases = resolve(__dirname, 'aliases.json');
+    if (existsSync(legacyAliases) && !existsSync(CFG.aliasFile)) {
+      mkdirSync(dirname(CFG.aliasFile), { recursive: true });
+      writeFileSync(CFG.aliasFile, readFileSync(legacyAliases, 'utf-8'), 'utf-8');
+      console.log('[server] 迁移 aliases.json → ' + CFG.aliasFile);
+    }
+  } catch (e) {
+    console.error('[server] 迁移 aliases.json 失败（忽略）:', e.message);
+  }
+}
 
 // 出口代理（可选）：配了 SUBSCRIPTION_URL 才起 mihomo，否则保持直连。
 // mihomo 就绪后 getUpstreamFetch() 返回走代理的 fetch，注入 worker env。

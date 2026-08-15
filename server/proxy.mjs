@@ -25,7 +25,11 @@ const CTRL_PORT = parseInt(process.env.MIHOMO_CTRL_PORT || '19090', 10);   // ex
 const POOL_NAME = 'freebuff-pool';
 const PROVIDER_NAME = 'freebuff-airport';
 const MIHOMO_BIN = process.env.MIHOMO_BIN || '/usr/local/bin/mihomo';
-const MIHOMO_DATA_DIR = process.env.MIHOMO_DATA_DIR || resolve(process.cwd(), '.mihomo');
+// mihomo 数据（订阅缓存、配置）放到数据目录。默认跟随 server.js 的 DATA_DIR
+// （Docker 里是 /data 卷，node 用户可写；本地开发回退到 ./data/.mihomo）。
+const MIHOMO_DATA_DIR = process.env.MIHOMO_DATA_DIR
+  || process.env.FREEBUFF_DATA_DIR
+  || resolve(process.cwd(), '.mihomo');
 const MIHOMO_CONFIG = resolve(MIHOMO_DATA_DIR, 'config.yaml');
 
 let logger = (level, msg) => console.log(`[${level}] ${msg}`);

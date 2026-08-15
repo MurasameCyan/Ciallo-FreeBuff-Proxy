@@ -17,6 +17,18 @@ docker compose up -d
 
 打开 http://127.0.0.1:8787 ，用 `.env` 里的密码登录面板，在「账号池 → 添加」里粘贴 Freebuff token。
 
+### 局域网 / 容器互通（可选）
+
+默认端口只绑本机回环。想让同机其它 compose 项目（agent 容器）按容器名访问，解开
+`docker-compose.yml` 里的 `ai-internal` 网络注释（两处），先建好外部网络再启动：
+
+```bash
+docker network create ai-internal
+docker compose up -d
+```
+
+之后其它容器用 `http://freebuff-proxy:8787/v1` 即可，无需暴露宿主端口。
+
 ## 配置
 
 | 环境变量 | 必填 | 说明 |
@@ -26,6 +38,7 @@ docker compose up -d
 | `FREEBUFF_API_KEY` | 否 | 面板 API Key，不设则首次启动自动生成 |
 | `FREEBUFF_TOKEN` | 否 | 账号池 token（多账号逗号分隔），也可在面板里添加 |
 | `FREEBUFF_READONLY` | 否 | `true` 时禁止面板修改账号池 |
+| `FREEBUFF_DATA_DIR` | 否 | 数据目录（账号池/Key/模型映射/内核缓存），容器默认 `/data`，本地默认 `./data` |
 
 ## 出口代理（订阅）
 

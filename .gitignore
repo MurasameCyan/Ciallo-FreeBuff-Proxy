@@ -41,6 +41,10 @@ aliases.json.tmp
 # mihomo 运行时数据（订阅缓存、配置），本地运行不提交
 .mihomo/
 
+# 本地运行数据（账号池、API Key、模型映射落盘），不提交
+data/
+data/**
+
 # Hermes 本地计划、实验补丁和会话资料，仅本地保存
 .hermes/
 

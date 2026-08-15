@@ -10,6 +10,18 @@ services:
     restart: unless-stopped
     ports:
       - "127.0.0.1:8787:8787"
+
+    # 想让同一台机器上别的 compose 项目（比如各种 agent 容器）直接按容器名连过来，
+    # 就把下面两段和文件末尾的 networks 一起解注释。加入同一个外部网络之后，
+    # 那些容器用 http://freebuff-proxy:8787/v1 就能访问，不必绕
+    # host.docker.internal 或者宿主的回环端口 —— 回环映射在容器里连不上，而
+    # host.docker.internal 在 Linux 上默认不存在。上面的 ports 可以一起删掉，
+    # 只走内部网络的话面板和 API 都不再暴露到宿主。
+    # 网络得先自己建好（compose 不会替你建 external 的）：
+    #   docker network create ai-internal
+    # networks:
+    #   - ai-internal
+
     environment:
       # 面板登录密码（必填，未设则面板不鉴权）
       PANEL_PASS: ${ADMIN_PASSWORD:-}
@@ -25,7 +37,7 @@ services:
       # 账号池只读（true=禁止面板改账号）
       # FREEBUFF_READONLY: ${FREEBUFF_READONLY:-false}
     volumes:
-      # 账号池、API Key、mihomo 缓存都放命名卷
+      # 账号池、API Key、模型映射、mihomo 缓存都放命名卷
       - freebuff-data:/data
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:'+(process.env.PORT||8787)+'/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
@@ -36,3 +48,9 @@ services:
 
 volumes:
   freebuff-data:
+
+# 配合上面 services.freebuff-proxy.networks 一起解注释。external: true 是「这个网络我在
+# 外面建好了，别管它的生命周期」—— compose down 不会把它删掉，别的项目还连着。
+# networks:
+#   ai-internal:
+#     external: true
