@@ -5,7 +5,7 @@
  */
 
 const $ = (id) => document.getElementById(id);
-const POLL_MS = 5000;
+const POLL_MS = 3600000; // 默认 1 小时自动刷新；需要即时数据可点概况区的刷新图标
 
 const S = {
   accounts: [], health: {}, aliases: {},
@@ -115,7 +115,7 @@ function statePill(s) {
 function quotaHtml(probe) {
   if (!probe || !probe.quota || !probe.quota.length) return '<span class="quota">—</span>';
   return '<div class="quota">' + probe.quota.map(q =>
-    `<div><b>${esc(q.model)}</b><span class="quota-count">已用 ${esc(q.used ?? '—')} / 总量 ${esc(q.limit ?? '—')}</span>${q.resetAt ? '<span class="quota-reset">重置 ' + esc(formatResetAt(q.resetAt)) + '</span>' : ''}</div>`
+    `<div class="quota-row"><b>${esc(q.model)}</b><span class="quota-count">已用 ${esc(q.used ?? '—')} / 总量 ${esc(q.limit ?? '—')}</span>${q.resetAt ? '<span class="quota-reset">重置 ' + esc(formatResetAt(q.resetAt)) + '</span>' : ''}</div>`
   ).join('') + '</div>';
 }
 
@@ -313,7 +313,7 @@ function renderProxy() {
   }
 
   const healthEnabled = p.autoHealthCheck ?? p.healthCheck?.enabled ?? false;
-  const rawInterval = Number(p.healthCheckInterval ?? p.healthCheck?.interval ?? 300);
+  const rawInterval = Number(p.healthCheckInterval ?? p.healthCheck?.interval ?? 600);
   const healthToggle = $('proxyHealthEnabled');
   const healthSelect = $('proxyHealthInterval');
   if (healthToggle) {
@@ -321,8 +321,9 @@ function renderProxy() {
     healthToggle.disabled = state === 'disabled' || state === 'starting';
   }
   if (healthSelect) {
-    const seconds = rawInterval > 3600 ? Math.round(rawInterval / 1000) : rawInterval;
-    const value = String(Number.isFinite(seconds) && seconds > 0 ? seconds : 300);
+    // 后端始终以秒返回（上限 86400）。超过上限的才当作误存的毫秒值折算回秒。
+    const seconds = rawInterval > 86400 ? Math.round(rawInterval / 1000) : rawInterval;
+    const value = String(Number.isFinite(seconds) && seconds > 0 ? seconds : 600);
     if (![...healthSelect.options].some((option) => option.value === value)) {
       const option = document.createElement('option');
       option.value = value;
@@ -331,6 +332,26 @@ function renderProxy() {
     }
     healthSelect.value = value;
     healthSelect.disabled = !healthEnabled || state === 'disabled' || state === 'starting';
+  }
+
+  const updateEnabled = p.autoUpdate ?? p.update?.enabled ?? false;
+  const rawUpdateInterval = Number(p.autoUpdateInterval ?? p.update?.interval ?? 21600);
+  const updateToggle = $('proxyAutoUpdate');
+  const updateSelect = $('proxyUpdateInterval');
+  if (updateToggle) {
+    updateToggle.checked = Boolean(updateEnabled);
+    updateToggle.disabled = state === 'disabled' || state === 'starting';
+  }
+  if (updateSelect) {
+    const value = String(Number.isFinite(rawUpdateInterval) && rawUpdateInterval > 0 ? rawUpdateInterval : 21600);
+    if (![...updateSelect.options].some((option) => option.value === value)) {
+      const option = document.createElement('option');
+      option.value = value;
+      option.textContent = `${value} 秒`;
+      updateSelect.append(option);
+    }
+    updateSelect.value = value;
+    updateSelect.disabled = !updateEnabled || state === 'disabled' || state === 'starting';
   }
 }
 
@@ -414,6 +435,21 @@ function wire() {
   $('logoutBtn').addEventListener('click', async () => {
     try { await api('/logout', { method: 'POST' }); } catch { /* 照样跳 */ }
     location.replace('/');
+  });
+
+  // 概况区刷新图标：自动轮询已降到 5 分钟，这里点一下立即拉一次最新数据。
+  $('btn-refresh')?.addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    if (btn.disabled) return;
+    btn.disabled = true;
+    btn.classList.add('spin');
+    try {
+      await refresh();
+      toast('已刷新', 'ok');
+    } finally {
+      btn.disabled = false;
+      btn.classList.remove('spin');
+    }
   });
 
   // 接入地址:各协议复制自己的 base URL
@@ -540,6 +576,31 @@ function wire() {
   };
   $('proxyHealthEnabled')?.addEventListener('change', saveProxyHealth);
   $('proxyHealthInterval')?.addEventListener('change', saveProxyHealth);
+
+  let updateSaving = false;
+  const saveProxyUpdate = async () => {
+    if (updateSaving) return;
+    updateSaving = true;
+    const toggle = $('proxyAutoUpdate');
+    const interval = $('proxyUpdateInterval');
+    toggle.disabled = true; interval.disabled = true;
+    try {
+      const r = await api('/proxy/update', {
+        method: 'PUT',
+        body: JSON.stringify({ enabled: toggle.checked, interval: Number(interval.value) }),
+      });
+      S.proxy = r?.proxy || r || S.proxy;
+      toast('自动更新设置已保存', 'ok');
+    } catch (e) {
+      toast(`保存自动更新设置失败:${e.message}`, 'err');
+    } finally {
+      updateSaving = false;
+      renderProxy();
+      refresh();
+    }
+  };
+  $('proxyAutoUpdate')?.addEventListener('change', saveProxyUpdate);
+  $('proxyUpdateInterval')?.addEventListener('change', saveProxyUpdate);
 
   // 手动添加账号
   $('addForm').addEventListener('submit', (e) => {

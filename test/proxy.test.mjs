@@ -120,6 +120,37 @@ test('自动测活间隔拒绝过短或非整数值', async () => {
   assert.equal(status.healthCheckInterval, 120);
 });
 
+test('自动更新间隔拒绝过短或非整数值并按小时粒度保存', async () => {
+  const { service } = fakeService();
+  await assert.rejects(() => service.setUpdate({ enabled: true, interval: 300 }), /3600/);
+  await assert.rejects(() => service.setUpdate({ enabled: true, interval: 3600.5 }), /整数/);
+  const status = await service.setUpdate({ enabled: true, interval: 10800 });
+  assert.equal(status.autoUpdate, true);
+  assert.equal(status.autoUpdateInterval, 10800);
+  assert.equal(status.update.enabled, true);
+  assert.equal(status.update.interval, 10800);
+});
+
+test('启用自动更新按间隔注册定时刷新，关闭后清除', async () => {
+  const timers = [];
+  let seq = 0;
+  const { service } = fakeService({
+    settings: { autoHealthCheck: false },
+    service: {
+      setIntervalFn: (fn, ms) => { const id = ++seq; timers.push({ id, fn, ms }); return id; },
+      clearIntervalFn: (id) => { const i = timers.findIndex((t) => t.id === id); if (i >= 0) timers.splice(i, 1); },
+    },
+  });
+  await service.setSubscription('https://sub.example.com/list');
+  assert.equal(timers.length, 0, '自动测活与自动更新均关闭时不应注册定时器');
+  const armed = await service.setUpdate({ enabled: true, interval: 3600 });
+  assert.equal(armed.autoUpdate, true);
+  assert.equal(timers.length, 1, '启用自动更新应注册一个定时器');
+  assert.equal(timers[0].ms, 3600 * 1000);
+  await service.setUpdate({ enabled: false, interval: 3600 });
+  assert.equal(timers.length, 0, '关闭自动更新应清除定时器');
+});
+
 test('测活更新节点失败时返回安全状态而不是向调用方抛出', async () => {
   const { service } = fakeService({
     controller: {
@@ -183,9 +214,9 @@ test('关闭自动测活时，保存订阅仍会测活一次以完成延迟排�
   assert.equal(status.nodes[0].delay, 60);
 });
 
-test('管理 API 暴露订阅、刷新、节点与测活设置路由', () => {
+test('管理 API 暴露订阅、刷新、节点、测活与更新设置路由', () => {
   const server = readFileSync(new URL('../server.js', import.meta.url), 'utf8');
-  for (const marker of ["sub === 'subscription'", "sub === 'refresh'", "sub === 'node'", "sub === 'health'"]) {
+  for (const marker of ["sub === 'subscription'", "sub === 'refresh'", "sub === 'node'", "sub === 'health'", "sub === 'update'"]) {
     assert.ok(server.includes(marker), `server.js 缺少代理路由: ${marker}`);
   }
 });

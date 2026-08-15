@@ -13,6 +13,7 @@ import {
   setProxySubscription,
   setProxyNode,
   setProxyHealth,
+  setProxyUpdate,
   refreshSubscription,
   getConfiguredSubscription,
   isProxyEnvLocked,
@@ -511,6 +512,7 @@ async function handleWebApi(req, res, url) {
   // POST /_api/proxy/refresh
   // PUT /_api/proxy/node { mode: auto|manual, node? }
   // PUT /_api/proxy/health { enabled, interval }
+  // PUT /_api/proxy/update { enabled, interval }
   // 旧面板曾使用 PUT /_api/proxy，保留为订阅设置的兼容入口。
   if (seg === 'proxy') {
     if (method === 'GET' && !sub) {
@@ -571,6 +573,22 @@ async function handleWebApi(req, res, url) {
         const proxy = await setProxyHealth({
           enabled: body.enabled,
           interval: body.interval ?? body.healthCheckInterval,
+        });
+        return json(res, 200, { ok: proxy.ok, proxy });
+      } catch (e) {
+        return proxyApiError(res, e);
+      }
+    }
+
+    if (method === 'PUT' && sub === 'update') {
+      let body;
+      try { body = await readJsonObject(req); } catch (e) {
+        return e.code === 'INVALID_JSON' ? err(res, 400, e.message) : proxyApiError(res, e);
+      }
+      try {
+        const proxy = await setProxyUpdate({
+          enabled: body.enabled,
+          interval: body.interval ?? body.autoUpdateInterval,
         });
         return json(res, 200, { ok: proxy.ok, proxy });
       } catch (e) {

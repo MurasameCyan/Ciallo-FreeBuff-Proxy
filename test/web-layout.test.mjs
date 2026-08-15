@@ -36,7 +36,8 @@ for (const id of [
   'proxyCurrentNode', 'proxyLastRefresh', 'proxyError', 'proxyMessage',
   'proxySubscriptionForm', 'proxySubscription', 'proxySubscriptionSave',
   'proxyModeAuto', 'proxyModeManual', 'proxyNode', 'proxyHealthEnabled', 'proxyHealthInterval',
-  'build-id', 'btn-update', 'repo-link', 'logoutBtn', 'toasts',
+  'proxyAutoUpdate', 'proxyUpdateInterval',
+  'build-id', 'btn-update', 'repo-link', 'logoutBtn', 'toasts', 'btn-refresh',
 ]) {
   assert.match(html, new RegExp(`id=["']${id}["']`), `管理面板丢失 DOM 绑定 #${id}`);
 }
@@ -96,6 +97,9 @@ assert.match(css, /@media\s*\(max-width:\s*660px\)/,
   '手机端侧栏必须退化为单列');
 assert.ok(html.includes('aria-live="polite"'), 'OAuth 状态变化必须可被辅助技术播报');
 assert.match(app, /已用 .*总量/, '额度展示必须明确“已用/总量”语义');
+assert.match(app, /class="quota-row"/, '额度每个模型必须用单行 quota-row 承载（紧凑布局）');
+assert.match(css, /\.quota-row\s*\{[^}]*flex-wrap:\s*wrap/s,
+  '额度行必须内联并允许换行，而非每项独占一行撑高条目');
 assert.match(html, /id="repo-link"[^>]*aria-label="GitHub 仓库"/s,
   '纯图标仓库链接必须有可访问名称');
 assert.match(html, /id="tab-manage"[^>]*aria-controls="pane-manage"/s,
@@ -139,11 +143,25 @@ assert.ok(app.includes("api('/proxy')"), '面板轮询必须读取代理订阅�
 assert.ok(app.includes("api('/proxy/subscription'"), '保存订阅必须调用订阅配置接口');
 assert.ok(app.includes("api('/proxy/node'"), '节点策略必须调用节点选择接口');
 assert.ok(app.includes("api('/proxy/health'"), '自动测活设置必须调用测活配置接口');
+assert.ok(app.includes("api('/proxy/update'"), '自动更新设置必须调用更新配置接口');
 assert.match(html, /id="proxyModeAuto"[^>]*aria-pressed="true"/s,
   '自动节点模式按钮必须暴露 pressed 状态');
 assert.match(html, /id="proxyHealthEnabled"/s, '代理卡必须提供自动测活开关');
+assert.match(html, /id="proxyAutoUpdate"/s, '代理卡必须提供自动更新开关');
+assert.match(html, /id="proxyHealthInterval"[\s\S]*?value="43200"[\s\S]*?<\/select>/s,
+  '检测间隔必须提供到 12 小时的粒度（1/10/30 分钟、1/6/12 小时）');
+assert.ok(!html.includes('>5 分钟<'), '检测间隔不应再保留旧的 5 分钟选项');
+assert.match(html, /id="proxyUpdateInterval"[\s\S]*?value="3600"[\s\S]*?value="86400"[\s\S]*?<\/select>/s,
+  '自动更新间隔必须提供 1 小时到 24 小时的选项');
 assert.ok(!html.includes('id="proxyRefresh"'), '代理卡不应保留重复的底部刷新按钮');
 assert.ok(!app.includes("api('/proxy/refresh'"), '保存订阅应由单次 PUT 完成，不应再重复 POST 刷新');
+
+// 账号池概况：自动轮询降到 1 小时，并提供可即时刷新的图标按钮。
+assert.ok(app.includes('const POLL_MS = 3600000'), '默认轮询间隔必须为 1 小时（3600000ms）');
+assert.ok(!html.includes('每 5 秒更新'), '概况区不应再声称每 5 秒更新');
+assert.ok(!html.includes('每 5 分钟刷新'), '概况区不应再声称每 5 分钟刷新');
+assert.match(html, /class="summary-live"[\s\S]*?每小时刷新/s, '概况区必须标注每小时刷新节奏');
+assert.match(html, /id="btn-refresh"[^>]*aria-label="立即刷新"/s, '概况区刷新图标必须有可访问名称');
 
 // 所有 id 必须唯一，避免重排后 renderStats/renderModels 写入错误节点。
 const ids = [...html.matchAll(/\bid=["']([^"']+)["']/g)].map((m) => m[1]);

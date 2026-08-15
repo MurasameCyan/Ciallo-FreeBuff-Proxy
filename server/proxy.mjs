@@ -48,10 +48,15 @@ const DEFAULT_PROXY_SETTINGS = Object.freeze({
   nodeMode: 'auto',
   selectedNode: '',
   autoHealthCheck: true,
-  healthCheckInterval: 300,
+  healthCheckInterval: 600,
+  autoUpdate: false,
+  autoUpdateInterval: 21600,
 });
 const MIN_HEALTH_INTERVAL = 30;
 const MAX_HEALTH_INTERVAL = 86400;
+// 自动更新订阅比测活重（要重新拉取机场配置），最小粒度限制为 1 小时。
+const MIN_UPDATE_INTERVAL = 3600;
+const MAX_UPDATE_INTERVAL = 86400;
 
 let logger = (level, msg) => console.log(`[${level}] ${msg}`);
 
@@ -140,9 +145,9 @@ function cleanError(error) {
     .slice(0, 240);
 }
 
-function normalizeInterval(value, fallback = DEFAULT_PROXY_SETTINGS.healthCheckInterval) {
+function normalizeInterval(value, fallback = DEFAULT_PROXY_SETTINGS.healthCheckInterval, min = MIN_HEALTH_INTERVAL, max = MAX_HEALTH_INTERVAL) {
   const n = Number(value);
-  return Number.isInteger(n) && n >= MIN_HEALTH_INTERVAL && n <= MAX_HEALTH_INTERVAL ? n : fallback;
+  return Number.isInteger(n) && n >= min && n <= max ? n : fallback;
 }
 
 export function resolveProxySettings({ envUrl = '', saved = {} } = {}) {
@@ -155,6 +160,10 @@ export function resolveProxySettings({ envUrl = '', saved = {} } = {}) {
     selectedNode: nodeMode === 'manual' ? String(saved?.selectedNode || '').trim() : '',
     autoHealthCheck: saved?.autoHealthCheck !== false,
     healthCheckInterval: normalizeInterval(saved?.healthCheckInterval),
+    autoUpdate: saved?.autoUpdate === true,
+    autoUpdateInterval: normalizeInterval(
+      saved?.autoUpdateInterval, DEFAULT_PROXY_SETTINGS.autoUpdateInterval, MIN_UPDATE_INTERVAL, MAX_UPDATE_INTERVAL,
+    ),
     source: lockedUrl ? 'env' : savedUrl ? 'data' : 'none',
     envLocked: Boolean(lockedUrl),
   };
@@ -254,6 +263,7 @@ export function createProxyService({
   let upstreamFetch = null;
   let closeFetch = null;
   let healthTimer = null;
+  let updateTimer = null;
   let tail = Promise.resolve();
 
   const serial = (fn) => {
@@ -269,6 +279,8 @@ export function createProxyService({
       selectedNode: cfg.selectedNode,
       autoHealthCheck: cfg.autoHealthCheck,
       healthCheckInterval: cfg.healthCheckInterval,
+      autoUpdate: cfg.autoUpdate,
+      autoUpdateInterval: cfg.autoUpdateInterval,
     };
   }
 
@@ -288,6 +300,16 @@ export function createProxyService({
     healthTimer = null;
   }
 
+  function stopUpdateTimer() {
+    if (updateTimer) clearIntervalFn(updateTimer);
+    updateTimer = null;
+  }
+
+  function stopTimers() {
+    stopHealthTimer();
+    stopUpdateTimer();
+  }
+
   function scheduleHealth() {
     stopHealthTimer();
     if (!cfg.autoHealthCheck || !cfg.subscriptionUrl || state !== 'ready') return;
@@ -298,6 +320,20 @@ export function createProxyService({
       });
     }, cfg.healthCheckInterval * 1000);
     healthTimer?.unref?.();
+  }
+
+  // 自动更新：按间隔重新拉取订阅（等价于一次手动刷新），刷新完成后会重排定时器，
+  // 保证下一次更新从本次刷新起算，节奏稳定。
+  function scheduleUpdate() {
+    stopUpdateTimer();
+    if (!cfg.autoUpdate || !cfg.subscriptionUrl || state !== 'ready') return;
+    updateTimer = setIntervalFn(() => {
+      serial(() => refreshCore({ ensureStarted: true })).catch((e) => {
+        lastError = cleanError(e);
+        serviceLogger('warn', `[proxy] 自动更新订阅失败: ${lastError}`);
+      });
+    }, cfg.autoUpdateInterval * 1000);
+    updateTimer?.unref?.();
   }
 
   function snapshot() {
@@ -331,6 +367,13 @@ export function createProxyService({
         interval: cfg.healthCheckInterval,
         lastCheckAt: lastHealthAt,
         error: healthError || null,
+      },
+      autoUpdate: cfg.autoUpdate,
+      autoUpdateInterval: cfg.autoUpdateInterval,
+      update: {
+        enabled: cfg.autoUpdate,
+        interval: cfg.autoUpdateInterval,
+        lastRefreshAt,
       },
       source: cfg.source,
       envLocked: cfg.envLocked,
@@ -399,7 +442,7 @@ export function createProxyService({
   async function failToDirect(error) {
     lastError = cleanError(error);
     state = 'error';
-    stopHealthTimer();
+    stopTimers();
     await closeDispatcher();
     try { await manager.stop(); } catch {}
     version = null;
@@ -431,6 +474,7 @@ export function createProxyService({
       await ensureDispatcher();
       state = 'ready';
       scheduleHealth();
+      scheduleUpdate();
       return true;
     } catch (e) {
       await failToDirect(e);
@@ -457,6 +501,7 @@ export function createProxyService({
       state = 'ready';
       lastError = '';
       scheduleHealth();
+      scheduleUpdate();
     } catch (e) {
       await closeDispatcher();
       lastError = cleanError(e);
@@ -467,7 +512,7 @@ export function createProxyService({
   }
 
   async function disableCore() {
-    stopHealthTimer();
+    stopTimers();
     await closeDispatcher();
     try { await manager.stop(); } catch {}
     state = 'disabled';
@@ -528,7 +573,7 @@ export function createProxyService({
           // 内核可能在 ready 后被 OOM/SIGTERM 杀掉；不能继续把旧 dispatcher
           // 注入 worker，否则请求会反复打到已失效的 mixed-port。状态探测失败
           // 时立即关闭代理连接并回落直连，下一次 refresh 会重新建立它。
-          stopHealthTimer();
+          stopTimers();
           await closeDispatcher();
           version = null;
           nodeNames = [];
@@ -539,7 +584,7 @@ export function createProxyService({
         }
       } catch (e) {
         if (state !== 'error') state = 'stopped';
-        stopHealthTimer();
+        stopTimers();
         await closeDispatcher();
         version = null;
         nodeNames = [];
@@ -581,6 +626,21 @@ export function createProxyService({
         save();
         scheduleHealth();
         if (enabled && cfg.subscriptionUrl && await manager.isRunning()) await testHealthCore();
+        return snapshot();
+      });
+    },
+    setUpdate({ enabled, interval } = {}) {
+      return serial(async () => {
+        if (typeof enabled !== 'boolean') throw new Error('enabled 必须是布尔值');
+        const n = Number(interval);
+        if (!Number.isInteger(n)) throw new Error('自动更新间隔必须是整数秒');
+        if (n < MIN_UPDATE_INTERVAL || n > MAX_UPDATE_INTERVAL) {
+          throw new Error(`自动更新间隔必须在 ${MIN_UPDATE_INTERVAL} 到 ${MAX_UPDATE_INTERVAL} 秒之间`);
+        }
+        cfg.autoUpdate = enabled;
+        cfg.autoUpdateInterval = n;
+        save();
+        scheduleUpdate();
         return snapshot();
       });
     },
@@ -641,6 +701,7 @@ export async function getProxyStatus() { return proxyService.status(); }
 export async function setProxySubscription(url) { return proxyService.setSubscription(url); }
 export async function setProxyNode(options) { return proxyService.setNode(options); }
 export async function setProxyHealth(options) { return proxyService.setHealth(options); }
+export async function setProxyUpdate(options) { return proxyService.setUpdate(options); }
 export function getConfiguredSubscription() { return proxyService.getSubscriptionUrl(); }
 export function isProxyEnvLocked() { return proxyService.isEnvLocked(); }
 export async function stopProxy() { return proxyService.stop(); }
