@@ -47,11 +47,15 @@ test('关闭后保存不会写入新数据', async () => {
   try {
     const file = join(dir, 'usage.json');
     const store = createUsagePersistence(file);
-    store.setEnabled(true);
-    await store.save({ ...blank, startTime: 456 });
-    const before = await readFile(file, 'utf8');
-    store.setEnabled(false);
+    const snapshot = { ...blank, startTime: 456 };
+    await store.setEnabled(true);
+    await store.save(snapshot);
+    await store.setEnabled(false);
+    const disabledState = await readFile(file, 'utf8');
+    const persisted = JSON.parse(disabledState);
+    assert.equal(persisted.enabled, false);
+    assert.deepEqual(persisted.snapshot, snapshot);
     await store.save({ ...blank, startTime: 789 });
-    assert.equal(await readFile(file, 'utf8'), before);
+    assert.equal(await readFile(file, 'utf8'), disabledState);
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
