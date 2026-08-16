@@ -42,20 +42,24 @@ for (const id of [
   assert.match(html, new RegExp(`id=["']${id}["']`), `管理面板丢失 DOM 绑定 #${id}`);
 }
 
-assert.match(css, /\.workspace-grid\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)\s+minmax\(300px,\s*380px\)/s,
-  '工作区右侧代理列必须收窄并限制为 380px');
+assert.match(css, /\.workspace-grid\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1\.3fr\)\s+minmax\(360px,\s*1fr\)/s,
+  '工作区必须是左宽右窄两列（左数据区 / 右概况·代理）');
 assert.match(css, /\.workspace-grid\s*>\s*\.runtime-card\s*\{[^}]*grid-column:\s*1[^}]*grid-row:\s*1/s,
   '运行状态卡片必须位于左上');
 assert.match(css, /\.workspace-grid\s*>\s*\.model-workspace-card\s*\{[^}]*grid-column:\s*1[^}]*grid-row:\s*2/s,
   '模型配置卡片必须位于左下');
-assert.match(css, /\.workspace-grid\s*>\s*\.proxy-card\s*\{[^}]*grid-column:\s*2[^}]*grid-row:\s*1\s*\/\s*span\s*2/s,
-  '出口代理卡片必须位于右侧并跨越两行');
+assert.match(css, /\.workspace-grid\s*>\s*\.usage-card\s*\{[^}]*grid-column:\s*2[^}]*grid-row:\s*1/s,
+  '运行概况卡片必须位于右上');
+assert.match(css, /\.workspace-grid\s*>\s*\.proxy-card\s*\{[^}]*grid-column:\s*2[^}]*grid-row:\s*2/s,
+  '出口代理卡片必须位于右下');
 assert.match(css, /\.workspace-grid\s*>\s*\.runtime-card/s,
   '运行状态卡片必须是工作区直接子项');
 assert.match(css, /\.workspace-grid\s*>\s*\.proxy-card/s,
   '出口代理卡片必须是工作区直接子项');
 assert.match(css, /\.workspace-grid\s*>\s*\.model-workspace-card/s,
   '模型配置卡片必须是工作区直接子项');
+assert.match(css, /\.workspace-grid\s*>\s*\.usage-card/s,
+  '运行概况卡片必须是工作区直接子项');
 assert.match(css, /@media\s*\(max-width:\s*1100px\)[\s\S]*?\.workspace-grid\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)/,
   '窄屏工作区必须退化为单列');
 assert.ok(!html.includes('egress-card'), '不应保留重复的出口状态卡片');
@@ -101,6 +105,9 @@ assert.ok(app.includes('esc(usage.used') && app.includes('esc(usage.limit'),
   '账号用量必须移动到账号名之后（池级共享，视作账号通用）呈现 (已用/总量)');
 assert.match(app, /class="acct-usage"/, '账号名后必须有 acct-usage 承载用量');
 assert.match(app, /class="quota-models"/, '可用模型列必须列出账号可用模型');
+assert.match(app, /function usableQuota/, '必须提供 usableQuota 以过滤未解锁模型');
+assert.match(app, /Number\(q\.limit\)\s*>\s*0/,
+  '可用模型与账号用量必须只取 limit>0 的池，隐藏 0/0 未解锁模型（如 glm-5.2）');
 assert.match(app, /8 \* 3600 \* 1000/, '重置时间必须显式折算到北京时间（UTC+8）');
 assert.match(app, /getUTCHours\(\)/, '北京时间格式化必须基于 UTC 偏移而非浏览器本地时区');
 assert.ok(!app.includes('quota-row'), '旧的每模型 quota-row 用量行必须移除');
@@ -214,17 +221,17 @@ assert.match(css, /\.calllog\s*\{[^}]*scrollbar-width:\s*none/s,
 assert.match(css, /\.calllog-main\s*\{[^}]*flex-wrap:\s*wrap/s,
   '调用日志主行必须可折行，避免横向溢出');
 
-// ── 概况卡（移植自 zen；通栏放在工作区之上、出口代理之上） ────────────
+// ── 运行概况卡（移植自 zen；占工作区右上格，出口代理上方） ────────────
 for (const id of ['usageCard', 's-tok', 's-tok-sub', 's-models', 's-models-empty',
   's-req', 's-req-sub', 's-rate', 's-rate-bar', 's-up', 's-up-sub', 'h-usage']) {
   assert.match(html, new RegExp(`id=["']${id}["']`), `概况卡丢失 DOM 绑定 #${id}`);
 }
 assert.match(html, /<section class="card usage-card" id="usageCard"/,
-  '概况必须是通栏 usage-card 卡');
-assert.match(html, /id="usageCard"[\s\S]*class="workspace-grid"/s,
-  '概况卡必须位于工作区网格之上');
+  '概况必须是 usage-card 卡');
+assert.match(html, /class="workspace-grid"[\s\S]*id="usageCard"/s,
+  '概况卡必须移入工作区网格（右上格）');
 assert.match(html, /id="usageCard"[\s\S]*id="proxyCard"/s,
-  '概况卡必须位于出口代理之上（放在出口代理上方）');
+  '概况卡（右上）必须排在出口代理（右下）之前');
 assert.match(html, /<h2 id="h-usage">概况<\/h2>/, '概况标题必须为“概况”');
 assert.match(html, /class="usage-grid"/, '概况必须用 usage-grid 承载 2×2 四格');
 const usageStatCount = (html.match(/class="usage-stat"/g) || []).length;

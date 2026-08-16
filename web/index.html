@@ -47,55 +47,6 @@
 </header>
 
 <main id="main" class="dashboard">
-  <!-- ── 概况（移植自 zen） ─────────────────────────────── -->
-  <!-- 一张卡内 2×2 四格：Token 消耗 / 模型统计 / 请求总数·成功率 / 运行时长。
-       DOM 顺序 == 视觉顺序（两列 grid 逐行填充），Tab / 读屏顺序即左上→右上→
-       左下→右下。数据来自 /usage 的 total·byModel·startTime·lastRequest，全部
-       进程内累计、重启清零。通栏放在工作区上方，即出口代理之上。 -->
-  <section class="card usage-card" id="usageCard" aria-labelledby="h-usage">
-    <div class="card-head">
-      <div class="card-title">
-        <p class="eyebrow">运行概况</p>
-        <h2 id="h-usage">概况</h2>
-      </div>
-    </div>
-    <div class="usage-grid">
-      <article class="usage-stat">
-        <h3>Token 消耗</h3>
-        <p class="usage-big" id="s-tok">—</p>
-        <p class="usage-sub" id="s-tok-sub">输入 — · 输出 — · 推理 — · 缓存读 — · 缓存写 —</p>
-      </article>
-      <!-- 各模型成功调用次数，按次数降序。与「调用日志」不同口径：那边是最近
-           200 条时间线，这边是开机至今的累计分布。 -->
-      <article class="usage-stat">
-        <h3>模型统计</h3>
-        <ul class="usage-models" id="s-models" aria-label="各模型成功调用次数，按次数降序"></ul>
-        <p class="usage-empty" id="s-models-empty" hidden>还没有成功的调用</p>
-      </article>
-      <!-- 成功率与请求总数并进一格：同一组数的两种写法，两列并排、进度条压底。
-           每列自成一块，读屏按 DOM 念时标签与数值不会串位。 -->
-      <article class="usage-stat">
-        <div class="usage-duo">
-          <div>
-            <h3>请求总数</h3>
-            <p class="usage-big" id="s-req">—</p>
-          </div>
-          <div>
-            <h3 id="h-rate">成功率</h3>
-            <p class="usage-big" id="s-rate">—</p>
-          </div>
-        </div>
-        <p class="usage-sub" id="s-req-sub">成功 — · 失败 —</p>
-        <div class="usage-bar" role="img" aria-labelledby="h-rate s-rate"><span id="s-rate-bar"></span></div>
-      </article>
-      <article class="usage-stat">
-        <h3>运行时长</h3>
-        <p class="usage-big" id="s-up">—</p>
-        <p class="usage-sub" id="s-up-sub">最后请求 —</p>
-      </article>
-    </div>
-  </section>
-
   <div class="workspace-grid">
     <!-- ── 运行状态：账号池与接入信息 ───────────────────── -->
     <section class="card account-card runtime-card" aria-labelledby="h-accounts">
@@ -104,7 +55,7 @@
           <div>
             <p class="eyebrow">运行状态</p>
             <h2 id="h-overview">账号池概况</h2>
-            <span class="summary-live"><span class="dot ok"></span>每小时刷新<button type="button" class="summary-refresh" id="btn-refresh" title="立即刷新" aria-label="立即刷新"><svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg></button></span>
+            <span class="summary-live"><span class="dot ok"></span>每小时刷新<button type="button" class="summary-refresh" id="btn-refresh" title="立即刷新" aria-label="立即刷新"><svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg></button></span>
           </div>
           <div class="summary-tools">
             <div class="access-card access-inline" aria-labelledby="h-conn">
@@ -192,6 +143,54 @@
           <button type="button" class="login-url" id="loginUrl" hidden></button>
           <p class="hint" id="oauthStatus" aria-live="polite"></p>
         </section>
+      </div>
+    </section>
+
+    <!-- ── 运行概况（移植自 zen）：占工作区右上格 ──────────────── -->
+    <!-- 一张卡内 2×2 四格：Token 消耗 / 模型统计 / 请求总数·成功率 / 运行时长。
+         数据来自 /usage 的 total·byModel·startTime·lastRequest，全部进程内累计、
+         重启清零。放在右上（运行状态右侧、出口代理上方）。 -->
+    <section class="card usage-card" id="usageCard" aria-labelledby="h-usage">
+      <div class="card-head">
+        <div class="card-title">
+          <p class="eyebrow">运行概况</p>
+          <h2 id="h-usage">概况</h2>
+        </div>
+      </div>
+      <div class="usage-grid">
+        <article class="usage-stat">
+          <h3>Token 消耗</h3>
+          <p class="usage-big" id="s-tok">—</p>
+          <p class="usage-sub" id="s-tok-sub">输入 — · 输出 — · 推理 — · 缓存读 — · 缓存写 —</p>
+        </article>
+        <!-- 各模型成功调用次数，按次数降序。与「调用日志」不同口径：那边是最近
+             200 条时间线，这边是开机至今的累计分布。 -->
+        <article class="usage-stat">
+          <h3>模型统计</h3>
+          <ul class="usage-models" id="s-models" aria-label="各模型成功调用次数，按次数降序"></ul>
+          <p class="usage-empty" id="s-models-empty" hidden>还没有成功的调用</p>
+        </article>
+        <!-- 成功率与请求总数并进一格：同一组数的两种写法，两列并排、进度条压底。
+             每列自成一块，读屏按 DOM 念时标签与数值不会串位。 -->
+        <article class="usage-stat">
+          <div class="usage-duo">
+            <div>
+              <h3>请求总数</h3>
+              <p class="usage-big" id="s-req">—</p>
+            </div>
+            <div>
+              <h3 id="h-rate">成功率</h3>
+              <p class="usage-big" id="s-rate">—</p>
+            </div>
+          </div>
+          <p class="usage-sub" id="s-req-sub">成功 — · 失败 —</p>
+          <div class="usage-bar" role="img" aria-labelledby="h-rate s-rate"><span id="s-rate-bar"></span></div>
+        </article>
+        <article class="usage-stat">
+          <h3>运行时长</h3>
+          <p class="usage-big" id="s-up">—</p>
+          <p class="usage-sub" id="s-up-sub">最后请求 —</p>
+        </article>
       </div>
     </section>
 

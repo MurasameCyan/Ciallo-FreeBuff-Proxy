@@ -238,21 +238,30 @@ function statePill(s) {
 // 额度是「池级」共享计数：同一池（STANDARD=flash/mimo、PREMIUM 等）下所有模型
 // 共用一份每日次数，因此免费号的可用模型用量完全一致、每日 07:00 UTC 统一重置。
 // 账号级用量取用量最高的池呈现（免费号只有一个池，等价于账号通用）。
+// 「可用池」= 有真实额度（limit>0）。免费号里 glm-5.2 等未解锁模型上游会以 0/0
+// （limit=0）返回，既非真正可用、又会污染账号用量取值，这里统一滤掉。
+function usableQuota(probe) {
+  if (!probe || !Array.isArray(probe.quota)) return [];
+  return probe.quota.filter((q) => Number(q.limit) > 0);
+}
+
 function accountUsage(probe) {
-  if (!probe || !Array.isArray(probe.quota) || !probe.quota.length) return null;
+  const rows = usableQuota(probe);
+  if (!rows.length) return null;
   let top = null;
-  for (const q of probe.quota) {
-    if (typeof q.limit !== 'number') continue;
+  for (const q of rows) {
     if (!top || Number(q.used ?? 0) > Number(top.used ?? 0)) top = q;
   }
   return top;
 }
 
-// 可用模型列：只列账号的可用模型 +（池级统一的）重置时间；用量已上移到账号名后。
+// 可用模型列：只列真正有额度（limit>0）的模型 +（池级统一的）重置时间；0/0 未解锁
+// 模型（如免费号的 glm-5.2）直接隐藏。用量已上移到账号名后。
 function modelsCellHtml(probe) {
-  if (!probe || !Array.isArray(probe.quota) || !probe.quota.length) return '<span class="quota">—</span>';
-  const models = probe.quota.map(q => `<b>${esc(q.model)}</b>`).join('');
-  const reset = probe.quota.map(q => q.resetAt).find(Boolean);
+  const rows = usableQuota(probe);
+  if (!rows.length) return '<span class="quota">—</span>';
+  const models = rows.map(q => `<b>${esc(q.model)}</b>`).join('');
+  const reset = rows.map(q => q.resetAt).find(Boolean);
   const resetHtml = reset ? `<span class="quota-reset">重置 ${esc(formatResetAt(reset))}</span>` : '';
   return `<div class="quota"><div class="quota-models">${models}</div>${resetHtml}</div>`;
 }

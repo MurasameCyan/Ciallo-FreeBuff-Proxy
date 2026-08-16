@@ -137,22 +137,22 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
 
 .workspace-grid {
   display: grid;
-  /* 左侧承担数据密集区，代理列收窄并纵向跨两行。 */
-  grid-template-columns: minmax(0, 1fr) minmax(300px, 380px);
+  /* 2×2：左列承担数据密集区（账号池 / 模型），右列放运行概况与出口代理。 */
+  grid-template-columns: minmax(0, 1.3fr) minmax(360px, 1fr);
   grid-template-rows: auto auto;
   gap: 20px;
   align-items: stretch;
 }
 .workspace-grid > .runtime-card,
+.workspace-grid > .usage-card,
 .workspace-grid > .proxy-card,
 .workspace-grid > .model-workspace-card { min-width: 0; }
 .workspace-grid > .runtime-card { grid-column: 1; grid-row: 1; }
+.workspace-grid > .usage-card { grid-column: 2; grid-row: 1; display: flex; flex-direction: column; }
+/* 概况通常比左侧账号池矮，让 2×2 内格吃满卡高，卡底与运行状态齐平，不留空洞。 */
+.workspace-grid > .usage-card .usage-grid { flex: 1 1 auto; grid-auto-rows: 1fr; }
 .workspace-grid > .model-workspace-card { grid-column: 1; grid-row: 2; }
-.workspace-grid > .proxy-card {
-  grid-column: 2;
-  grid-row: 1 / span 2;
-  align-self: stretch;
-}
+.workspace-grid > .proxy-card { grid-column: 2; grid-row: 2; align-self: stretch; }
 
 @media (max-width: 1100px) {
   .workspace-grid {
@@ -160,6 +160,7 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
     grid-template-rows: auto;
   }
   .workspace-grid > .runtime-card,
+  .workspace-grid > .usage-card,
   .workspace-grid > .model-workspace-card,
   .workspace-grid > .proxy-card {
     grid-column: auto;
