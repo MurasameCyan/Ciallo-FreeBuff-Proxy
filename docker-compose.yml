@@ -38,6 +38,8 @@ services:
       # CODEBUFF_API: ${CODEBUFF_API:-}
       # 账号池只读（true=禁止面板改账号）
       # FREEBUFF_READONLY: ${FREEBUFF_READONLY:-false}
+      # 封禁/凭据失效状态文件（默认 /data/credentials/account-state.json）
+      # FREEBUFF_ACCOUNT_STATE_FILE: ${FREEBUFF_ACCOUNT_STATE_FILE:-}
     volumes:
       # 账号池 / API Key / 模型映射 / mihomo 缓存都落这里。
       # 绑挂到宿主 ./data，方便直接查看和管理账号文件

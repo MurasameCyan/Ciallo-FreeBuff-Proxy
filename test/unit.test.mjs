@@ -8,13 +8,14 @@ const src = readFileSync(new URL('../worker.js', import.meta.url), 'utf-8');
 // 使内部函数在沙箱全局可见，供单测直接调用。
 const wrapper = src.replace('export default {', 'const __workerDefault__ = {') +
   '\n\nglobalThis.__workerDefault__ = __workerDefault__;\n' +
-  'globalThis.__unitTestApi__ = { normalizeChatThinking, anthropicThinkingToEffort, namedEffort, normalizeReasoningEffort, collectReasoningTexts, anthropicStopReason, anthropicModelToOpenAI, parseModelAliases, resolveModelAlias, resolveModelConfig, findModelConfig, setTestAliases: (raw) => { currentAliases = parseModelAliases(raw); }, cooldown, cooldownInfo, inCooldown, markSessionInvalidated, wasRecentlyInvalidated, singleFlight, sessionRemainingMs, INVALIDATION_WINDOW_MS, SESSION_REUSE_SAFE_MS, SESSION_VERIFY_WINDOW_MS, executeChat, readCallUsage, accountLabel, logCall, callLogSnapshot, readUsageFull, recordRequest, blankUsageTotals, recordAccountObservation, setTestEgressReject: (fn) => { onEgressReject = fn; } };\n';
+  'globalThis.__unitTestApi__ = { normalizeChatThinking, anthropicThinkingToEffort, namedEffort, normalizeReasoningEffort, collectReasoningTexts, anthropicStopReason, anthropicModelToOpenAI, parseModelAliases, resolveModelAlias, resolveModelConfig, findModelConfig, setTestAliases: (raw) => { currentAliases = parseModelAliases(raw); }, cooldown, cooldownInfo, inCooldown, parseCooldown, nextPacificMidnight: typeof nextPacificMidnight === "function" ? nextPacificMidnight : null, pickToken, releaseToken: typeof releaseToken === "function" ? releaseToken : null, accountPoolExhaustion: typeof accountPoolExhaustion === "function" ? accountPoolExhaustion : null, waitingRoomResponse: typeof waitingRoomResponse === "function" ? waitingRoomResponse : null, pipeUpstreamToClient, pipeUpstreamToResponsesStream, markSessionInvalidated, wasRecentlyInvalidated, singleFlight, sessionRemainingMs, INVALIDATION_WINDOW_MS, SESSION_REUSE_SAFE_MS, SESSION_VERIFY_WINDOW_MS, executeChat, readCallUsage, accountLabel, logCall, callLogSnapshot, readUsageFull, recordRequest, blankUsageTotals, recordAccountObservation, setTestEgressReject: (fn) => { onEgressReject = fn; } };\n';
 
 // 可编程 fetch mock：测试里可替换 sandbox.fetch，返回可定制的 Response 形状
 // （worker 里用的是 { status, ok, headers, text() } 简化形状）。
 const fetchState = { calls: [], impl: null };
 const sandbox = {
   console, TextEncoder, TextDecoder, Set, Map, Date, Math, Number, String, JSON, Uint8Array, Object,
+  setTimeout, clearTimeout, AbortController, ReadableStream, TransformStream,
   // Node 18+ 全局 Response/Request 注入沙箱（worker.js 的 jsonResponse 用 new Response）
   Response, Request, Headers,
   fetch: async (url, init = {}) => {
@@ -29,7 +30,7 @@ sandbox.globalThis = sandbox;
 vm.createContext(sandbox);
 vm.runInContext(wrapper, sandbox);
 
-const { normalizeChatThinking, anthropicThinkingToEffort, namedEffort, normalizeReasoningEffort, collectReasoningTexts, anthropicStopReason, anthropicModelToOpenAI, parseModelAliases, resolveModelAlias, resolveModelConfig, findModelConfig, setTestAliases, cooldown, cooldownInfo, inCooldown, markSessionInvalidated, wasRecentlyInvalidated, singleFlight, sessionRemainingMs, INVALIDATION_WINDOW_MS, SESSION_REUSE_SAFE_MS, SESSION_VERIFY_WINDOW_MS, executeChat, readCallUsage, accountLabel, logCall, callLogSnapshot, readUsageFull, recordRequest, blankUsageTotals, recordAccountObservation, setTestEgressReject } = sandbox.__unitTestApi__;
+const { normalizeChatThinking, anthropicThinkingToEffort, namedEffort, normalizeReasoningEffort, collectReasoningTexts, anthropicStopReason, anthropicModelToOpenAI, parseModelAliases, resolveModelAlias, resolveModelConfig, findModelConfig, setTestAliases, cooldown, cooldownInfo, inCooldown, parseCooldown, nextPacificMidnight, pickToken, releaseToken, accountPoolExhaustion, waitingRoomResponse, pipeUpstreamToClient, pipeUpstreamToResponsesStream, markSessionInvalidated, wasRecentlyInvalidated, singleFlight, sessionRemainingMs, INVALIDATION_WINDOW_MS, SESSION_REUSE_SAFE_MS, SESSION_VERIFY_WINDOW_MS, executeChat, readCallUsage, accountLabel, logCall, callLogSnapshot, readUsageFull, recordRequest, blankUsageTotals, recordAccountObservation, setTestEgressReject } = sandbox.__unitTestApi__;
 
 let pass = 0, fail = 0;
 function t(name, fn) {
@@ -387,6 +388,136 @@ await tAsync('上游 429 → 本地冷却 + 下次直接本地 429', async () =>
   console.log('       [OK] 本地 429 锁拦截上游调用 ✓');
 });
 
+function installSingleChatResponse(makeResponse) {
+  let chatCalls = 0;
+  fetchState.calls = [];
+  fetchState.impl = (url, init) => {
+    const u = String(url);
+    if (u.includes('/api/v1/freebuff/session')) {
+      return Promise.resolve({
+        status: 200,
+        ok: true,
+        headers: {},
+        text: async () => JSON.stringify({
+          status: 'active',
+          instanceId: 'inst-first-failure',
+          expiresAt: new Date(Date.now() + 3600 * 1000).toISOString(),
+        }),
+      });
+    }
+    if (u.includes('/api/v1/agent-runs')) {
+      return Promise.resolve({ status: 200, ok: true, headers: {}, text: async () => JSON.stringify({ runId: 'run-first-failure' }) });
+    }
+    if (u.includes('/api/v1/ads') || u.includes('/api/v1/usage')) {
+      return Promise.resolve({ status: 200, ok: true, headers: {}, text: async () => '{}' });
+    }
+    if (u.includes('/api/v1/chat/completions')) {
+      chatCalls++;
+      return Promise.resolve(makeResponse());
+    }
+    return Promise.resolve({ status: 200, ok: true, headers: {}, text: async () => '{}' });
+  };
+  return () => chatCalls;
+}
+
+function installSingleChatFailure(status, payload) {
+  return installSingleChatResponse(() => ({
+    status,
+    ok: false,
+    headers: {},
+    text: async () => JSON.stringify(payload),
+  }));
+}
+
+const integrationChat = { model: 'deepseek/deepseek-v4-flash', messages: [{ role: 'user', content: 'hi' }], stream: false };
+const integrationModel = { id: 'deepseek/deepseek-v4-flash', session: 'deepseek/deepseek-v4-flash', upstream: 'deepseek/deepseek-v4-flash', agent: 'base2-free-deepseek' };
+const integrationReview = { ...integrationChat, metadata: { freebuff_mode: 'code_review' } };
+const integrationReviewModel = { ...integrationModel, root_agent: integrationModel.agent, reviewer_agent: 'code-reviewer' };
+
+await tAsync('首次上游 429 当次返回结构化池耗尽响应', async () => {
+  const chatCalls = installSingleChatFailure(429, { status: 'rate_limited', retryAfterMs: 60000 });
+  const env = { FREEBUFF_TOKEN: 'first-upstream-429-123456', FREEBUFF_DEBUG: 'false', FREEBUFF_ACCOUNT_STATE: {} };
+  const response = await executeChat(env, integrationChat, integrationModel, false, 'chat');
+  const body = await response.json();
+  if (chatCalls() !== 1) throw new Error(`上游 chat 调用 ${chatCalls()} 次`);
+  if (response.status !== 429 || body.error?.type !== 'rate_limit_exceeded') {
+    throw new Error(`首次 429 被误分类: ${response.status} ${JSON.stringify(body)}`);
+  }
+});
+
+await tAsync('首次明确 banned 当次返回 403', async () => {
+  const chatCalls = installSingleChatFailure(403, { status: 'banned' });
+  const env = { FREEBUFF_TOKEN: 'first-upstream-banned-123456', FREEBUFF_DEBUG: 'false', FREEBUFF_ACCOUNT_STATE: {} };
+  const response = await executeChat(env, integrationChat, integrationModel, false, 'chat');
+  const body = await response.json();
+  if (chatCalls() !== 1) throw new Error(`上游 chat 调用 ${chatCalls()} 次`);
+  if (response.status !== 403 || body.error?.type !== 'account_banned') {
+    throw new Error(`首次 banned 被误分类: ${response.status} ${JSON.stringify(body)}`);
+  }
+});
+
+await tAsync('首次 401 凭据失效当次返回 503', async () => {
+  const chatCalls = installSingleChatFailure(401, { status: 'unauthorized' });
+  const env = { FREEBUFF_TOKEN: 'first-upstream-invalid-123456', FREEBUFF_DEBUG: 'false', FREEBUFF_ACCOUNT_STATE: {} };
+  const response = await executeChat(env, integrationChat, integrationModel, false, 'chat');
+  const body = await response.json();
+  if (chatCalls() !== 1) throw new Error(`上游 chat 调用 ${chatCalls()} 次`);
+  if (response.status !== 503 || body.error?.type !== 'account_pool_unavailable') {
+    throw new Error(`首次 401 被误分类: ${response.status} ${JSON.stringify(body)}`);
+  }
+});
+
+await tAsync('Reviewer 首次上游 429 当次返回结构化池耗尽响应', async () => {
+  const chatCalls = installSingleChatFailure(429, { status: 'rate_limited', retryAfterMs: 60000 });
+  const env = { FREEBUFF_TOKEN: 'first-review-429-123456', FREEBUFF_DEBUG: 'false', FREEBUFF_ACCOUNT_STATE: {} };
+  const response = await executeChat(env, integrationReview, integrationReviewModel, false, 'chat');
+  const body = await response.json();
+  if (chatCalls() !== 1) throw new Error(`上游 reviewer 调用 ${chatCalls()} 次`);
+  if (response.status !== 429 || body.error?.type !== 'rate_limit_exceeded') {
+    throw new Error(`Reviewer 首次 429 被误分类: ${response.status} ${JSON.stringify(body)}`);
+  }
+});
+
+await tAsync('Reviewer 首次明确 banned 当次返回 403', async () => {
+  const chatCalls = installSingleChatFailure(403, { status: 'banned' });
+  const env = { FREEBUFF_TOKEN: 'first-review-banned-123456', FREEBUFF_DEBUG: 'false', FREEBUFF_ACCOUNT_STATE: {} };
+  const response = await executeChat(env, integrationReview, integrationReviewModel, false, 'chat');
+  const body = await response.json();
+  if (chatCalls() !== 1) throw new Error(`上游 reviewer 调用 ${chatCalls()} 次`);
+  if (response.status !== 403 || body.error?.type !== 'account_banned') {
+    throw new Error(`Reviewer 首次 banned 被误分类: ${response.status} ${JSON.stringify(body)}`);
+  }
+});
+
+await tAsync('流式首 chunk 前客户端取消会停止上游并释放账号', async () => {
+  let startedResolve;
+  const started = new Promise((resolve) => { startedResolve = resolve; });
+  let cancelCalls = 0;
+  installSingleChatResponse(() => new Response(new ReadableStream({
+    start() { startedResolve(); },
+    cancel() { cancelCalls++; },
+  })));
+  const token = 'pre-response-cancel-123456';
+  const env = { FREEBUFF_TOKEN: token, FREEBUFF_DEBUG: 'false', FREEBUFF_ACCOUNT_STATE: {} };
+  const clientAbort = new AbortController();
+  const pending = executeChat(env, { ...integrationChat, stream: true }, integrationModel, true, 'chat', clientAbort.signal);
+  await Promise.race([
+    started,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('上游 chat 未启动')), 5000)),
+  ]);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  clientAbort.abort(new Error('client disconnected'));
+  const outcome = await Promise.race([
+    pending.then(() => 'resolved', () => 'rejected'),
+    new Promise((resolve) => setTimeout(() => resolve('timeout'), 1000)),
+  ]);
+  if (outcome === 'timeout') throw new Error('客户端取消后 executeChat 未结束');
+  if (cancelCalls !== 1) throw new Error(`上游 reader.cancel 调用 ${cancelCalls} 次`);
+  const available = pickToken(env, integrationModel.session, new Set());
+  if (!available || available.token !== token) throw new Error('客户端取消后账号租约未释放');
+  releaseToken(token);
+});
+
 // 清理锁：worker 内部 cooldowns 是 const Map，无法从外部 clear。
 // 通过导出 inCooldown 验证锁确实生效即可；为隔离测试，换用不同 token 继续。
 
@@ -554,6 +685,280 @@ for (const [name, status, body, expect] of [
   });
 }
 setTestEgressReject(null);
+
+console.log('\n--- 账号隔离与严格选号（新契约）---');
+t('banned resumes_at 支持 RFC3339、Unix 秒、Unix 毫秒', () => {
+  if (typeof parseCooldown !== 'function') throw new Error('parseCooldown 未导出');
+  const now = Date.UTC(2030, 0, 1);
+  const target = now + 2 * 3600 * 1000;
+  for (const value of [
+    new Date(target).toISOString(),
+    String(Math.floor(target / 1000)),
+    String(target),
+  ]) {
+    const got = parseCooldown(JSON.stringify({ status: 'banned', resumes_at: value }), 403, {}, now);
+    if (Math.abs(got - 2 * 3600 * 1000) > 1000) throw new Error(`${value} -> ${got}`);
+  }
+});
+t('banned 缺少 resumes_at 时至少隔离 24 小时', () => {
+  const got = parseCooldown('{"status":"banned"}', 403, {}, Date.UTC(2030, 0, 1));
+  if (got < 24 * 3600 * 1000) throw new Error('got ' + got);
+});
+t('429 按 retryAfterMs、resetAt、Retry-After、太平洋午夜排序', () => {
+  const now = Date.UTC(2030, 0, 1, 16, 0, 0);
+  const direct = parseCooldown('{"retryAfterMs":123456}', 429, {}, now);
+  if (direct !== 123456) throw new Error('retryAfterMs 未优先: ' + direct);
+  const reset = parseCooldown(JSON.stringify({ resetAt: new Date(now + 234567).toISOString() }), 429, {}, now);
+  if (Math.abs(reset - 234567) > 1000) throw new Error('resetAt 未生效: ' + reset);
+  const header = parseCooldown('{}', 429, { 'Retry-After': '17' }, now);
+  if (header !== 17000) throw new Error('Retry-After 未生效: ' + header);
+  const human = parseCooldown('rate limited; try again in 5m', 429, {}, now);
+  if (human !== 300000) throw new Error('文本冷却未保留兼容: ' + human);
+  const midnight = parseCooldown('{}', 429, {}, now);
+  if (!(midnight > 0 && midnight < 24 * 3600 * 1000)) throw new Error('太平洋午夜兜底异常: ' + midnight);
+});
+await tAsync('waiting-room 返回结构化 503 和 Retry-After', async () => {
+  if (typeof waitingRoomResponse !== 'function') throw new Error('waitingRoomResponse 未导出');
+  const response = waitingRoomResponse(45000);
+  if (response.status !== 503) throw new Error('waiting-room 应返回 503');
+  if (response.headers.get('Retry-After') !== '45') throw new Error('Retry-After 不正确');
+  const body = await response.json();
+  if (body.error?.type !== 'waiting_room') throw new Error('错误类型不正确: ' + JSON.stringify(body));
+});
+async function assertCanceledPipeCancelsUpstream(startPipe) {
+  let cancelCalls = 0;
+  let completeCalls = 0;
+  const upstreamBody = {
+    getReader: () => ({
+      read: async () => ({ done: false, value: new TextEncoder().encode('data: {}\n\n') }),
+      cancel: async () => { cancelCalls++; },
+    }),
+  };
+  const writable = {
+    getWriter: () => ({
+      closed: new Promise(() => {}),
+      write: async () => { throw new Error('client canceled'); },
+      close: async () => {},
+    }),
+  };
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('管道未完成收尾')), 1000);
+    startPipe(upstreamBody, writable, () => {
+      completeCalls++;
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+  if (cancelCalls !== 1) throw new Error(`上游 reader.cancel 调用 ${cancelCalls} 次`);
+  if (completeCalls !== 1) throw new Error(`完成回调调用 ${completeCalls} 次`);
+}
+await tAsync('Chat SSE 客户端取消会取消上游 reader', async () => {
+  await assertCanceledPipeCancelsUpstream((body, writable, onComplete) =>
+    pipeUpstreamToClient(body, writable, onComplete));
+});
+await tAsync('Responses SSE 客户端取消会取消上游 reader', async () => {
+  await assertCanceledPipeCancelsUpstream((body, writable, onComplete) =>
+    pipeUpstreamToResponsesStream(body, writable, { id: 'test-model' }, onComplete));
+});
+async function assertPendingReadCancelsUpstream(startPipe) {
+  let cancelCalls = 0;
+  let completeCalls = 0;
+  let rejectClosed;
+  const upstreamBody = {
+    getReader: () => ({
+      read: () => new Promise(() => {}),
+      cancel: async () => { cancelCalls++; },
+    }),
+  };
+  const writable = {
+    getWriter: () => ({
+      closed: new Promise((resolve, reject) => { rejectClosed = reject; }),
+      write: async () => {},
+      close: async () => {},
+    }),
+  };
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('pending read 未完成收尾')), 1000);
+    startPipe(upstreamBody, writable, () => {
+      completeCalls++;
+      clearTimeout(timer);
+      resolve();
+    });
+    setTimeout(() => rejectClosed(new Error('client disconnected')), 10);
+  });
+  if (cancelCalls !== 1) throw new Error(`pending read 时 reader.cancel 调用 ${cancelCalls} 次`);
+  if (completeCalls !== 1) throw new Error(`pending read 时完成回调调用 ${completeCalls} 次`);
+}
+await tAsync('Chat SSE 下游断开会取消 pending upstream read', async () => {
+  await assertPendingReadCancelsUpstream((body, writable, onComplete) =>
+    pipeUpstreamToClient(body, writable, onComplete));
+});
+await tAsync('Responses SSE 下游断开会取消 pending upstream read', async () => {
+  await assertPendingReadCancelsUpstream((body, writable, onComplete) =>
+    pipeUpstreamToResponsesStream(body, writable, { id: 'test-model' }, onComplete));
+});
+t('Responses SSE 初始化失败会同步抛出供调用方释放租约', () => {
+  let threw = false;
+  let pending = null;
+  try {
+    pending = pipeUpstreamToResponsesStream(null, { getWriter: () => ({}) }, { id: 'test-model' }, () => {});
+  } catch {
+    threw = true;
+  }
+  if (pending && typeof pending.catch === 'function') pending.catch(() => {});
+  if (!threw) throw new Error('初始化异常被包装成未处理的 rejected Promise');
+});
+t('全池冷却时不删除记录、不强行放行账号', () => {
+  const env = { FREEBUFF_TOKEN: 'strict-pool-a-123456,strict-pool-b-123456' };
+  cooldown('strict-pool-a-123456', 60 * 60 * 1000, { reason: 'quota', retryAfterMs: 60000 });
+  cooldown('strict-pool-b-123456', 2 * 60 * 60 * 1000, { reason: 'quota', retryAfterMs: 120000 });
+  if (pickToken(env, null, new Set())) throw new Error('全池冷却时不应返回账号');
+  if (!cooldownInfo('strict-pool-a-123456') || !cooldownInfo('strict-pool-b-123456')) throw new Error('冷却记录被删除');
+});
+t('持久封禁/凭据失效账号跳过，忙账号释放后可选', () => {
+  const env = {
+    FREEBUFF_TOKEN: 'strict-banned-123456,strict-invalid-123456,strict-live-123456',
+    FREEBUFF_ACCOUNT_STATE: {
+      'strict-banned-123456': { state: 'banned', until: Date.now() + 3600000 },
+      'strict-invalid-123456': { state: 'token_invalid', until: null },
+    },
+  };
+  const first = pickToken(env, null, new Set());
+  if (!first || first.token !== 'strict-live-123456') throw new Error('未跳过持久隔离账号');
+  if (pickToken(env, null, new Set())) throw new Error('忙账号不应再次被选');
+  releaseToken(first.token);
+  const again = pickToken(env, null, new Set());
+  if (!again || again.token !== 'strict-live-123456') throw new Error('释放后账号不可选');
+  releaseToken(again.token);
+});
+t('池耗尽分类为 403/429/503', () => {
+  if (typeof accountPoolExhaustion !== 'function') throw new Error('accountPoolExhaustion 未导出');
+  const banned = accountPoolExhaustion({ FREEBUFF_TOKEN: 'only-banned-123456', FREEBUFF_ACCOUNT_STATE: { 'only-banned-123456': { state: 'banned', until: Date.now() + 3600000 } } });
+  if (banned.status !== 403) throw new Error('全封禁应 403: ' + JSON.stringify(banned));
+  const quotaEnv = { FREEBUFF_TOKEN: 'only-quota-123456' };
+  cooldown('only-quota-123456', 222000, { reason: 'quota', retryAfterMs: 222000 });
+  const quota = accountPoolExhaustion(quotaEnv);
+  if (quota.status !== 429 || quota.retryAfterMs < 221000 || quota.retryAfterMs > 222000) throw new Error('全限流应 429: ' + JSON.stringify(quota));
+  const mixed = accountPoolExhaustion({ FREEBUFF_TOKEN: 'busy-mixed-123456' });
+  if (mixed.status !== 503) throw new Error('混合/忙应 503: ' + JSON.stringify(mixed));
+});
+t('429 观测与额度冷却组合仍返回 429', () => {
+  const token = 'observed-quota-123456';
+  const env = { FREEBUFF_TOKEN: token, FREEBUFF_ACCOUNT_STATE: {} };
+  recordAccountObservation(token, 429, { status: 'rate_limited' });
+  cooldown(token, 222000, { reason: 'quota', retryAfterMs: 222000 });
+  const result = accountPoolExhaustion(env);
+  if (result.status !== 429 || result.retryAfterMs < 221000 || result.retryAfterMs > 222000) {
+    throw new Error('429 观测不应被健康状态改成 503: ' + JSON.stringify(result));
+  }
+});
+await tAsync('429 冷却到期后账号重新进入可选池', async () => {
+  const token = 'observed-quota-recovery-123456';
+  const env = { FREEBUFF_TOKEN: token, FREEBUFF_ACCOUNT_STATE: {} };
+  recordAccountObservation(token, 429, { status: 'rate_limited' });
+  cooldown(token, 5, { reason: 'quota', retryAfterMs: 5 });
+  if (pickToken(env, null, new Set())) throw new Error('冷却期间不应选中账号');
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const recovered = pickToken(env, null, new Set());
+  if (!recovered || recovered.token !== token) throw new Error('冷却到期后账号仍被永久摘除');
+  releaseToken(recovered.token);
+});
+t('池耗尽 Retry-After 使用最早冷却的真实剩余时间', () => {
+  const env = { FREEBUFF_TOKEN: 'remaining-a-123456,remaining-b-123456' };
+  cooldown('remaining-a-123456', 2000, { reason: 'quota', retryAfterMs: 60000 });
+  cooldown('remaining-b-123456', 5000, { reason: 'quota', retryAfterMs: 1000 });
+  const result = accountPoolExhaustion(env);
+  if (result.status !== 429 || result.retryAfterMs < 1700 || result.retryAfterMs > 2000) {
+    throw new Error('未按真实截止时间选择最早恢复账号: ' + JSON.stringify(result));
+  }
+});
+t('业务请求写入的封禁状态不会被同一请求的旧快照覆盖', () => {
+  const writes = [];
+  const token = 'stale-snapshot-banned-123456';
+  const env = {
+    FREEBUFF_TOKEN: token,
+    FREEBUFF_ACCOUNT_STATE: {},
+    FREEBUFF_ACCOUNT_STATE_SET: (t, state) => writes.push({ t, state }),
+    FREEBUFF_ACCOUNT_STATE_CLEAR: () => {},
+  };
+  const lease = pickToken(env, null, new Set());
+  if (!lease) throw new Error('测试账号应先可选');
+  releaseToken(lease.token);
+  recordAccountObservation(token, 403, '{"status":"banned"}');
+  const exhausted = accountPoolExhaustion(env);
+  if (exhausted.status !== 403) throw new Error('旧快照覆盖了刚写入的封禁: ' + JSON.stringify(exhausted));
+  if (!writes.length || writes[0].t !== token) throw new Error('未调用持久化回调');
+});
+t('账号状态持久化失败会记录错误并保留内存隔离', () => {
+  const token = 'persist-failure-banned-123456';
+  const env = {
+    FREEBUFF_TOKEN: token,
+    FREEBUFF_ACCOUNT_STATE: {},
+    FREEBUFF_ACCOUNT_STATE_SET: () => { throw new Error(`write failed for ${token}`); },
+    FREEBUFF_ACCOUNT_STATE_CLEAR: () => {},
+  };
+  const originalError = sandbox.console.error;
+  const errors = [];
+  sandbox.console.error = (...args) => errors.push(args.map(String).join(' '));
+  try {
+    const lease = pickToken(env, null, new Set());
+    if (!lease) throw new Error('测试账号应先可选');
+    releaseToken(lease.token);
+    recordAccountObservation(token, 403, { status: 'banned' });
+    if (pickToken(env, null, new Set())) throw new Error('写盘失败后内存隔离不应丢失');
+    if (!errors.some((line) => line.includes('[account-state] persist set failed'))) {
+      throw new Error('持久化失败被静默吞掉');
+    }
+    if (errors.some((line) => line.includes(token))) throw new Error('持久化错误日志泄露 token');
+  } finally {
+    sandbox.console.error = originalError;
+  }
+});
+t('不同请求的旧账号状态快照不会覆盖新写入的封禁', () => {
+  const token = 'stale-env-race-banned-123456';
+  let revision = 0;
+  const persisted = {};
+  const makeEnv = (snapshot, snapshotRevision) => ({
+    FREEBUFF_TOKEN: token,
+    FREEBUFF_ACCOUNT_STATE: snapshot,
+    FREEBUFF_ACCOUNT_STATE_REVISION: snapshotRevision,
+    FREEBUFF_ACCOUNT_STATE_SET: (t, state) => {
+      revision += 1;
+      persisted[t] = { ...state };
+      return { ...state, revision };
+    },
+    FREEBUFF_ACCOUNT_STATE_CLEAR: () => {},
+  });
+  const envA = makeEnv({}, 0);
+  const lease = pickToken(envA, null, new Set());
+  if (!lease) throw new Error('竞态测试账号应先可选');
+  releaseToken(lease.token);
+  recordAccountObservation(token, 403, { status: 'banned' });
+  if (pickToken(envA, null, new Set())) throw new Error('封禁状态未在原请求隔离');
+  const staleEnv = makeEnv({}, 0);
+  if (pickToken(staleEnv, null, new Set())) throw new Error('旧快照覆盖了刚写入的封禁');
+  const freshEnv = makeEnv({ [token]: persisted[token] }, revision);
+  if (pickToken(freshEnv, null, new Set())) throw new Error('新快照不应解除封禁');
+});
+t('管理员成功探测清除持久隔离后，账号和健康状态都可恢复', () => {
+  const token = 'manual-clear-recovery-123456';
+  const envBefore = {
+    FREEBUFF_TOKEN: token,
+    FREEBUFF_ACCOUNT_STATE: {},
+    FREEBUFF_ACCOUNT_STATE_REVISION: 0,
+    FREEBUFF_ACCOUNT_STATE_SET: () => {},
+    FREEBUFF_ACCOUNT_STATE_CLEAR: () => {},
+  };
+  const lease = pickToken(envBefore, null, new Set());
+  if (!lease) throw new Error('恢复测试账号应先可选');
+  releaseToken(lease.token);
+  recordAccountObservation(token, 403, '{"status":"banned"}');
+  if (pickToken(envBefore, null, new Set())) throw new Error('封禁状态未生效');
+  const envAfterProbe = { FREEBUFF_TOKEN: token, FREEBUFF_ACCOUNT_STATE: {}, FREEBUFF_ACCOUNT_STATE_REVISION: 1 };
+  const recovered = pickToken(envAfterProbe, null, new Set());
+  if (!recovered || recovered.token !== token) throw new Error('成功探测清除后仍不可选');
+  releaseToken(recovered.token);
+});
 
 console.log(`\n${pass} passed, ${fail} failed`);
 if (fail) process.exit(1);

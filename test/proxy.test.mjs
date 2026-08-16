@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { createServer, request as httpRequest } from 'node:http';
 import { createProxyService, maskSubscriptionUrl, resolveProxySettings } from '../server/proxy.mjs';
 
 const tests = [];
@@ -258,6 +259,85 @@ test('管理 API 暴露订阅、刷新、节点、测活与更新设置路由', 
   for (const marker of ["sub === 'subscription'", "sub === 'refresh'", "sub === 'node'", "sub === 'health'", "sub === 'update'"]) {
     assert.ok(server.includes(marker), `server.js 缺少代理路由: ${marker}`);
   }
+});
+
+test('透明转发使用 pipeline 传播背压与客户端断流', () => {
+  const server = readFileSync(new URL('../server/http-adapter.mjs', import.meta.url), 'utf8');
+  assert.ok(
+    server.includes('await pipeline(Readable.fromWeb(response.body), nodeRes)'),
+    'server.js 必须通过 Node pipeline 转发 Web response body',
+  );
+});
+
+test('客户端在 worker Response 前断开会中止 Request.signal', async () => {
+  const adapter = await import('../server/http-adapter.mjs').catch(() => ({}));
+  assert.equal(typeof adapter.forwardWorkerRequest, 'function', '必须提供可测试的 HTTP 转发桥');
+
+  let workerRequest = null;
+  let startedResolve;
+  let abortedResolve;
+  const started = new Promise((resolve) => { startedResolve = resolve; });
+  const aborted = new Promise((resolve) => { abortedResolve = resolve; });
+  const handler = {
+    async fetch(request) {
+      workerRequest = request;
+      startedResolve();
+      await new Promise((_, reject) => {
+        if (request.signal.aborted) return reject(request.signal.reason);
+        request.signal.addEventListener('abort', () => {
+          abortedResolve();
+          reject(request.signal.reason || new Error('client disconnected'));
+        }, { once: true });
+      });
+    },
+  };
+  const server = createServer((req, res) => {
+    adapter.forwardWorkerRequest(req, res, handler, {}).catch(() => {});
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  const client = httpRequest({ hostname: '127.0.0.1', port: address.port, path: '/v1/chat/completions', method: 'POST' });
+  client.on('error', () => {});
+  client.end('{}');
+  await Promise.race([
+    started,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('worker 未开始处理请求')), 2000)),
+  ]);
+  client.destroy();
+  await Promise.race([
+    aborted,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('客户端断开未传播到 worker')), 1000)),
+  ]);
+  assert.equal(workerRequest.signal.aborted, true);
+  await new Promise((resolve) => server.close(resolve));
+});
+
+test('正常透明响应不会误触发 Request.signal abort', async () => {
+  const { forwardWorkerRequest } = await import('../server/http-adapter.mjs');
+  let workerSignal;
+  const handler = {
+    async fetch(request) {
+      workerSignal = request.signal;
+      return new Response('ok', { status: 200 });
+    },
+  };
+  const server = createServer((req, res) => {
+    forwardWorkerRequest(req, res, handler, {}).catch(() => {});
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  const body = await new Promise((resolve, reject) => {
+    const client = httpRequest({ hostname: '127.0.0.1', port: address.port, path: '/healthz', method: 'GET' }, (res) => {
+      const chunks = [];
+      res.on('data', (chunk) => chunks.push(chunk));
+      res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    });
+    client.on('error', reject);
+    client.end();
+  });
+  assert.equal(body, 'ok');
+  assert.equal(workerSignal.aborted, false);
+  await new Promise((resolve) => server.close(resolve));
 });
 
 for (const { name, fn } of tests) {

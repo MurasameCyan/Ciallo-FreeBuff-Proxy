@@ -4,6 +4,8 @@ import { resolve, dirname, join, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import crypto from 'node:crypto';
 import { buildInfo, checkUpdate } from './server/build.mjs';
+import { createAccountStateStore } from './server/account-state.mjs';
+import { forwardWorkerRequest } from './server/http-adapter.mjs';
 import {
   initProxy,
   stopProxy,
@@ -63,6 +65,8 @@ const CFG = {
   sessionTtlHours: parseFloat(env.ADMIN_SESSION_TTL_HOURS || '24'),
   // 账号池文件路径（数据目录可写，Docker 里是 /data 卷）
   credFile: env.FREEBUFF_CREDENTIALS_FILE || dataFile('credentials', 'freebuff_credentials.json'),
+  // 账号封禁/凭据失效状态（只保存 token 哈希）
+  accountStateFile: env.FREEBUFF_ACCOUNT_STATE_FILE || dataFile('credentials', 'account-state.json'),
   // 自定义模型映射文件路径（面板可改，需落盘 → 放数据目录。格式同 MODEL_ALIASES env：别名=模型id 逗号分隔）
   aliasFile: env.MODEL_ALIASES_FILE || dataFile('aliases.json'),
   // 上游（与 worker.js 的 CODEBUFF_API 保持一致）
@@ -76,6 +80,8 @@ const CFG = {
   // 非空时由服务端锁定并优先于持久化配置。
   subscriptionUrl: getConfiguredSubscription(),
 };
+
+const accountStateStore = createAccountStateStore(CFG.accountStateFile);
 
 // === API Key 持久化（面板「重置 Key」生成的随机 key 存这里，env 未设时生效） ===
 const KEY_FILE = dataFile('credentials', 'server-key.txt');
@@ -297,7 +303,7 @@ async function probeAccount(token) {
     else if (data.status === 'ip_capped') { state = 'ip_capped'; label = 'IP 并发上限'; }
     else { state = 'ok'; label = '存活'; quota = fmtQuota(); }
   } else { state = 'unknown'; label = `HTTP ${r.status}`; }
-  return {
+  const result = {
     state, label, quota, retryAfterMs,
     uid: data.uid || null,
     accessTier: data.accessTier || null,
@@ -305,6 +311,10 @@ async function probeAccount(token) {
     statusCode: r.status,
     raw: String(r.text || '').slice(0, 500),
   };
+  // 只有管理员主动探测得到明确存活结果时才清除持久隔离；业务成功响应
+  // 不自动清除，避免上游短暂异常造成封禁状态抖动。
+  if (result.state === 'ok') accountStateStore.clear(token);
+  return result;
 }
 
 // === Freebuff 授权码登录（OAuth 代理） ===
@@ -370,37 +380,11 @@ const server = createServer(async (nodeReq, nodeRes) => {
 
     // ================= 透明转发给 worker（OpenAI/Anthropic API） =================
     // healthz 免鉴权（worker 内部逻辑）；其余路径由 worker 自己鉴权
-    const chunks = [];
-    for await (const chunk of nodeReq) chunks.push(chunk);
-    const body = Buffer.concat(chunks);
-
-    const upstreamUrl = `http://${nodeReq.headers.host || 'localhost'}${nodeReq.url}`;
-    const request = new Request(upstreamUrl, {
-      method: nodeReq.method,
-      headers: new Headers(nodeReq.headers),
-      body: body.length > 0 ? body : null,
-    });
-
     const workerEnv = buildWorkerEnv();
-    const response = await handler.fetch(request, workerEnv);
-
-    nodeRes.writeHead(response.status, Object.fromEntries(response.headers.entries()));
-    if (response.body) {
-      const reader = response.body.getReader();
-      try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          if (value) nodeRes.write(Buffer.from(value));
-        }
-      } catch {
-        // 客户端断流正常
-      }
-    }
-    if (!nodeRes.writableEnded) nodeRes.end();
+    await forwardWorkerRequest(nodeReq, nodeRes, handler, workerEnv);
   } catch (e) {
     console.error('[server] request error:', e.message);
-    if (!nodeRes.headersSent) {
+    if (!nodeRes.headersSent && !nodeRes.destroyed) {
       nodeRes.writeHead(502, { 'content-type': 'application/json' });
       nodeRes.end(JSON.stringify({ error: { message: 'proxy error', type: 'proxy_error' } }));
     } else if (!nodeRes.writableEnded) nodeRes.end();
@@ -469,6 +453,10 @@ function buildWorkerEnv() {
   const tokens = allTokens();
   const envTokens = (env.FREEBUFF_TOKEN || '').split(/[\n,]/).map((s) => s.trim()).filter(Boolean);
   for (const t of envTokens) if (!tokens.includes(t)) tokens.push(t);
+  const stateTokens = tokens.map((token) => {
+    const idx = token.indexOf(':');
+    return idx > 0 ? token.slice(0, idx).trim() : token;
+  });
   // 模型映射序列化（worker.js parseModelAliases 逆解析）
   const aliasStr = [...loadModelAliases().entries()].map(([k, v]) => `${k}=${v}`).join(',');
   return {
@@ -485,6 +473,11 @@ function buildWorkerEnv() {
     FREEBUFF_UPSTREAM_FETCH: getUpstreamFetch() || undefined,
     // 上游拒绝出站 IP（地区封禁/IP 触顶/裸 403）时回调，由代理服务归因到当前节点并进面板。
     FREEBUFF_ON_EGRESS_REJECT: noteEgressReject,
+    // worker 只拿当前账号的内存快照；落盘始终由 server 负责哈希 token。
+    FREEBUFF_ACCOUNT_STATE: accountStateStore.snapshot(stateTokens),
+    FREEBUFF_ACCOUNT_STATE_REVISION: accountStateStore.revision(),
+    FREEBUFF_ACCOUNT_STATE_SET: (token, state) => accountStateStore.set(token, state),
+    FREEBUFF_ACCOUNT_STATE_CLEAR: (token) => accountStateStore.clear(token),
   };
 }
 

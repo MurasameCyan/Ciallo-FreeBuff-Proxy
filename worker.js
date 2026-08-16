@@ -536,6 +536,114 @@ function wasRecentlyInvalidated(token, model, now = Date.now()) {
 const cooldowns = new Map();
 const sessCache = new Map();      // `${token}:${sessionModel}` -> { instanceId, model, remainingMs, expiresAt }（必须带 token，多账号防串号）
 
+// 明确的账号级隔离由 server.js 持久化；没有 Node adapter 时仍保留内存语义。
+const durableAccountStates = new Map(); // token -> { state, until, reason }
+const dirtyAccountStates = new Set(); // 本请求刚写入，不能被旧 env 快照覆盖
+const accountStateRevisions = new Map(); // token -> 最近已应用/本地写入的 store revision
+const accountLeases = new Map(); // token -> inFlight count (最多 1)
+let accountStateSet = null;
+let accountStateClear = null;
+const BANNED_DEFAULT_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+
+function validAccountStateRevision(value) {
+  const revision = Number(value);
+  return Number.isSafeInteger(revision) && revision >= 0 ? revision : null;
+}
+
+function noteAccountStateRevision(token, result) {
+  const revision = validAccountStateRevision(result && typeof result === "object" ? result.revision : null);
+  if (revision === null) return;
+  const previous = accountStateRevisions.get(token);
+  if (previous == null || revision > previous) accountStateRevisions.set(token, revision);
+}
+
+function syncAccountState(env) {
+  accountStateSet = env && typeof env.FREEBUFF_ACCOUNT_STATE_SET === "function"
+    ? env.FREEBUFF_ACCOUNT_STATE_SET : null;
+  accountStateClear = env && typeof env.FREEBUFF_ACCOUNT_STATE_CLEAR === "function"
+    ? env.FREEBUFF_ACCOUNT_STATE_CLEAR : null;
+  if (!env || !env.FREEBUFF_ACCOUNT_STATE || typeof env.FREEBUFF_ACCOUNT_STATE !== "object") return;
+  const incoming = env.FREEBUFF_ACCOUNT_STATE;
+  const incomingRevision = validAccountStateRevision(env.FREEBUFF_ACCOUNT_STATE_REVISION);
+  const tokens = new Set(parseAccounts(env).map((acct) => acct.token));
+  for (const token of tokens) {
+    const knownRevision = accountStateRevisions.get(token);
+    if (incomingRevision !== null && knownRevision != null && incomingRevision < knownRevision) continue;
+    if (dirtyAccountStates.has(token)
+      && (incomingRevision === null || knownRevision == null || incomingRevision <= knownRevision)) continue;
+    const record = incoming[token];
+    if (record && typeof record === "object" && record.state) {
+      durableAccountStates.set(token, { ...record });
+    } else {
+      const previous = durableAccountStates.get(token);
+      if (previous && (previous.state === "banned" || previous.state === "token_invalid" || previous.state === "manual_disabled")) {
+        cooldowns.delete(token);
+        acctHealth.delete(token);
+      }
+      durableAccountStates.delete(token);
+    }
+    if (incomingRevision !== null) accountStateRevisions.set(token, incomingRevision);
+    dirtyAccountStates.delete(token);
+  }
+}
+
+function durableAccountState(token, now = Date.now()) {
+  const record = durableAccountStates.get(token);
+  if (!record) return null;
+  if (record.state === "banned" && Number.isFinite(Number(record.until)) && Number(record.until) <= now) {
+    clearDurableAccountState(token);
+    acctHealth.delete(token);
+    return null;
+  }
+  return record;
+}
+
+function setDurableAccountState(token, record) {
+  if (!token || !record || !record.state) return;
+  const normalized = {
+    state: String(record.state),
+    until: record.until == null ? null : Number(record.until),
+    ...(record.reason ? { reason: String(record.reason) } : {}),
+  };
+  durableAccountStates.set(token, normalized);
+  dirtyAccountStates.add(token);
+  try {
+    if (accountStateSet) noteAccountStateRevision(token, accountStateSet(token, normalized));
+  } catch {
+    console.error("[account-state] persist set failed");
+  }
+}
+
+function clearDurableAccountState(token) {
+  durableAccountStates.delete(token);
+  dirtyAccountStates.add(token);
+  try {
+    if (accountStateClear) noteAccountStateRevision(token, accountStateClear(token));
+  } catch {
+    console.error("[account-state] persist clear failed");
+  }
+}
+
+function accountIsBlocked(token, now = Date.now()) {
+  const record = durableAccountState(token, now);
+  return Boolean(record && (record.state === "banned" || record.state === "token_invalid" || record.state === "manual_disabled"));
+}
+
+function acquireToken(token) {
+  if (!token || accountLeases.get(token)) return false;
+  accountLeases.set(token, 1);
+  return true;
+}
+
+function releaseToken(token) {
+  if (!token) return;
+  accountLeases.delete(token);
+}
+
+function tokenBusy(token) {
+  return accountLeases.get(token) === 1;
+}
+
 
 function parseAccounts(env) {
   // 支持一行一个（换行）或逗号分隔；每项可为纯 token 或 "token:uid"（冒号配对 user_id）
@@ -587,6 +695,21 @@ function recordAccountObservation(token, status, dataOrText, extra = {}) {
     || (state === "blocked" && !upstreamState);
   if (onEgressReject && ipLevel) {
     try { onEgressReject({ state, status }); } catch {}
+  }
+
+  // 只有账号级的明确结果才进入持久隔离；出口节点级拒绝继续交给代理层处理。
+  if (state === "banned") {
+    setDurableAccountState(token, {
+      state: "banned",
+      until: banUntil(dataOrText),
+      reason: "upstream_banned",
+    });
+  } else if (state === "token_invalid") {
+    setDurableAccountState(token, {
+      state: "token_invalid",
+      until: null,
+      reason: "upstream_auth_rejected",
+    });
   }
 
   const previous = acctHealth.get(token) || {};
@@ -788,16 +911,21 @@ function callLogSnapshot() {
   };
 }
 
-function pickToken(env, sessionModel) {
+function pickToken(env, sessionModel, attempted = new Set()) {
+  syncAccountState(env);
   const pool = parseAccounts(env);
   if (pool.length === 0) return null;
 
-  // v1.6.0：跳过已探测为失效的号（alive=false）；未探测/探测失败的不跳过（避免误杀）
+  // 只选择没有明确隔离、短期冷却或并发租约的账号。acctHealth 还承载
+  // rate_limited/country_blocked 等临时观测，只用于面板展示，不能永久摘号。
   const alivePool = pool.filter((acct) => {
-    const h = acctHealth.get(acct.token);
-    return !(h && h.alive === false);
+    if (attempted && attempted.has(acct.token)) return false;
+    if (accountIsBlocked(acct.token)) return false;
+    if (tokenBusy(acct.token)) return false;
+    return true;
   });
-  const usePool = alivePool.length > 0 ? alivePool : pool; // 全失效时回退全池，让请求继续（由 429 冷却接管）
+  const usePool = alivePool;
+  if (usePool.length === 0) return null;
 
   // v1.8.5.1：账号选择恢复为稳定轮询。
   // rateLimitsByModel 仅作为观测数据，不参与轮询顺序；真实 session/chat
@@ -811,11 +939,12 @@ function pickToken(env, sessionModel) {
   if (sessionModel) {
     for (const acct of finalPool) {
       const t = acct.token;
-      if (inCooldown(t)) continue;
+      if (inCooldown(t) || !acquireToken(t)) continue;
       const cached = sessCache.get(t + ":" + sessionModel);
       if (isUsableSession(cached)) {
         return acct;
       }
+      releaseToken(t);
     }
   }
 
@@ -824,16 +953,65 @@ function pickToken(env, sessionModel) {
     const acct = finalPool[accountIdx % finalPool.length];
     accountIdx = (accountIdx + 1) % finalPool.length;
     const t = acct.token;
-    if (!inCooldown(t)) return acct;
+    if (!inCooldown(t) && acquireToken(t)) return acct;
   }
-  // 全部在冷却中：找最早过期的那个，删掉它的冷却（放行一个号让请求继续），
-  // 由上游 429 再收回去。不要一直卡死整个池子。
-  let oldestToken = null, oldestUntil = Infinity;
-  for (const [t, c] of cooldowns) {
-    if (c.until < oldestUntil) { oldestUntil = c.until; oldestToken = t; }
+  return null;
+}
+
+function accountPoolExhaustion(env) {
+  syncAccountState(env);
+  const pool = parseAccounts(env);
+  if (pool.length === 0) return { status: 503, type: "config_error", retryAfterMs: null, allUnavailable: true };
+  const now = Date.now();
+  const details = pool.map((acct) => ({
+    token: acct.token,
+    state: durableAccountState(acct.token, now)?.state || null,
+    lock: cooldownInfo(acct.token, now),
+    busy: tokenBusy(acct.token),
+  }));
+  const allUnavailable = details.every((d) => Boolean(d.state || d.lock || d.busy));
+  if (details.every((d) => d.state === "banned")) {
+    return { status: 403, type: "account_banned", retryAfterMs: null, allUnavailable };
   }
-  if (oldestToken) cooldowns.delete(oldestToken);
-  return finalPool[0];
+  const quotaOnly = details.every((d) =>
+    !d.state && !d.busy && d.lock && d.lock.reason === "quota");
+  if (quotaOnly) {
+    const quotaLocks = details.map((d) => d.lock);
+    const retryAfterMs = Math.min(...quotaLocks.map((lock) => cooldownRemainingMs(lock, now)));
+    return { status: 429, type: "rate_limit_exceeded", retryAfterMs, allUnavailable };
+  }
+  return { status: 503, type: "account_pool_unavailable", retryAfterMs: null, allUnavailable };
+}
+
+function poolExhaustionResponse(env) {
+  const info = accountPoolExhaustion(env);
+  if (info.status === 403) {
+    return jsonResponse({ error: { message: "账号池中的账号均已被上游封禁", type: info.type } }, 403);
+  }
+  if (info.status === 429) {
+    const seconds = Math.max(1, Math.ceil(info.retryAfterMs / 1000));
+    return jsonResponse({
+      error: {
+        message: `账号额度已用完,请 ${seconds}s 后重试`,
+        type: info.type,
+        retryAfterMs: info.retryAfterMs,
+      },
+    }, 429, { "Retry-After": String(seconds), "X-RateLimit-Local": "1" });
+  }
+  const message = info.type === "config_error" ? "缺少 FREEBUFF_TOKEN 环境变量" : "当前没有可用账号";
+  return jsonResponse({ error: { message, type: info.type } }, 503);
+}
+
+function waitingRoomResponse(retryAfterMs = 30 * 1000) {
+  const ms = Math.max(1000, Number(retryAfterMs) || 30 * 1000);
+  const seconds = Math.max(1, Math.ceil(ms / 1000));
+  return jsonResponse({
+    error: {
+      message: `上游会话仍在排队，请 ${seconds}s 后重试`,
+      type: "waiting_room",
+      retryAfterMs: ms,
+    },
+  }, 503, { "Retry-After": String(seconds) });
 }
 
 function normalizeSession(data, requestedModel, now = Date.now()) {
@@ -898,6 +1076,10 @@ function cooldownInfo(token, now = Date.now()) {
   const c = cooldowns.get(token);
   if (!c || c.until <= now) { cooldowns.delete(token); return null; }
   return c;
+}
+
+function cooldownRemainingMs(lock, now = Date.now()) {
+  return Math.max(1, Number(lock?.until) - now || 1);
 }
 
 /** 该 token 是否处于冷却中 */
@@ -972,19 +1154,114 @@ function isQuotaExhausted(info, sessionModel) {
   return entry.limit - entry.recentCount <= 0;
 }
 
-function parseCooldown(text, status) {
-  // 优先解析 JSON 里的 retryAfterMs（luna 等模型 429 返回 {"retryAfterMs": 15506639}）
-  const jm = (text || "").match(/"retryAfterMs"\s*:\s*(\d+)/);
-  if (jm) {
-    const ms = parseInt(jm[1], 10);
-    if (ms > 0) return Math.min(ms, 6 * 3600 * 1000);
+function parseJsonBody(text) {
+  if (text && typeof text === "object") return text;
+  try { return JSON.parse(String(text || "")); } catch { return null; }
+}
+
+function findStructuredValue(value, names, depth = 0) {
+  if (!value || typeof value !== "object" || depth > 5) return undefined;
+  for (const name of names) {
+    if (Object.prototype.hasOwnProperty.call(value, name)) return value[name];
   }
-  const m = (text || "").match(/try again in (?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?\s*(?:(\d+)\s*s)?/i);
-  if (m) {
-    const ms = (parseInt(m[1]||0,10)*3600 + parseInt(m[2]||0,10)*60 + parseInt(m[3]||0,10)) * 1000;
-    if (ms > 0) return Math.min(ms, 6*3600*1000);
+  for (const child of Object.values(value)) {
+    const hit = findStructuredValue(child, names, depth + 1);
+    if (hit !== undefined) return hit;
   }
-  return status === 429 ? 5*60*1000 : 60*1000;
+  return undefined;
+}
+
+function timestampMs(value) {
+  if (value == null || value === "") return null;
+  const numeric = Number(value);
+  if (Number.isFinite(numeric)) return Math.abs(numeric) < 1e12 ? numeric * 1000 : numeric;
+  const parsed = Date.parse(String(value));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function delayUntil(value, now = Date.now()) {
+  const target = timestampMs(value);
+  return target == null ? null : Math.max(0, target - now);
+}
+
+function pacificDateParts(ms) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/Los_Angeles",
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23",
+  }).formatToParts(new Date(ms));
+  const out = {};
+  for (const part of parts) if (part.type !== "literal") out[part.type] = Number(part.value);
+  return out;
+}
+
+function nextPacificMidnight(now = Date.now()) {
+  const local = pacificDateParts(now);
+  const next = new Date(Date.UTC(local.year, local.month - 1, local.day + 1));
+  const targetLocalAsUtc = Date.UTC(next.getUTCFullYear(), next.getUTCMonth(), next.getUTCDate());
+  let candidate = targetLocalAsUtc;
+  for (let i = 0; i < 4; i++) {
+    const actual = pacificDateParts(candidate);
+    const actualAsUtc = Date.UTC(actual.year, actual.month - 1, actual.day, actual.hour, actual.minute, actual.second);
+    const delta = targetLocalAsUtc - actualAsUtc;
+    candidate += delta;
+    if (Math.abs(delta) < 1000) break;
+  }
+  if (candidate <= now) candidate += 24 * 3600 * 1000;
+  return candidate;
+}
+
+function headerValue(headers, name) {
+  if (!headers) return null;
+  if (typeof headers.get === "function") return headers.get(name) || headers.get(name.toLowerCase());
+  for (const key of Object.keys(headers)) if (key.toLowerCase() === name.toLowerCase()) return headers[key];
+  return null;
+}
+
+function retryAfterDelay(headers, now = Date.now()) {
+  const raw = headerValue(headers, "Retry-After");
+  if (!raw) return null;
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+  return delayUntil(raw, now);
+}
+
+function humanRetryDelay(text) {
+  const m = String(text || "").match(/try again in (?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?\s*(?:(\d+)\s*s)?/i);
+  if (!m) return null;
+  const ms = (parseInt(m[1] || 0, 10) * 3600 + parseInt(m[2] || 0, 10) * 60 + parseInt(m[3] || 0, 10)) * 1000;
+  return ms > 0 ? ms : null;
+}
+
+function parseCooldown(text, status, headers = {}, now = Date.now()) {
+  const body = parseJsonBody(text);
+  const upstreamState = body && typeof body === "object"
+    ? findStructuredValue(body, ["status", "state"]) : null;
+  if (status === 403 && upstreamState === "banned") {
+    const banDelay = delayUntil(findStructuredValue(body, ["resumes_at", "resumesAt", "resume_at", "resumeAt"]), now);
+    return banDelay > 0 ? banDelay : BANNED_DEFAULT_COOLDOWN_MS;
+  }
+  if (status === 429) {
+    const retryAfterMs = findStructuredValue(body, ["retryAfterMs", "retry_after_ms"]);
+    const direct = Number(retryAfterMs);
+    if (Number.isFinite(direct) && direct > 0) return direct;
+    const resetDelay = delayUntil(findStructuredValue(body, ["resetAt", "reset_at", "resetsAt", "resets_at"]), now);
+    if (resetDelay > 0) return resetDelay;
+    const headerDelay = retryAfterDelay(headers, now);
+    if (headerDelay > 0) return headerDelay;
+    const humanDelay = humanRetryDelay(text);
+    if (humanDelay > 0) return humanDelay;
+    return Math.max(1, nextPacificMidnight(now) - now);
+  }
+  const humanDelay = humanRetryDelay(text);
+  if (humanDelay > 0) return humanDelay;
+  return status === 429 ? Math.max(1, nextPacificMidnight(now) - now) : 60 * 1000;
+}
+
+function banUntil(text, now = Date.now()) {
+  const body = parseJsonBody(text);
+  const delay = delayUntil(findStructuredValue(body, ["resumes_at", "resumesAt", "resume_at", "resumeAt"]), now);
+  return now + (delay > 0 ? delay : BANNED_DEFAULT_COOLDOWN_MS);
 }
 
 class QuotaExhaustedError extends Error {
@@ -992,6 +1269,14 @@ class QuotaExhaustedError extends Error {
     super("upstream account quota exhausted");
     this.name = "QuotaExhaustedError";
     this.retryAfterMs = info && typeof info.retryAfterMs === "number" ? info.retryAfterMs : null;
+  }
+}
+
+class WaitingRoomError extends Error {
+  constructor(retryAfterMs = 30 * 1000) {
+    super("session stayed queued (retry later)");
+    this.name = "WaitingRoomError";
+    this.retryAfterMs = retryAfterMs;
   }
 }
 
@@ -1115,10 +1400,33 @@ async function freshQuotaProbe(token, sessionModel) {
   if (isQuotaExhausted(cached, sessionModel)) throw new QuotaExhaustedError(cached);
 }
 
+function throwIfRequestAborted(signal) {
+  if (!signal?.aborted) return;
+  throw signal.reason instanceof Error ? signal.reason : new Error("request aborted");
+}
+
 // 流式 chat 不设置总时长 abort。只有在首个数据迟迟未到时，
 // 才强制刷新账号额度；额度未知或仍有额度时，原请求继续等待。
-async function fetchStreamWithQuotaGuard(url, init, token, sessionModel) {
+// requestSignal 代表下游客户端，必须覆盖 response 已拿到但首 chunk 尚未到达的窗口。
+async function fetchStreamWithQuotaGuard(url, init, token, sessionModel, requestSignal = null) {
   const controller = new AbortController();
+  let reader = null;
+  let requestAbortHandler = null;
+  let rejectRequestAbort = null;
+  let transferred = false;
+  const requestAborted = requestSignal
+    ? new Promise((_, reject) => {
+        rejectRequestAbort = reject;
+        requestAbortHandler = () => {
+          const reason = requestSignal.reason || new Error("request aborted");
+          try { controller.abort(reason); } catch { controller.abort(); }
+          if (reader) Promise.resolve(reader.cancel(reason)).catch(() => {});
+          rejectRequestAbort(reason);
+        };
+        if (requestSignal.aborted) requestAbortHandler();
+        else requestSignal.addEventListener("abort", requestAbortHandler, { once: true });
+      })
+    : null;
   const request = upstreamFetch(url, { ...init, signal: controller.signal });
   let probeTimer = null;
   const armProbe = () => new Promise((_, reject) => {
@@ -1135,14 +1443,23 @@ async function fetchStreamWithQuotaGuard(url, init, token, sessionModel) {
     if (probeTimer !== null) clearTimeout(probeTimer);
     probeTimer = null;
   };
+  const cleanupRequestAbort = () => {
+    if (requestSignal && requestAbortHandler) {
+      requestSignal.removeEventListener("abort", requestAbortHandler);
+      requestAbortHandler = null;
+    }
+  };
+  const raceWithRequestAbort = (promises) => requestAborted
+    ? Promise.race([...promises, requestAborted])
+    : Promise.race(promises);
   try {
     // 首个字节前不再使用 AbortSignal.timeout(20s)。
-    const response = await Promise.race([request, armProbe()]);
+    const response = await raceWithRequestAbort([request, armProbe()]);
     clearProbe();
     if (!response.body) throw new EmptyUpstreamStreamError();
 
-    const reader = response.body.getReader();
-    const first = await Promise.race([reader.read(), armProbe()]);
+    reader = response.body.getReader();
+    const first = await raceWithRequestAbort([reader.read(), armProbe()]);
     clearProbe();
     if (first.done) {
       try { reader.releaseLock(); } catch {}
@@ -1165,16 +1482,27 @@ async function fetchStreamWithQuotaGuard(url, init, token, sessionModel) {
             streamController.error(error);
           } finally {
             try { reader.releaseLock(); } catch {}
+            cleanupRequestAbort();
           }
         })();
       },
-      cancel(reason) { return reader.cancel(reason); },
+      cancel(reason) {
+        cleanupRequestAbort();
+        try { controller.abort(reason); } catch { controller.abort(); }
+        return reader.cancel(reason);
+      },
     });
+    transferred = true;
     return new Response(body, { status: response.status, headers: response.headers });
   } catch (error) {
     clearProbe();
+    cleanupRequestAbort();
     try { controller.abort(error); } catch { controller.abort(); }
+    if (reader) Promise.resolve(reader.cancel(error)).catch(() => {});
     throw error;
+  } finally {
+    clearProbe();
+    if (!transferred) cleanupRequestAbort();
   }
 }
 
@@ -1370,7 +1698,7 @@ async function createSession(token, sessionModel, forceCreate = false) {
           return s;
         }
       }
-      throw new Error("session stayed queued (retry later)");
+      throw new WaitingRoomError();
     }
     if (r.status === 409) throw new Error("session_model_mismatch: " + String(r.data?.message || r.data?.error || "上游拒绝该模型"));
     throw new Error("create session failed: " + r.status + " " + (r.text || "").slice(0, 300));
@@ -1388,7 +1716,10 @@ function utcNow() {
 async function startRun(token, agentId, ancestors = []) {
   const r = await enqueueUp("POST", "/api/v1/agent-runs", token,
     { action: "START", agentId, ancestorRunIds: ancestors }, undefined, SESSION_TIMEOUT_MS);
-  if (r.status !== 200 || !r.data?.runId) throw new Error("start_run failed: " + r.status + " " + (r.text || "").slice(0, 200));
+  if (r.status !== 200 || !r.data?.runId) {
+    recordAccountObservation(token, r.status, r.data ?? r.text);
+    throw new Error("start_run failed: " + r.status + " " + (r.text || "").slice(0, 200));
+  }
   return r.data.runId;
 }
 
@@ -1673,7 +2004,7 @@ async function handleChat(request, env) {
   if (!mc) return jsonResponse({ error: { message: "Model not available: " + requestedModel, type: "unsupported_model" } }, 400);
   // 顶层 thinking 参数 → reasoning_effort 归一化（新 OpenAI SDK 兼容）
   params = normalizeChatThinking(params);
-  return executeChat(env, params, mc, isStream, "chat");
+  return executeChat(env, params, mc, isStream, "chat", request.signal);
 }
 
 // OpenAI Responses API（/v1/responses）入口：把 Responses 请求翻译成 chat completions 上游调用
@@ -1684,7 +2015,7 @@ async function handleResponses(request, env) {
   const requestedModel = params.model || DEFAULT_MODEL;
   const mc = await resolveModelConfig(requestedModel);
   if (!mc) return jsonResponse({ error: { message: "Model not available: " + requestedModel, type: "unsupported_model" } }, 400);
-  return executeChat(env, responsesToChatParams(params, mc), mc, isStream, "responses");
+  return executeChat(env, responsesToChatParams(params, mc), mc, isStream, "responses", request.signal);
 }
 
 // Responses API 请求 → chat completions 参数（字段名/结构翻译）
@@ -1767,7 +2098,8 @@ function responsesInputToMessages(input, instructions) {
 // 第一阶段：显式代码审计模式。
 // 这是 reviewer-only 入口：创建 root run 作为父链，再创建 code-reviewer 子 run，
 // 不执行普通 root chat，也不把 reviewer agent 混入普通模型路由。
-async function executeCodeReview(env, chatParams, mc, isStream, mode) {
+async function executeCodeReview(env, chatParams, mc, isStream, mode, requestSignal = null) {
+  syncAccountState(env);
   const debug = env.FREEBUFF_DEBUG === "true";
   const reviewerAgent = mc.reviewer_agent;
   const reviewerModel = mc.upstream;
@@ -1786,31 +2118,42 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode) {
   }
 
   let lastErrMsg = "";
+  let lastWaitingRetryAfter = null;
+  const attempted = new Set();
   for (let acctTry = 0; acctTry < pool.length; acctTry++) {
-    const acct = pickToken(env, mc.session);
+    throwIfRequestAborted(requestSignal);
+    const acct = pickToken(env, mc.session, attempted);
     const token = acct ? acct.token : null;
-    if (!token) break;
+    if (!token) {
+      recordRequest(mc && mc.id ? mc.id : "", null, false);
+      return lastWaitingRetryAfter ? waitingRoomResponse(lastWaitingRetryAfter) : poolExhaustionResponse(env);
+    }
+    attempted.add(token);
     logAccountRoute(debug, pool, token, mc.session, acctTry + 1,
       isUsableSession(sessCache.get(token + ":" + mc.session)) ? "active_session" : "quota_or_round_robin");
     // 429 本地锁（与 executeChat 一致）：冷却中的 quota 号直接本地回 429
     const lock = cooldownInfo(token);
     if (lock && lock.reason === "quota") {
-      const retryAfterSec = lock.retryAfterMs
-        ? Math.max(1, Math.ceil(lock.retryAfterMs / 1000))
-        : Math.max(1, Math.ceil((lock.until - Date.now()) / 1000));
+      releaseToken(token);
+      const retryAfterMs = cooldownRemainingMs(lock);
+      const retryAfterSec = Math.max(1, Math.ceil(retryAfterMs / 1000));
       return jsonResponse({
         error: {
           message: `账号额度已用完,请 ${retryAfterSec}s 后重试`,
           type: "rate_limit_exceeded",
-          retryAfterMs: lock.retryAfterMs || (lock.until - Date.now()),
+          retryAfterMs,
         },
       }, 429, { "Retry-After": String(retryAfterSec), "X-RateLimit-Local": "1" });
     }
     let rootRunId = null;
     let reviewerRunId = null;
+    let leaseTransferred = false;
     try {
+      throwIfRequestAborted(requestSignal);
       const sess = await createSession(token, mc.session);
+      throwIfRequestAborted(requestSignal);
       const root = await startRunChain(token, mc.root_agent || mc.agent);
+      throwIfRequestAborted(requestSignal);
       rootRunId = root.runId;
       // Desktop 协议的关键：reviewer 是 root run 的子 run。
       reviewerRunId = await startRun(token, reviewerAgent, [rootRunId]);
@@ -1826,17 +2169,17 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode) {
         method: "POST",
         headers,
         body: JSON.stringify(payload),
-        signal: isStream ? undefined : AbortSignal.timeout(NONSTREAM_TIMEOUT_MS),
+        signal: isStream ? requestSignal : AbortSignal.timeout(NONSTREAM_TIMEOUT_MS),
       });
       if (!resp.ok) {
         const text = await resp.text();
         recordAccountObservation(token, resp.status, text);
         lastErrMsg = "reviewer upstream error: " + text.slice(0, 300);
         if (resp.status === 429) {
-          const ra = parseCooldown(text, 429);
+          const ra = parseCooldown(text, 429, resp.headers);
           cooldown(token, ra, { reason: "quota", retryAfterMs: ra });
         } else {
-          cooldown(token, parseCooldown(text, resp.status));
+          cooldown(token, parseCooldown(text, resp.status, resp.headers));
         }
         throw new Error(lastErrMsg);
       }
@@ -1851,8 +2194,12 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode) {
 
       if (isStream) {
         const { readable, writable } = new TransformStream();
-        if (mode === "responses") pipeUpstreamToResponsesStream(resp.body, writable, mc, finalize);
-        else pipeUpstreamToClient(resp.body, writable, finalize);
+        const onDone = async (info) => {
+          try { await finalize(info); } finally { releaseToken(token); }
+        };
+        if (mode === "responses") pipeUpstreamToResponsesStream(resp.body, writable, mc, onDone);
+        else pipeUpstreamToClient(resp.body, writable, onDone);
+        leaseTransferred = true;
         return new Response(readable, {
           status: 200,
           headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", ...corsHeaders() },
@@ -1865,19 +2212,35 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode) {
       await finalize();
       return mode === "responses" ? jsonResponse(result, 200) : jsonResponse(result, 200);
     } catch (e) {
+      if (requestSignal?.aborted) throw e;
       console.error("[code_review]", e);
       lastErrMsg = String(e.message || e);
+      if (e instanceof WaitingRoomError || /session stayed queued|waiting.room/i.test(lastErrMsg)) {
+        lastWaitingRetryAfter = e.retryAfterMs || 30 * 1000;
+      } else lastWaitingRetryAfter = null;
       if (reviewerRunId) await finishRun(token, reviewerRunId, 1).catch(() => {});
       if (rootRunId) await finishRun(token, rootRunId, 1).catch(() => {});
-      if (/start_run failed|timeout|timed out|abort|reviewer upstream/i.test(lastErrMsg)) cooldown(token, 60 * 1000);
+      if (!cooldownInfo(token)
+        && (e instanceof WaitingRoomError || /start_run failed|timeout|timed out|abort|reviewer upstream/i.test(lastErrMsg))) {
+        cooldown(token, lastWaitingRetryAfter || 60 * 1000);
+      }
+    } finally {
+      if (!leaseTransferred) releaseToken(token);
     }
   }
+  if (lastWaitingRetryAfter) {
+    recordRequest(mc && mc.id ? mc.id : "", null, false);
+    return waitingRoomResponse(lastWaitingRetryAfter);
+  }
+  recordRequest(mc && mc.id ? mc.id : "", null, false);
+  if (accountPoolExhaustion(env).allUnavailable) return poolExhaustionResponse(env);
   return jsonResponse({ error: { message: lastErrMsg || "code reviewer failed", type: "api_error" } }, 502);
 }
 
 // chat completions 与 responses 共用的上游执行：多号重试 + session/run 生命周期 + 流式/非流式出口
-async function executeChat(env, chatParams, mc, isStream, mode) {
-  if (isCodeReviewRequest(chatParams)) return executeCodeReview(env, chatParams, mc, isStream, mode);
+async function executeChat(env, chatParams, mc, isStream, mode, requestSignal = null) {
+  if (isCodeReviewRequest(chatParams)) return executeCodeReview(env, chatParams, mc, isStream, mode, requestSignal);
+  syncAccountState(env);
   const debug = env.FREEBUFF_DEBUG === "true";
   const pool = parseAccounts(env);
   if (pool.length === 0) return jsonResponse({ error: { message: "缺少 FREEBUFF_TOKEN 环境变量", type: "config_error" } }, 503);
@@ -1885,10 +2248,17 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
   // 请求内多号重试：一个号失败（超时/429/428 重建无效/run 失败）立即冷却并换下一个号，最多试完整个账号池。
   // 免费通道上游波动大（并发>1 即出问题、排队超时），单请求内换号比等客户端重试成功率高得多。
   let lastErrMsg = "";
+  let lastWaitingRetryAfter = null;
+  const attempted = new Set();
   for (let acctTry = 0; acctTry < pool.length; acctTry++) {
-    const acct = pickToken(env, mc.session);
+    throwIfRequestAborted(requestSignal);
+    const acct = pickToken(env, mc.session, attempted);
     const token = acct ? acct.token : null;
-    if (!token) break;
+    if (!token) {
+      recordRequest(mc && mc.id ? mc.id : "", null, false);
+      return lastWaitingRetryAfter ? waitingRoomResponse(lastWaitingRetryAfter) : poolExhaustionResponse(env);
+    }
+    attempted.add(token);
     logAccountRoute(debug, pool, token, mc.session, acctTry + 1,
       isUsableSession(sessCache.get(token + ":" + mc.session)) ? "active_session" : "quota_or_round_robin");
 
@@ -1897,9 +2267,9 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
     // 参考 trefeon/freebuff-proxy 的 429 本地锁语义。
     const lock = cooldownInfo(token);
     if (lock && lock.reason === "quota") {
-      const retryAfterSec = lock.retryAfterMs
-        ? Math.max(1, Math.ceil(lock.retryAfterMs / 1000))
-        : Math.max(1, Math.ceil((lock.until - Date.now()) / 1000));
+      releaseToken(token);
+      const retryAfterMs = cooldownRemainingMs(lock);
+      const retryAfterSec = Math.max(1, Math.ceil(retryAfterMs / 1000));
       if (debug) console.log(`[acct ${acctTry + 1}] local 429 lock (${retryAfterSec}s), skip upstream`);
       // 客户端拿到 429 即该请求的失败终态，记一次失败（概况口径，非逐次尝试计数）。
       recordRequest(mc && mc.id ? mc.id : "", null, false);
@@ -1907,21 +2277,25 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
         error: {
           message: `账号额度已用完,请 ${retryAfterSec}s 后重试`,
           type: "rate_limit_exceeded",
-          retryAfterMs: lock.retryAfterMs || (lock.until - Date.now()),
+          retryAfterMs,
         },
       }, 429, { "Retry-After": String(retryAfterSec), "X-RateLimit-Local": "1" });
     }
 
+    let leaseTransferred = false;
     try {
+      throwIfRequestAborted(requestSignal);
       // 调用日志计时起点：涵盖 session/run/chat 全过程，与面板"耗时"口径一致。
       const t0 = Date.now();
       let effort = "";
       // 1) session
       const sess = await createSession(token, mc.session);
+      throwIfRequestAborted(requestSignal);
       if (debug) console.log(`[acct ${acctTry + 1}] session=${sess.instanceId}`);
 
       // 2) run 链
       const run = await startRunChain(token, mc.agent);
+      throwIfRequestAborted(requestSignal);
       if (debug) console.log(`[acct ${acctTry + 1}] run=${run.runId}`);
 
       // 3) chat（428 waiting_room_required / 409 session_superseded = session 失效，
@@ -1948,7 +2322,7 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
         };
         try {
           resp = isStream
-            ? await fetchStreamWithQuotaGuard(CODEBUFF_API + "/api/v1/chat/completions", chatInit, token, mc.session)
+            ? await fetchStreamWithQuotaGuard(CODEBUFF_API + "/api/v1/chat/completions", chatInit, token, mc.session, requestSignal)
             : await upstreamFetch(CODEBUFF_API + "/api/v1/chat/completions", {
                 ...chatInit,
                 signal: AbortSignal.timeout(NONSTREAM_TIMEOUT_MS),
@@ -2000,10 +2374,10 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
         // 重建后仍失败：该号 session 状态异常，冷却交给外层换号
         if (staleSession) cooldown(token, 60 * 1000, { reason: "invalidation", retryAfterMs: 60 * 1000 });
         if (resp.status === 429) {
-          const ra = parseCooldown(errText, 429);
+          const ra = parseCooldown(errText, 429, resp.headers);
           cooldown(token, ra, { reason: "quota", retryAfterMs: ra });
         } else {
-          cooldown(token, parseCooldown(errText, resp.status));
+          cooldown(token, parseCooldown(errText, resp.status, resp.headers));
         }
         break;
       }
@@ -2019,10 +2393,16 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
       if (isStream) {
         const { readable, writable } = new TransformStream();
         // 流式：首字延迟与 usage 只有管道跑完才知道，用 onComplete 收尾记一行。
-        const onDone = (info) =>
-          recordChatCall(env, token, mc, effort, t0, info && info.firstTokenAt, info && info.usage);
+        const onDone = async (info) => {
+          try {
+            recordChatCall(env, token, mc, effort, t0, info && info.firstTokenAt, info && info.usage);
+          } finally {
+            releaseToken(token);
+          }
+        };
         if (mode === "responses") pipeUpstreamToResponsesStream(resp.body, writable, mc, onDone);
         else pipeUpstreamToClient(resp.body, writable, onDone);
+        leaseTransferred = true;
         return new Response(readable, { status: 200, headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", ...corsHeaders() } });
       }
 
@@ -2036,8 +2416,12 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
       recordChatCall(env, token, mc, effort, t0, null, agg && agg.usage);
       return jsonResponse(agg, 200);
     } catch (e) {
+      if (requestSignal?.aborted) throw e;
       console.error("[" + mode + "]", e);
       const msg = String(e.message || e);
+      if (e instanceof WaitingRoomError || /session stayed queued|waiting.room/i.test(msg)) {
+        lastWaitingRetryAfter = e.retryAfterMs || 30 * 1000;
+      } else lastWaitingRetryAfter = null;
       // 累计口径：额度耗尽记限流，超时/中断记超时，其余异常记错误。
       if (e instanceof QuotaExhaustedError) callTotals.rateLimited++;
       else if (/abort|timeout|timed out|terminated/i.test(msg)) callTotals.timeout++;
@@ -2045,7 +2429,7 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
       // 额度探测确认耗尽：清除当前模型 session，按上游 retryAfterMs 冷却后切号。
       if (e instanceof QuotaExhaustedError) {
         sessCache.delete(token + ":" + mc.session);
-        const ra = e.retryAfterMs || 5 * 60 * 1000;
+        const ra = e.retryAfterMs || parseCooldown("", 429);
         cooldown(token, ra, { reason: "quota", retryAfterMs: ra });
       }
       if (e instanceof EmptyUpstreamStreamError) {
@@ -2053,7 +2437,9 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
       }
       // 其他上游交互失败/超时继续沿用原有冷却逻辑；流式 chat 不再因固定 20s abort 进入这里。
       // createSession 429（额度耗尽）按 retryAfterMs/文本冷却，不能固定 60s。
-      if (/create session failed|stayed queued|start_run failed|session_model_mismatch|abort|timeout|timed out|terminated/i.test(msg)) {
+      if (e instanceof WaitingRoomError) {
+        cooldown(token, e.retryAfterMs || 30 * 1000);
+      } else if (/create session failed|stayed queued|start_run failed|session_model_mismatch|abort|timeout|timed out|terminated/i.test(msg)) {
         const m429 = msg.match(/429/);
         if (m429) {
           const ra = parseCooldown(msg, 429);
@@ -2064,10 +2450,17 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
       }
       lastErrMsg = msg;
       if (debug) console.log(`[acct ${acctTry + 1}] exception: ${msg.slice(0, 120)}, switch account`);
+    } finally {
+      if (!leaseTransferred) releaseToken(token);
     }
+  }
+  if (lastWaitingRetryAfter) {
+    recordRequest(mc && mc.id ? mc.id : "", null, false);
+    return waitingRoomResponse(lastWaitingRetryAfter);
   }
   // 全池换号仍失败：该请求的失败终态，记一次失败（每个客户端请求只落一次）。
   recordRequest(mc && mc.id ? mc.id : "", null, false);
+  if (accountPoolExhaustion(env).allUnavailable) return poolExhaustionResponse(env);
   return jsonResponse({ error: { message: lastErrMsg, type: "api_error" } }, 502);
 }
 
@@ -2416,7 +2809,7 @@ async function handleAnthropicMessages(request, env) {
   const mc = await resolveModelConfig(openaiModel);
   if (!mc) return anthropicError("Model not available: " + (body.model || ""), "invalid_request_error", 400);
   const chat = anthropicToChat(body, mc);
-  const response = await executeChat(env, chat, mc, !!chat.stream, "chat");
+  const response = await executeChat(env, chat, mc, !!chat.stream, "chat", request.signal);
   if (response.status >= 400) {
     let msg = "Upstream error"; try { const data = await response.json(); msg = data?.error?.message || msg; } catch {}
     const types = { 400: "invalid_request_error", 401: "authentication_error", 403: "permission_error", 429: "rate_limit_error", 503: "overloaded_error" };
@@ -2433,10 +2826,22 @@ function unwrapData(obj) {
   return obj;
 }
 
+function writerClosedSignal(writer) {
+  if (!writer || !writer.closed || typeof writer.closed.then !== "function") return null;
+  return Promise.resolve(writer.closed).then(
+    () => ({ writerClosed: true, error: new Error("downstream stream closed") }),
+    (error) => ({
+      writerClosed: true,
+      error: error instanceof Error ? error : new Error("downstream stream closed"),
+    }),
+  );
+}
+
 // 流式：把上游 SSE 剥 {data:...} 包装后透传
 function pipeUpstreamToClient(upstreamBody, writable, onComplete) {
   const reader = upstreamBody.getReader();
   const writer = writable.getWriter();
+  const closed = writerClosedSignal(writer);
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
   let buf = "";
@@ -2444,7 +2849,9 @@ function pipeUpstreamToClient(upstreamBody, writable, onComplete) {
   (async () => {
     try {
       while (true) {
-        const { done, value } = await reader.read();
+        const next = closed ? await Promise.race([reader.read(), closed]) : await reader.read();
+        if (next.writerClosed) throw next.error;
+        const { done, value } = next;
         if (done) break;
         buf += decoder.decode(value, { stream: true });
         let idx;
@@ -2467,7 +2874,10 @@ function pipeUpstreamToClient(upstreamBody, writable, onComplete) {
           }
         }
       }
-    } catch {}
+    } catch (error) {
+      // 客户端取消/写入失败时，停止上游读取，避免释放租约后旧流继续占用账号。
+      try { if (typeof reader.cancel === "function") await reader.cancel(error); } catch {}
+    }
     finally {
       try { if (onComplete) await onComplete({ firstTokenAt, usage }); } catch {}
       try { await writer.close(); } catch {}
@@ -2580,9 +2990,10 @@ function chatUsageToResponsesUsage(usage) {
 }
 
 // 流式：上游 chat SSE → Responses API 事件序列（response.created … response.completed）
-async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onComplete) {
+function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onComplete) {
   const reader = upstreamBody.getReader();
   const writer = writable.getWriter();
+  const closed = writerClosedSignal(writer);
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
   const respId = "resp_" + Math.random().toString(36).slice(2, 10);
@@ -2631,7 +3042,9 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
       await send({ type: "response.in_progress", response: responsesBase(mc, respId, createdAt) });
 
       while (true) {
-        const { done, value } = await reader.read();
+        const next = closed ? await Promise.race([reader.read(), closed]) : await reader.read();
+        if (next.writerClosed) throw next.error;
+        const { done, value } = next;
         if (done) break;
         buf += decoder.decode(value, { stream: true });
         let idx;
@@ -2742,7 +3155,10 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
       }
       resp.usage = chatUsageToResponsesUsage(usage);
       await send({ type: "response.completed", response: resp });
-    } catch {}
+    } catch (error) {
+      // 客户端取消/写入失败时，停止上游读取，避免释放租约后旧流继续占用账号。
+      try { if (typeof reader.cancel === "function") await reader.cancel(error); } catch {}
+    }
     finally {
       try { if (onComplete) await onComplete({ firstTokenAt, usage }); } catch {}
       try { await writer.close(); } catch {}

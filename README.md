@@ -28,9 +28,18 @@ docker compose up -d
 data/
 ├─ credentials/
 │  ├─ freebuff_credentials.json   # 账号池（token）
-│  └─ server-key.txt              # 面板 API Key
+│  ├─ server-key.txt              # 面板 API Key
+│  └─ account-state.json           # 封禁/凭据失效状态（只含 token 哈希）
 └─ aliases.json                   # 自定义模型别名
 ```
+
+`account-state.json` 不保存原始 token。上游明确返回 `banned` 或 `401` 后，账号会被隔离；
+管理员在账号池里执行一次成功探测即可清除过期隔离。`country_blocked`、`ip_capped` 和裸
+403 仍归因于当前出口节点，不会写成账号封禁。所有账号都不可用时，服务返回 403（全封禁）、
+429（全是额度冷却，带 `Retry-After`）或 503（忙/混合状态），不会删除冷却记录强行试号。
+状态文件先写完整临时副本再替换；Windows 替换边界会保留 `.bak`，启动时可从完整的
+`.tmp`/`.bak` 恢复，避免半写 JSON 被当成空状态。流式请求在响应返回前客户端断开时，
+Node 转发桥会中止 Worker `Request.signal`，同时取消上游 reader 并释放账号租约。
 
 容器以 `node`(uid 1000) 运行，入口脚本启动时会把 `/data` 属主修正为 `node`，所以宿主目录
 属主对不上也不会 permission denied，**无需手动 chown**。想让数据交给 Docker 托管、不落宿主
@@ -59,6 +68,7 @@ docker compose up -d
 | `FREEBUFF_TOKEN` | 否 | 账号池 token（多账号逗号分隔），也可在面板里添加 |
 | `FREEBUFF_READONLY` | 否 | `true` 时禁止面板修改账号池 |
 | `FREEBUFF_DATA_DIR` | 否 | 数据目录（账号池/Key/模型映射/内核缓存），容器默认 `/data`，本地默认 `./data` |
+| `FREEBUFF_ACCOUNT_STATE_FILE` | 否 | 封禁/凭据失效状态文件，默认位于数据目录 `credentials/account-state.json` |
 
 ## 出口代理（订阅）
 
@@ -153,7 +163,7 @@ Freebuff 会把响应里的 `model` 字段改写成自己的命名，**问模型
 node server.js          # 需要 Node 20+
 ```
 
-测试：`node test/unit.test.mjs`、`node test/proxy.test.mjs`、`node test/web-layout.test.mjs`
+测试：`node test/unit.test.mjs`、`node --test test/account-state.test.mjs`、`node --test test/proxy.test.mjs`、`node test/web-layout.test.mjs`
 
 ## 构建
 
@@ -175,3 +185,15 @@ GitHub Actions 在 push 到 `beta` 分支时自动构建 `linux/amd64,linux/arm6
   `mapClaudeThinkingToReasoningEffort` / `anthropic.go` 对齐的。
 - **[CodebuffAI/freebuff](https://github.com/CodebuffAI/freebuff)** —— 官方源码公开镜像。
   模型清单、`efforts` 档位表、访问层与地区门控规则都以它为事实来源，本文所有「官方源码写着」均指此处。
+
+### 账号安全实现参考
+
+以下仓库只作为设计参考；本项目以现有 Node/worker 架构重写，未直接复制其 TLS 伪装、换 IP
+规避、自动注册或养号代码：
+
+- **[trefeon/freebuff-proxy](https://github.com/trefeon/freebuff-proxy)**（MIT）——结构化封禁冷却、`resumes_at` 解析、429 重置时间和太平洋午夜兜底；本地落在 `worker.js` 的 `parseCooldown`、持久隔离和池耗尽响应。
+- **[yelixir-dev/freebuff-bridge](https://github.com/yelixir-dev/freebuff-bridge)**（MIT）——每账号一次 `inFlight` 租约和请求结束释放；本地落在 `pickToken`/`releaseToken` 及 chat/reviewer 两条执行链。
+- **[yuzu-octopus/freebuff2api](https://github.com/yuzu-octopus/freebuff2api)**（MIT）——忙账号跳过、流式异常/取消先停止上游 reader 再释放租约的生命周期约束；本地落在 SSE 管道完成回调和 Node 转发断流处理。
+- **[akasakaid/Freebuff-router](https://github.com/akasakaid/Freebuff-router)**（MIT）——账号状态与严格池耗尽的持久化思路；本地改为 `server/account-state.mjs` 的 SHA-256 JSON 存储，不引入 SQLite。
+
+精确提交、审查日期、已采用行为和定期复查步骤见 [`docs/PROJECT_MEMORY.md`](docs/PROJECT_MEMORY.md)。
