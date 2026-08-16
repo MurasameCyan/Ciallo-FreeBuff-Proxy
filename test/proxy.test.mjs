@@ -177,7 +177,7 @@ test('内核启动失败不抛到请求层且保持直连', async () => {
   assert.ok(!JSON.stringify(status).includes('token=abc'));
 });
 
-test('订阅解析后自动测活并按延迟升序排序，失效节点垫底', async () => {
+test('订阅解析后自动测活并按延迟升序排序，测活失败的节点自动删除', async () => {
   const { service } = fakeService({
     controller: {
       async request(path) {
@@ -189,11 +189,50 @@ test('订阅解析后自动测活并按延迟升序排序，失效节点垫底',
     },
   });
   const status = await service.setSubscription('https://sub.example.com/list');
-  assert.deepEqual(status.nodes.map((n) => n.name), ['fast', 'slow', 'dead']);
+  assert.deepEqual(status.nodes.map((n) => n.name), ['fast', 'slow'], 'dead 测活没通，必须从节点列表里删掉');
   assert.equal(status.nodes[0].delay, 45);
-  assert.equal(status.nodes[2].healthy, false);
-  assert.equal(status.nodes[2].delay, null);
   assert.equal(status.healthyCount, 2);
+  assert.equal(status.nodeCount, 3, '节点总数仍是订阅解析出的数量，用来看衰减（3 → 健康 2）');
+});
+
+test('节点全部测活失败时不清空列表（通常是测活地址自己不通）', async () => {
+  const { service } = fakeService({
+    controller: {
+      async request(path) {
+        if (path.includes('/proxies/freebuff-pool')) return { all: ['a', 'b'], now: 'a' };
+        if (path.includes('/group/freebuff-pool/delay')) return { a: 0, b: 0 };
+        return {};
+      },
+    },
+  });
+  const status = await service.setSubscription('https://sub.example.com/list');
+  assert.equal(status.healthyCount, 0);
+  assert.deepEqual(status.nodes.map((n) => n.name), ['a', 'b'], '全灭时删光会让手动选节点没得选');
+});
+
+test('上游拒绝出站 IP 时归因到当前节点并进快照，直连时不记', async () => {
+  const { service } = fakeService({
+    controller: {
+      async request(path) {
+        if (path.includes('/proxies/freebuff-pool')) return { all: ['a', 'b'], now: 'a' };
+        if (path.includes('/group/freebuff-pool/delay')) return { a: 40, b: 90 };
+        return {};
+      },
+    },
+  });
+  service.noteEgressReject({ state: 'country_blocked', status: 403 });
+  assert.equal((await service.status()).reject, null, '没起代理时无节点可归因，不应记录');
+
+  await service.setSubscription('https://sub.example.com/list');
+  service.noteEgressReject({ state: 'country_blocked', status: 403 });
+  const hit = await service.status();
+  assert.equal(hit.reject.state, 'country_blocked');
+  assert.equal(hit.reject.status, 403);
+  assert.equal(hit.reject.node, hit.currentNode, '拒绝记录必须钉在当时在用的节点上');
+  assert.ok(hit.reject.at, '必须带发生时间');
+
+  await service.setNode({ mode: 'manual', node: 'b' });
+  assert.equal((await service.status()).reject, null, '换了节点后旧的拒绝记录必须清掉');
 });
 
 test('关闭自动测活时，保存订阅仍会测活一次以完成延迟排序', async () => {

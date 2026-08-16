@@ -34,7 +34,7 @@ for (const id of [
   'modelCount',
   'aliasCount', 'aliasBody', 'newAlias', 'newAliasTarget', 'aliasAdd', 'aliasMsg',
   'proxyCard', 'proxyStatus', 'proxyUrl', 'proxyVersion', 'proxyNodeCount', 'proxyHealthyCount',
-  'proxyCurrentNode', 'proxyLastRefresh', 'proxyError', 'proxyMessage',
+  'proxyCurrentNode', 'proxyLastRefresh', 'proxyError', 'proxyReject', 'proxyMessage',
   'proxySubscriptionForm', 'proxySubscription', 'proxySubscriptionSave',
   'proxyModeAuto', 'proxyModeManual', 'proxyNode', 'proxyHealthEnabled', 'proxyHealthInterval',
   'proxyAutoUpdate', 'proxyUpdateInterval',
@@ -151,8 +151,32 @@ assert.match(html, /id="tab-manage"[^>]*aria-controls="pane-manage"/s,
   '账号管理标签必须关联面板');
 assert.match(html, /id="tab-add"[^>]*aria-controls="pane-add"/s,
   '账号添加标签必须关联面板');
-assert.match(html, /<button[^>]*class="login-url"[^>]*id="loginUrl"/s,
+// 授权链接显示框：框内是「可点开的链接文字 + 纯图标复制按钮」两颗 button，
+// 框自身必须是 div —— button 套 button 是非法 HTML，浏览器会把内层拆出去。
+assert.match(html, /<div class="login-url" id="loginUrl" hidden>/,
+  '授权链接显示框必须是 div，才能在框内放复制按钮');
+const urlBox = html.slice(html.indexOf('<div class="login-url"'), html.indexOf('id="oauthStatus"'));
+assert.match(urlBox, /<button[^>]*class="login-url-text"[^>]*id="loginUrlOpen"/s,
   'OAuth 授权地址必须可通过键盘操作');
+assert.match(urlBox, /<button[^>]*id="loginUrlCopy"[^>]*aria-label="复制授权链接"/s,
+  '复制按钮必须在授权链接框内，且纯图标要有可访问名称');
+assert.match(urlBox, /id="loginUrlCopy"[^>]*>\s*<svg[\s\S]*?<\/svg>\s*<\/button>/s,
+  '复制按钮只放图标，不带文字');
+assert.ok(app.includes("$('loginUrlOpen').textContent = j.loginUrl"),
+  '链接文字必须写进内层 button，而不是外层的框');
+assert.match(app, /loginUrlCopy[\s\S]*?clipboard\.writeText\(\$\('loginUrlOpen'\)\.textContent/s,
+  '复制按钮必须把框里显示的链接写入剪贴板');
+
+// 开始授权按钮：点下去就自报「等待授权」，三条出口（成功/过期/失败）都要复位
+assert.ok(app.includes("btn.textContent = '等待授权'"),
+  '点击开始授权后按钮文案必须变为「等待授权」');
+assert.match(app, /function oauthIdle\(\)[\s\S]*?textContent = '开始授权'/s,
+  '必须有统一的复位函数把按钮文案改回「开始授权」');
+assert.equal(app.split('oauthIdle()').length - 1, 4,
+  'oauthIdle 必须在定义之外的三处出口（成功/过期/失败）都被调用');
+// 带引号匹配字符串字面量：注释里引用这句旧文案（说明为什么撤掉）是允许的
+assert.ok(!app.includes("'等待授权…(每 3 秒检测一次)'"),
+  '轮询状态行不应再重复「等待授权…(每 3 秒检测一次)」（已由按钮文案表达）');
 for (const binding of ['data-copy-proto="openai"', 'data-copy-proto="anthropic"', 'data-copy-key', 'data-reset-key']) {
   assert.ok(html.includes(binding), `管理面板丢失交互绑定: ${binding}`);
 }
@@ -220,8 +244,27 @@ assert.ok(app.includes("api('/proxy/subscription'"), '保存订阅必须调用�
 assert.ok(app.includes("api('/proxy/node'"), '节点策略必须调用节点选择接口');
 assert.ok(app.includes("api('/proxy/health'"), '自动测活设置必须调用测活配置接口');
 assert.ok(app.includes("api('/proxy/update'"), '自动更新设置必须调用更新配置接口');
+// 手动更新订阅：按钮 + 复用后端 refresh 接口 + 未配置订阅时必须禁用
+// （后端 refreshCore 在无订阅时静默返回快照，不拦就会 toast 一个假的「更新完成」）。
+assert.match(html,
+  /class="proxy-field proxy-url-field"[\s\S]*?id="proxyUrl"[\s\S]*?<button[^>]*class="btn primary"[^>]*id="proxyRefresh"[^>]*>更新</s,
+  '手动更新按钮必须在「当前订阅」右侧，与「保存」同为 primary 配色，文案为「更新」');
+assert.match(css, /\.proxy-url-field\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)\s+auto/s,
+  '「当前订阅」行必须与订阅输入行同列宽，「更新」才会正好落在「保存」下方');
+assert.ok(app.includes("api('/proxy/refresh'"), '手动更新必须调用后端订阅刷新接口');
+assert.match(app, /\$\('proxyRefresh'\)[\s\S]{0,120}disabled\s*=\s*!p\.configured/s,
+  '未配置订阅时手动更新按钮必须禁用');
+// 节点被 freebuff 拒绝：独立一行、与 proxyError 分开（那条是内核/订阅故障，这条是出口 IP 不被收）
+assert.match(html, /id="proxyError"[\s\S]{0,240}id="proxyReject"[^>]*hidden/s,
+  '节点被拒提示必须独立成行、排在代理错误之后，且默认隐藏（没记录时不占位）');
+assert.match(css, /\.proxy-reject\s*\{[^}]*color:\s*var\(--amber\)/s,
+  '节点被拒是琥珀色而非 rose：代理本身没坏，是出口 IP 不被接受');
+assert.ok(app.includes('p.reject'), '面板必须读取代理快照里的 reject 记录');
+assert.match(app, /country_blocked:[^\n]*ip_capped:/s,
+  '被拒原因必须按 country_blocked / ip_capped 等状态译成中文');
 assert.match(html, /id="proxyModeAuto"[^>]*aria-pressed="true"/s,
   '自动节点模式按钮必须暴露 pressed 状态');
+
 assert.match(html, /id="proxyHealthEnabled"/s, '代理卡必须提供自动测活开关');
 assert.match(html, /id="proxyAutoUpdate"/s, '代理卡必须提供自动更新开关');
 assert.match(html,
@@ -233,8 +276,12 @@ assert.ok(!app.includes('healthSelect.append') && !app.includes('updateSelect.ap
   '不应再把后端非标准秒值追加为「N 秒」下拉项（如 43 秒/300 秒）累积成垃圾');
 assert.match(html, /id="proxyUpdateInterval"[\s\S]*?value="3600"[\s\S]*?value="86400"[\s\S]*?<\/select>/s,
   '自动更新间隔必须提供 1 小时到 24 小时的选项');
-assert.ok(!html.includes('id="proxyRefresh"'), '代理卡不应保留重复的底部刷新按钮');
-assert.ok(!app.includes("api('/proxy/refresh'"), '保存订阅应由单次 PUT 完成，不应再重复 POST 刷新');
+// 旧断言曾禁止 #proxyRefresh，理由是「与保存订阅重复」——那只对保存流程成立：重拉已配置的
+// 订阅需要重新粘一遍 URL，envLocked 时还根本粘不了。手动更新按钮已按需求重新加回（见上方断言）。
+// 仍要守住的是原来那条禁令的有效部分：保存流程本身不许再补一次 POST 刷新。
+const saveFlow = app.slice(app.indexOf("'保存订阅'"), app.indexOf("'节点已重新解析'"));
+assert.ok(saveFlow.length > 0 && !saveFlow.includes('/proxy/refresh'),
+  '保存订阅应由单次 PUT 完成，不应在保存流程里再 POST 刷新');
 
 // 账号池概况：自动轮询降到 1 小时，并提供可即时刷新的图标按钮。
 assert.ok(app.includes('const POLL_MS = 3600000'), '默认轮询间隔必须为 1 小时（3600000ms）');
@@ -284,6 +331,33 @@ assert.match(css, /\.calllog\s*\{[^}]*scrollbar-width:\s*none/s,
   '调用日志列表必须隐藏滚动条');
 assert.match(css, /\.calllog-main\s*\{[^}]*flex-wrap:\s*wrap/s,
   '调用日志主行必须可折行，避免横向溢出');
+
+// 展开标记：<details> 自带的三角形按要求隐藏（两套前缀都要关，否则旧版 Safari 还留着）
+assert.match(css, /\.calllog-summary\s*\{[^}]*list-style:\s*none/s,
+  '调用日志卡头不应显示 <details> 自带的展开三角');
+assert.match(css, /\.calllog-summary::-webkit-details-marker\s*\{[^}]*display:\s*none/s,
+  '调用日志卡头必须同时关掉 WebKit 的 details marker');
+assert.ok(!/\.calllog-summary\s*\{[^}]*list-style-position/s.test(css),
+  '标记已隐藏，不应再为它保留 list-style-position');
+assert.match(css, /\.calllog-summary \.card-head\s*\{[^}]*width:\s*100%/s,
+  '标记撤掉后卡头应占满整行（原先让出的 20px 要收回）');
+
+// 实时刷新：调用日志自带快轮询，不再靠用户手动刷新页面。
+// 必须与 1 小时的 refresh() 分开——那条慢是因为它连带探账号，日志只读内存快照。
+assert.match(app, /const LOG_POLL_MS = (\d+)/, '调用日志必须有独立的快轮询间隔 LOG_POLL_MS');
+assert.ok(Number(app.match(/const LOG_POLL_MS = (\d+)/)[1]) <= 5000,
+  '调用日志轮询间隔必须 ≤5s，否则算不上实时');
+assert.ok(app.includes('setInterval(refreshCallLogLive, LOG_POLL_MS)'),
+  '调用日志快轮询必须挂上 setInterval');
+const liveFlow = app.slice(app.indexOf('async function refreshCallLogLive'), app.indexOf('// ── 交互'));
+assert.ok(liveFlow.includes("api('/usage')"), '快轮询必须只读 /usage');
+for (const heavy of ["api('/accounts')", "api('/config')", "api('/proxy')", '/v1/models']) {
+  assert.ok(!liveFlow.includes(heavy), `快轮询不应触发 ${heavy}（每 3 秒探一次账号会打爆上游）`);
+}
+assert.ok(liveFlow.includes('document.hidden') && liveFlow.includes('logPolling'),
+  '快轮询必须在页面隐藏时停下，并防止请求堆积');
+assert.match(app, /visibilitychange[\s\S]*refreshCallLogLive\(\)/,
+  '切回前台应立即补一次，不用等下一拍');
 
 // ── 运行概况卡（移植自 zen；右列上半，出口代理上方） ────────────
 for (const id of ['usageCard', 's-tok', 's-tok-sub', 's-models', 's-models-empty',

@@ -130,7 +130,12 @@
             <p class="hint">生成授权链接，完成登录后自动加入账号池。</p>
           </div>
           <button type="button" class="btn primary wide" id="oauthStart">开始授权</button>
-          <button type="button" class="login-url" id="loginUrl" hidden></button>
+          <!-- 显示框本身不再是 button：里面要塞复制图标，button 套 button 是非法 HTML。
+               链接文字仍是 button（键盘可达，回车即开新窗），复制只给图标不给文字。 -->
+          <div class="login-url" id="loginUrl" hidden>
+            <button type="button" class="login-url-text" id="loginUrlOpen"></button>
+            <button type="button" class="login-url-copy" id="loginUrlCopy" title="复制授权链接" aria-label="复制授权链接"><svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>
+          </div>
           <p class="hint" id="oauthStatus" aria-live="polite"></p>
         </section>
       </div>
@@ -267,6 +272,7 @@
           <div class="proxy-field proxy-url-field">
             <span class="lbl">当前订阅</span>
             <code id="proxyUrl">未配置</code>
+            <button type="button" class="btn primary" id="proxyRefresh" title="立即重新拉取订阅并测活">更新</button>
           </div>
           <div class="proxy-metrics">
             <div><span class="lbl">节点</span><strong id="proxyNodeCount">—</strong></div>
@@ -343,6 +349,9 @@
         </section>
 
         <p class="hint proxy-error" id="proxyError" aria-live="polite"></p>
+        <!-- 上游把出站 IP 拒了（地区封禁/IP 触顶/403）。与 proxyError 分开：那条是订阅/内核
+             自己的故障，这条是节点能连通、但 freebuff 不收——换节点才有用。 -->
+        <p class="hint proxy-reject" id="proxyReject" aria-live="polite" hidden></p>
         <div class="proxy-actions">
           <span class="hint" id="proxyMessage" aria-live="polite"></span>
         </div>

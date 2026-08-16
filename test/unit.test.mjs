@@ -8,7 +8,7 @@ const src = readFileSync(new URL('../worker.js', import.meta.url), 'utf-8');
 // 使内部函数在沙箱全局可见，供单测直接调用。
 const wrapper = src.replace('export default {', 'const __workerDefault__ = {') +
   '\n\nglobalThis.__workerDefault__ = __workerDefault__;\n' +
-  'globalThis.__unitTestApi__ = { normalizeChatThinking, anthropicThinkingToEffort, namedEffort, normalizeReasoningEffort, collectReasoningTexts, anthropicStopReason, anthropicModelToOpenAI, parseModelAliases, resolveModelAlias, resolveModelConfig, findModelConfig, setTestAliases: (raw) => { currentAliases = parseModelAliases(raw); }, cooldown, cooldownInfo, inCooldown, markSessionInvalidated, wasRecentlyInvalidated, singleFlight, sessionRemainingMs, INVALIDATION_WINDOW_MS, SESSION_REUSE_SAFE_MS, SESSION_VERIFY_WINDOW_MS, executeChat, readCallUsage, accountLabel, logCall, callLogSnapshot, readUsageFull, recordRequest, blankUsageTotals };\n';
+  'globalThis.__unitTestApi__ = { normalizeChatThinking, anthropicThinkingToEffort, namedEffort, normalizeReasoningEffort, collectReasoningTexts, anthropicStopReason, anthropicModelToOpenAI, parseModelAliases, resolveModelAlias, resolveModelConfig, findModelConfig, setTestAliases: (raw) => { currentAliases = parseModelAliases(raw); }, cooldown, cooldownInfo, inCooldown, markSessionInvalidated, wasRecentlyInvalidated, singleFlight, sessionRemainingMs, INVALIDATION_WINDOW_MS, SESSION_REUSE_SAFE_MS, SESSION_VERIFY_WINDOW_MS, executeChat, readCallUsage, accountLabel, logCall, callLogSnapshot, readUsageFull, recordRequest, blankUsageTotals, recordAccountObservation, setTestEgressReject: (fn) => { onEgressReject = fn; } };\n';
 
 // 可编程 fetch mock：测试里可替换 sandbox.fetch，返回可定制的 Response 形状
 // （worker 里用的是 { status, ok, headers, text() } 简化形状）。
@@ -29,7 +29,7 @@ sandbox.globalThis = sandbox;
 vm.createContext(sandbox);
 vm.runInContext(wrapper, sandbox);
 
-const { normalizeChatThinking, anthropicThinkingToEffort, namedEffort, normalizeReasoningEffort, collectReasoningTexts, anthropicStopReason, anthropicModelToOpenAI, parseModelAliases, resolveModelAlias, resolveModelConfig, findModelConfig, setTestAliases, cooldown, cooldownInfo, inCooldown, markSessionInvalidated, wasRecentlyInvalidated, singleFlight, sessionRemainingMs, INVALIDATION_WINDOW_MS, SESSION_REUSE_SAFE_MS, SESSION_VERIFY_WINDOW_MS, executeChat, readCallUsage, accountLabel, logCall, callLogSnapshot, readUsageFull, recordRequest, blankUsageTotals } = sandbox.__unitTestApi__;
+const { normalizeChatThinking, anthropicThinkingToEffort, namedEffort, normalizeReasoningEffort, collectReasoningTexts, anthropicStopReason, anthropicModelToOpenAI, parseModelAliases, resolveModelAlias, resolveModelConfig, findModelConfig, setTestAliases, cooldown, cooldownInfo, inCooldown, markSessionInvalidated, wasRecentlyInvalidated, singleFlight, sessionRemainingMs, INVALIDATION_WINDOW_MS, SESSION_REUSE_SAFE_MS, SESSION_VERIFY_WINDOW_MS, executeChat, readCallUsage, accountLabel, logCall, callLogSnapshot, readUsageFull, recordRequest, blankUsageTotals, recordAccountObservation, setTestEgressReject } = sandbox.__unitTestApi__;
 
 let pass = 0, fail = 0;
 function t(name, fn) {
@@ -529,6 +529,31 @@ t('callLogSnapshot：total/byModel 是副本，外部改动不污染内部', () 
   if (callLogSnapshot().total.requests !== before) throw new Error('total 应是副本');
   if (Object.values(callLogSnapshot().byModel).some((v) => v.success === 77777)) throw new Error('byModel 各项应是副本');
 });
+
+console.log('\n--- 出站 IP 被拒的归因回调（面板显示「节点被 freebuff 拒绝」）---');
+// 判据：账号级失败（封号/token 失效/额度）换账号就能绕过，不该记到节点头上；
+// 出站 IP 级失败（地区封禁 / IP 触顶 / 裸 403）换账号没用，必须回调给出口代理。
+const rejects = [];
+setTestEgressReject((info) => rejects.push(info));
+for (const [name, status, body, expect] of [
+  ['country_blocked → 回调', 403, '{"status":"country_blocked"}', 'country_blocked'],
+  ['ip_capped → 回调', 200, '{"status":"ip_capped"}', 'ip_capped'],
+  ['裸 403（无 status 体）→ 回调 blocked', 403, 'Forbidden', 'blocked'],
+  ['403 free_mode_cli_required → 不回调（模式问题，不许冤枉节点）', 403, '{"status":"free_mode_cli_required"}', null],
+  ['403 free_mode_invalid_agent_model → 不回调', 403, '{"status":"free_mode_invalid_agent_model"}', null],
+  ['banned → 不回调（账号问题，换节点没用）', 403, '{"status":"banned"}', null],
+  ['401 token 失效 → 不回调', 401, '{}', null],
+  ['429 额度 → 不回调', 429, '{}', null],
+  ['200 正常 → 不回调', 200, '{}', null],
+]) {
+  t(name, () => {
+    rejects.length = 0;
+    recordAccountObservation(`tok-${status}-${expect}`, status, body);
+    const got = rejects[0]?.state ?? null;
+    if (got !== expect) throw new Error(`expect ${expect}, got ${got}`);
+  });
+}
+setTestEgressReject(null);
 
 console.log(`\n${pass} passed, ${fail} failed`);
 if (fail) process.exit(1);

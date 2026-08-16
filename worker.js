@@ -417,6 +417,10 @@ export default {
     if (env && typeof env.FREEBUFF_UPSTREAM_FETCH === "function") {
       upstreamFetch = env.FREEBUFF_UPSTREAM_FETCH;
     }
+    // 出站 IP 被上游拒绝时的回调（同上，只有 Node adapter 能注入函数）。
+    if (env && typeof env.FREEBUFF_ON_EGRESS_REJECT === "function") {
+      onEgressReject = env.FREEBUFF_ON_EGRESS_REJECT;
+    }
     const url = new URL(request.url);
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders() });
 
@@ -574,6 +578,16 @@ function recordAccountObservation(token, status, dataOrText, extra = {}) {
       : upstreamState === "country_blocked" ? "country_blocked" : "blocked";
   } else if (status === 429) state = "rate_limited";
   if (!state) return;
+
+  // country_blocked / ip_capped 是冲着出站 IP 来的，换账号没用、换节点才有用；
+  // 另外「403 且响应体压根没给 status」是 Cloudflare/WAF 那种不解释的拦截，同样归到 IP。
+  // 反过来，403 只要报了名字（free_mode_cli_required、free_mode_invalid_agent_model、banned…）
+  // 那就是账号/模式的问题，不能记到节点头上——否则面板会拿模型报错去冤枉节点。
+  const ipLevel = state === "country_blocked" || state === "ip_capped"
+    || (state === "blocked" && !upstreamState);
+  if (onEgressReject && ipLevel) {
+    try { onEgressReject({ state, status }); } catch {}
+  }
 
   const previous = acctHealth.get(token) || {};
   acctHealth.set(token, {
@@ -1054,6 +1068,10 @@ function jitterMs() {
 // 配置了订阅时 server/proxy.mjs 会构造一个「带 undici ProxyAgent 指向本地
 // mihomo mixed-port」的 fetch 传进来，上游流量就经代理节点出站。
 let upstreamFetch = typeof fetch === "function" ? fetch : globalThis.fetch;
+
+// 出站 IP 被上游拒绝时的回调（env.FREEBUFF_ON_EGRESS_REJECT）。这里只知道「被拒了、
+// 什么原因」，节点名在 server/proxy.mjs 手里，所以把分类结果丢过去由它归因到当前节点。
+let onEgressReject = null;
 
 async function up(method, path, token, body, extraHeaders = {}, timeoutMs = UPSTREAM_TIMEOUT_MS) {
   // 出站前加入随机抖动，让请求节奏不规则（CHAIN_GAP_MS 之外）

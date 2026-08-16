@@ -260,6 +260,7 @@ export function createProxyService({
   let nodeNames = [];
   let currentNode = '';
   let healthMap = new Map();
+  let lastReject = null;
   let upstreamFetch = null;
   let closeFetch = null;
   let healthTimer = null;
@@ -337,10 +338,16 @@ export function createProxyService({
   }
 
   function snapshot() {
-    const nodes = nodeNames.map((name) => {
+    const all = nodeNames.map((name) => {
       const delay = healthMap.has(name) ? healthMap.get(name) : null;
       return { name, healthy: delay != null, delay, selected: name === currentNode };
     });
+    const healthyCount = all.filter((n) => n.healthy).length;
+    // 测活失败的节点自动从对外列表里删掉：healthMap 里有这个键但延迟是 null = 测过且没通。
+    // 没测过的（healthMap 里根本没这个键）保留，否则首次测活完成前列表会是空的。
+    // 全军覆没时也保留：那通常是测活地址自己不通，删光只会让手动选节点没得选。
+    // 只删「对外呈现」，nodeNames 不动 —— 一动 applyNodeMode 会把手动模式静默降级成自动。
+    const nodes = healthyCount ? all.filter((n) => n.healthy || !healthMap.has(n.name)) : all;
     // 按延迟升序排序：已测得延迟的在前（延迟低者优先），失效/未测的垫底。
     // Array.sort 在 Node 上是稳定排序，同延迟（含均为 null）保持原订阅顺序。
     nodes.sort((a, b) => (a.delay == null ? Infinity : a.delay) - (b.delay == null ? Infinity : b.delay));
@@ -352,10 +359,12 @@ export function createProxyService({
       subscriptionUrlMasked: maskSubscriptionUrl(cfg.subscriptionUrl),
       version,
       nodeCount: nodeNames.length,
-      healthyCount: nodes.filter((n) => n.healthy).length,
+      healthyCount,
       currentNode: currentNode || null,
       lastRefreshAt,
       error: lastError || null,
+      // 上游把出站 IP 拒了的最近一次记录（地区封禁 / IP 触顶 / 裸 403），已归因到当时在用的节点。
+      reject: lastReject,
       nodes,
       nodeMode: cfg.nodeMode,
       mode: cfg.nodeMode,
@@ -391,7 +400,23 @@ export function createProxyService({
   async function switchPoolNode(name) {
     if (!name) return;
     await controller.request(`/proxies/${encodeURIComponent(POOL_NAME)}`, 'PUT', { name });
+    // 换了节点，之前那次「出站 IP 被拒」不再说明当前出口的状况，清掉。
+    if (name !== currentNode) lastReject = null;
     currentNode = name;
+  }
+
+  // worker.js 判定「这次失败是冲着出站 IP 来的」之后回调进来。分工：worker 知道被拒的原因，
+  // 但不知道节点名；proxy 知道当前节点，但看不到上游响应。这里只负责把两半拼起来。
+  // 直连（没起代理）时不记：没有节点可归因，记了只会误导。
+  function noteEgressReject(info = {}) {
+    if (state !== 'ready' || !currentNode) return;
+    lastReject = {
+      node: currentNode,
+      state: String(info.state || 'blocked'),
+      status: Number(info.status) || null,
+      at: new Date(now()).toISOString(),
+    };
+    serviceLogger('warn', `[proxy] 出站被上游拒绝(${lastReject.state}): ${currentNode}`);
   }
 
   async function applyNodeMode() {
@@ -448,6 +473,7 @@ export function createProxyService({
     version = null;
     currentNode = '';
     nodeNames = [];
+    lastReject = null;
     serviceLogger('error', `[proxy] ${lastError}，已回落直连`);
   }
 
@@ -647,6 +673,7 @@ export function createProxyService({
     testHealth() { return serial(() => testHealthCore()); },
     async stop() { return serial(() => disableCore()); },
     getFetch() { return upstreamFetch; },
+    noteEgressReject,
     getSubscriptionUrl() { return cfg.subscriptionUrl; },
     isEnvLocked() { return cfg.envLocked; },
   };
@@ -706,3 +733,4 @@ export function getConfiguredSubscription() { return proxyService.getSubscriptio
 export function isProxyEnvLocked() { return proxyService.isEnvLocked(); }
 export async function stopProxy() { return proxyService.stop(); }
 export function getUpstreamFetch() { return proxyService.getFetch(); }
+export function noteEgressReject(info) { return proxyService.noteEgressReject(info); }

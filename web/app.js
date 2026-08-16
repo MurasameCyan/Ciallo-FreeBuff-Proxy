@@ -6,6 +6,10 @@
 
 const $ = (id) => document.getElementById(id);
 const POLL_MS = 3600000; // 默认 1 小时自动刷新；需要即时数据可点概况区的刷新图标
+// 调用日志单独快轮询：只打 /usage(worker 进程内存快照,零上游开销),不像
+// refresh() 那样连带 /accounts 逐个探号——1 小时那条限制是为它设的,与这里无关。
+// 代价：每次回全量环形缓冲(上限 200 条)。真嫌费流量就上 SSE 或按 since 增量。
+const LOG_POLL_MS = 3000;
 
 const S = {
   accounts: [], health: {}, aliases: {},
@@ -464,6 +468,17 @@ function renderProxy() {
   put('proxyVersion', p.version ? `mihomo ${p.version}` : '', '—');
   put('proxyLastRefresh', p.lastRefreshAt ? formatResetAt(p.lastRefreshAt) : '', '—');
   put('proxyError', p.error, '');
+  // 节点被 freebuff 拒（后端已把原因归因到当时在用的节点）。没有记录就整行藏起来。
+  // 变量别叫 r：调用日志那边禁止出现 r 点 node 这种字段名，重名会误伤契约测试。
+  const reject = $('proxyReject');
+  if (reject) {
+    const rj = p.reject;
+    const why = {
+      country_blocked: '地区被封禁', ip_capped: 'IP 触发上限', blocked: '被拒绝访问（403）',
+    }[String(rj?.state || '')] || '被拒绝';
+    reject.hidden = !rj?.node;
+    reject.textContent = rj?.node ? `节点被 freebuff ${why} · ${rj.node} · ${formatResetAt(rj.at)}` : '';
+  }
   const msg = $('proxyMessage');
   if (msg) msg.textContent = p.envLocked ? '订阅由环境变量管理，面板仅可查看' : '';
   const subscriptionInput = $('proxySubscription');
@@ -473,6 +488,10 @@ function renderProxy() {
     subscriptionInput.placeholder = p.envLocked ? '由 SUBSCRIPTION_URL 环境变量管理' : '粘贴订阅链接，保存后自动解析';
   }
   if (subscriptionSave) subscriptionSave.disabled = Boolean(p.envLocked) || state === 'starting';
+  // 手动更新按钮：未配置订阅时后端 refreshCore 会静默返回快照（不报错），点了会 toast
+  // 一个假的「更新完成」，所以这里拦住。envLocked 不拦——环境变量锁的是改地址，重拉合法。
+  const refreshBtn = $('proxyRefresh');
+  if (refreshBtn) refreshBtn.disabled = !p.configured || state === 'starting';
 
   const rawNodes = Array.isArray(p.nodes) ? p.nodes : [];
   // 后端已按延迟升序排序（失效节点垫底），前端只如实呈现顺序与延迟。
@@ -695,6 +714,25 @@ async function refresh() {
   }
 }
 
+/**
+ * 调用日志的实时刷新。刻意只取 /usage 并只重渲染吃这份数据的两张卡
+ * (调用日志 + 运行概况),不走 refresh():那个会连带探账号、拉模型表。
+ * 页面切到后台就停,回到前台由 visibilitychange 立刻补一次,不用等下一拍。
+ */
+let logPolling = false;
+async function refreshCallLogLive() {
+  if (logPolling || document.hidden) return;  // 上一发没回就跳过,别堆积
+  logPolling = true;
+  try {
+    S.usage = await api('/usage');
+    renderUsageOverview(); renderCallLog();
+  } catch {
+    // 静默:3 秒一次,弹 toast 会刷屏;下一拍自然重试。401 已由 api() 跳登录页
+  } finally {
+    logPolling = false;
+  }
+}
+
 // ── 交互 ────────────────────────────────────────────────
 
 function wire() {
@@ -825,6 +863,14 @@ function wire() {
     });
   }
 
+  // 手动更新订阅：直接复用后端已有的 POST /_api/proxy/refresh（重拉订阅 → 测活 → 按延迟重排节点）。
+  $('proxyRefresh')?.addEventListener('click', (event) => run(event.currentTarget, '更新订阅', async () => {
+    const r = await api('/proxy/refresh', { method: 'POST' });
+    S.proxy = r?.proxy || r || S.proxy;
+    renderProxy();
+    return Number.isFinite(S.proxy?.nodeCount) ? `解析到 ${S.proxy.nodeCount} 个节点` : '';
+  }));
+
   const saveProxyNode = (btn, mode, node = '') => run(btn, '切换节点', async () => {
     const selected = node || $('proxyNode')?.value || '';
     if (mode === 'manual' && !selected) throw new Error('暂无节点，请先刷新订阅');
@@ -927,20 +973,30 @@ function wire() {
   $('oauthStart').addEventListener('click', (e) => {
     const btn = e.currentTarget;
     btn.disabled = true;
+    // 按钮自己承担「现在在等」这个状态，下面的状态行就不用再重复一遍
+    btn.textContent = '等待授权';
     $('oauthStatus').textContent = '生成链接中…';
     api('/login/start', { method: 'POST' })
       .then((j) => {
         $('loginUrl').hidden = false;
-        $('loginUrl').textContent = j.loginUrl;
-        $('loginUrl').onclick = () => window.open(j.loginUrl, '_blank');
-        $('oauthStatus').textContent = '请在浏览器完成授权,页面将自动检测…';
+        $('loginUrlOpen').textContent = j.loginUrl;
+        $('loginUrlOpen').onclick = () => window.open(j.loginUrl, '_blank');
+        $('oauthStatus').textContent = OAUTH_PENDING;
         pollOauth(j.fingerprintId);
       })
       .catch((err) => {
         $('oauthStatus').textContent = '';
         toast('授权失败:' + err.message, 'err');
-        btn.disabled = false;
+        oauthIdle();
       });
+  });
+
+  // 复制授权链接（只有图标）。链接不另存变量：框里显示的就是真值，直接读回来
+  $('loginUrlCopy').addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText($('loginUrlOpen').textContent || '');
+      toast('已复制授权链接');
+    } catch { toast('复制失败', 'err'); }
   });
 
   // 模型映射添加
@@ -959,6 +1015,17 @@ function wire() {
 
 // ── OAuth 轮询 ──────────────────────────────────────────
 
+// 等待期的状态文案只有这一份：轮询那一拍原本写「等待授权…(每 3 秒检测一次)」，
+// 现在这句由按钮文字表达，状态行改回这条指引（也顺手把上一拍的报错覆盖掉）
+const OAUTH_PENDING = '请在浏览器完成授权,页面将自动检测…';
+
+/** 授权按钮复位。文案和 disabled 必须一起改，漏一处就永远卡在「等待授权」 */
+function oauthIdle() {
+  const btn = $('oauthStart');
+  btn.disabled = false;
+  btn.textContent = '开始授权';
+}
+
 let oauthTimer = null;
 function pollOauth(fingerprintId) {
   clearTimeout(oauthTimer);
@@ -968,13 +1035,13 @@ function pollOauth(fingerprintId) {
       if (j.state === 'done') {
         $('oauthStatus').textContent = '登录成功:' + (j.user?.email || '') + ',已加入账号池';
         $('loginUrl').hidden = true;
-        $('oauthStart').disabled = false;
+        oauthIdle();
         refresh();
       } else if (j.state === 'expired') {
         $('oauthStatus').textContent = '链接已过期,请重新开始授权';
-        $('oauthStart').disabled = false;
+        oauthIdle();
       } else {
-        $('oauthStatus').textContent = '等待授权…(每 3 秒检测一次)';
+        $('oauthStatus').textContent = OAUTH_PENDING;
         pollOauth(fingerprintId);
       }
     } catch {
@@ -987,3 +1054,5 @@ function pollOauth(fingerprintId) {
 wire();
 refresh();
 setInterval(refresh, POLL_MS);
+setInterval(refreshCallLogLive, LOG_POLL_MS);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshCallLogLive(); });

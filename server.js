@@ -18,6 +18,7 @@ import {
   getConfiguredSubscription,
   isProxyEnvLocked,
   mihomo,
+  noteEgressReject,
 } from './server/proxy.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -482,6 +483,8 @@ function buildWorkerEnv() {
     FREEBUFF_ACCOUNT_LABELS: accountLabels(),
     // 出口代理注入（有订阅且 mihomo 就绪时返回走代理的 fetch；否则 undefined → worker 直连）
     FREEBUFF_UPSTREAM_FETCH: getUpstreamFetch() || undefined,
+    // 上游拒绝出站 IP（地区封禁/IP 触顶/裸 403）时回调，由代理服务归因到当前节点并进面板。
+    FREEBUFF_ON_EGRESS_REJECT: noteEgressReject,
   };
 }
 
