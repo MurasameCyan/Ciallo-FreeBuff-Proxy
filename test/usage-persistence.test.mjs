@@ -42,6 +42,19 @@ test('损坏文件回退到空快照', async () => {
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
+test('写入失败时保存明确拒绝且 store 仍可继续调用', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'freebuff-usage-'));
+  try {
+    // 路径指向目录而非文件，rename 到该路径必然失败。
+    const store = createUsagePersistence(dir);
+    await assert.rejects(store.setEnabled(true));
+    await assert.rejects(store.save({ ...blank, startTime: 456 }));
+    // 失败后状态不受影响，仍可继续调用且保持开启。
+    assert.equal(store.enabled(), true);
+    assert.deepEqual(store.load(), blank);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
 test('关闭后保存不会写入新数据', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'freebuff-usage-'));
   try {
