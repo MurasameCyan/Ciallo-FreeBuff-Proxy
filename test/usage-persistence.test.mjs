@@ -41,3 +41,17 @@ test('损坏文件回退到空快照', async () => {
     assert.equal(store.enabled(), false);
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
+
+test('关闭后保存不会写入新数据', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'freebuff-usage-'));
+  try {
+    const file = join(dir, 'usage.json');
+    const store = createUsagePersistence(file);
+    store.setEnabled(true);
+    await store.save({ ...blank, startTime: 456 });
+    const before = await readFile(file, 'utf8');
+    store.setEnabled(false);
+    await store.save({ ...blank, startTime: 789 });
+    assert.equal(await readFile(file, 'utf8'), before);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
