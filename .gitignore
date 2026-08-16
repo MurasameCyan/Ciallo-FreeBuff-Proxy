@@ -37,6 +37,9 @@ wrangler.toml
 # 本地临时/运行产物统一目录（日志、.tmp、旧截图等），绝不提交
 .local/
 
+# 本地隔离开发工作树
+.worktrees/
+
 # 本地日志分析文件，绝不提交
 logs/
 server.out.log
