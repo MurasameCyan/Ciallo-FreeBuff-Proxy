@@ -1430,7 +1430,7 @@ function normalizeChatThinking(params) {
   else if (Number.isFinite(th.budget_tokens)) {
     const b = th.budget_tokens;
     out.reasoning_effort = b <= 0 ? "none" : b <= 512 ? "minimal" : b <= 1024 ? "low" : b <= 8192 ? "medium" : b <= 24576 ? "high" : "xhigh";
-  } else if (th.effort) out.reasoning_effort = th.effort;
+  } else if (th.effort) out.reasoning_effort = namedEffort(th.effort) ?? th.effort;
   return out;
 }
 
@@ -1470,6 +1470,17 @@ function normalizeMessages(messages) {
 // 不拒绝请求、不换模型（官方 clampReasoningEffort 语义）。
 // 档位升序 ladder：minimal < low < medium < high < xhigh < max < ultra
 const REASONING_EFFORT_RANK = ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
+
+// 客户端点名的档位一律原样采用（含 xhigh / max / ultra）。
+// 明确写了名字的档不该在协议转换层被降级——超出模型能力由 buildUpstreamPayload 的
+// clampReasoningEffort 按官方 per-model efforts 表下取，那才是唯一该降档的地方。
+// 返回 null = 不是已知档位名，交给调用方决定回落。
+function namedEffort(value) {
+  const s = String(value ?? "").trim().toLowerCase();
+  if (!s) return null;
+  if (s === "none" || s === "disabled" || s === "off") return "none";
+  return REASONING_EFFORT_RANK.includes(s) ? s : null;
+}
 
 // 官方 per-model efforts（2026-08-13 源码 freebuff-models.ts，同步 DEEPSEEK_V4_REASONING_EFFORTS）：
 //   - deepseek-v4-flash / deepseek-v4-pro: [low, high, max]（GA 后两模型同表，无 medium）
@@ -2085,8 +2096,11 @@ function anthropicContent(content) {
 }
 
 // Anthropic thinking 配置 → Freebuff reasoning_effort。
-// 语义对齐 Go 版 mapClaudeThinkingToReasoningEffort + budgetToReasoningEffort，
-// 输出取值在官方 ladder 内，最终由 buildUpstreamPayload 的 clamp 归一化。
+// budget_tokens 分档语义对齐 Go 版 mapClaudeThinkingToReasoningEffort + budgetToReasoningEffort；
+// 但客户端点名的档位（thinking.effort / output_config.effort，Anthropic effort-2025-11-24）
+// 一律原样采用，不再把 max 折成 xhigh——那会让 CC 侧设的 max 在这里就掉一档，
+// 到了 efforts=[low,high,max] 的模型上再被 clamp 成 high，等于完全失效。
+// 输出取值在官方 ladder 内，最终由 buildUpstreamPayload 的 clamp 按模型能力归一化。
 // 返回 undefined 表示无需设置。
 function anthropicThinkingToEffort(body) {
   const thinking = body?.thinking;
@@ -2096,6 +2110,9 @@ function anthropicThinkingToEffort(body) {
     case "disabled":
       return "none";
     case "enabled": {
+      // 显式档位名优先于 budget（新客户端两者都发时，名字才是用户真正点的那一档）
+      const named = namedEffort(thinking.effort);
+      if (named) return named;
       const budget = Number(thinking.budget_tokens);
       if (!Number.isFinite(budget)) return "auto";
       if (budget <= 0) return "none";
@@ -2107,10 +2124,9 @@ function anthropicThinkingToEffort(body) {
     }
     case "adaptive":
     case "auto": {
-      // Anthropic 扩展：adaptive/auto + output_config.effort（Desk/Agent 工具常用）
-      const effort = String(body?.output_config?.effort || "auto").toLowerCase();
-      if (effort === "low" || effort === "medium" || effort === "high") return effort;
-      if (effort === "max") return "xhigh";
+      // Anthropic 扩展：adaptive/auto + output_config.effort（Desk/Agent 工具与 CC 常用）
+      const named = namedEffort(body?.output_config?.effort);
+      if (named) return named;
       return "auto";
     }
     default:
@@ -2129,8 +2145,8 @@ function anthropicToChat(body, mc) {
   // Anthropic thinking → Freebuff reasoning_effort（语义对齐官方 freebuff reasoning-effort.ts ladder：
   // minimal < low < medium < high < xhigh < max < ultra；映射结果再经 normalizeReasoningEffort clamp-down）
   //   thinking.type=disabled        → "none"（关闭思考）
-  //   thinking.type=enabled         → 按 budget_tokens 分档（Go 版 budgetToReasoningEffort 语义）
-  //   thinking.type=adaptive/auto   → 读 output_config.effort（Anthropic 扩展）
+  //   thinking.type=enabled         → thinking.effort 点名优先，否则按 budget_tokens 分档
+  //   thinking.type=adaptive/auto   → 读 output_config.effort（Anthropic 扩展，max 原样为 max）
   const thinkingEffort = anthropicThinkingToEffort(body);
   if (thinkingEffort !== undefined) chat.reasoning_effort = thinkingEffort;
   if (body.metadata && typeof body.metadata === "object") chat.metadata = body.metadata;

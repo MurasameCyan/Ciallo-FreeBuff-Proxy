@@ -48,6 +48,10 @@
 
 <main id="main" class="dashboard">
   <div class="workspace-grid">
+    <!-- 两列各自独立成流(每列一个 .workspace-col),不再是共用行高的 2×2 网格。
+         旧结构里同一排的两张卡被高的那张撑出同样行高,于是「概况」下方和「模型」
+         下方各留了一个几百像素的空洞;现在左右各自往下排,洞就没了。 -->
+    <div class="workspace-col col-main">
     <!-- ── 运行状态：账号池与接入信息 ───────────────────── -->
     <section class="card account-card runtime-card" aria-labelledby="h-accounts">
       <section class="account-summary overview-panel" id="accountSummary" aria-labelledby="h-overview">
@@ -56,20 +60,6 @@
             <p class="eyebrow">运行状态</p>
             <h2 id="h-overview">账号池概况</h2>
             <span class="summary-live"><span class="dot ok"></span>每小时刷新<button type="button" class="summary-refresh" id="btn-refresh" title="立即刷新" aria-label="立即刷新"><svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg></button></span>
-          </div>
-          <div class="summary-tools">
-            <div class="access-card access-inline" aria-labelledby="h-conn">
-              <h2 id="h-conn" class="sr-only">接入信息</h2>
-              <div class="access-head">
-                <code class="access-key" id="key-mask" aria-label="当前 API Key"></code>
-              </div>
-              <div class="access-actions" role="group" aria-label="接入信息操作">
-                <button type="button" class="btn tiny" data-copy-proto="openai">复制 OpenAI</button>
-                <button type="button" class="btn tiny" data-copy-proto="anthropic">复制 Anthropic</button>
-                <button type="button" class="btn tiny" data-copy-key>复制 Key</button>
-                <button type="button" class="btn tiny warn" data-reset-key>重置 Key</button>
-              </div>
-            </div>
           </div>
         </div>
         <div class="stats">
@@ -112,7 +102,7 @@
       <div class="pane" id="pane-manage" data-pane="manage" role="tabpanel" aria-labelledby="tab-manage">
         <div class="table-scroll" role="region" tabindex="0" aria-label="账号列表，可横向滚动">
           <table class="tbl account-table is-empty">
-            <thead><tr><th>账号</th><th>状态</th><th>可用模型(重置时间)</th><th><div class="th-actions">操作<button type="button" class="btn tiny" id="btn-testall">全部探测</button></div></th></tr></thead>
+            <thead><tr><th>账号</th><th>状态</th><th id="quotaHead">可用模型(重置时间)</th><th>操作</th></tr></thead>
             <tbody id="acctBody"><tr><td colspan="4" class="empty">加载中…</td></tr></tbody>
           </table>
         </div>
@@ -146,7 +136,53 @@
       </div>
     </section>
 
-    <!-- ── 运行概况（移植自 zen）：占工作区右上格 ──────────────── -->
+    <!-- ── 模型配置：模型映射 + 模型列表 ─────────────────── -->
+    <section class="card model-workspace-card alias-card models-card" id="modelWorkspace" aria-labelledby="h-model-workspace">
+      <div class="card-head model-workspace-head">
+        <div class="card-title">
+          <p class="eyebrow">模型配置</p>
+          <h2 id="h-model-workspace">模型与映射</h2>
+        </div>
+      </div>
+      <div class="model-workspace-grid">
+        <section class="alias-editor" id="aliasEditor" aria-labelledby="h-alias">
+          <div class="subcard-head">
+            <div>
+              <h3 id="h-alias">模型映射</h3>
+            </div>
+            <span class="count" id="aliasCount"></span>
+          </div>
+          <div class="table-scroll" role="region" tabindex="0" aria-label="模型映射列表，可横向滚动">
+            <table class="tbl alias-table">
+              <thead><tr><th>别名</th><th>映射到</th><th class="action-col">操作</th></tr></thead>
+              <tbody id="aliasBody"><tr><td colspan="3" class="empty">加载中…</td></tr></tbody>
+            </table>
+          </div>
+          <div class="alias-add">
+            <input type="text" id="newAlias" placeholder="别名，如 gpt-5" autocomplete="off" spellcheck="false" aria-label="模型别名">
+            <input type="text" id="newAliasTarget" placeholder="目标模型 ID" autocomplete="off" spellcheck="false" aria-label="目标模型 ID">
+            <button type="button" class="btn primary" id="aliasAdd">添加映射</button>
+          </div>
+          <p class="hint alias-message" id="aliasMsg" aria-live="polite"></p>
+        </section>
+
+        <section class="model-catalog" id="modelCatalog" aria-labelledby="h-models">
+          <div class="subcard-head">
+            <div>
+              <h3 id="h-models">模型列表</h3>
+            </div>
+            <span class="count" id="modelCount"></span>
+          </div>
+          <ul class="models" id="models"></ul>
+          <p class="empty" id="models-empty" hidden>加载中…</p>
+        </section>
+      </div>
+    </section>
+    </div>
+
+    <!-- 右列:侧栏。概况(360 起)与出口代理(660 起)自上而下排,高度不再被左列牵连。 -->
+    <div class="workspace-col col-side">
+    <!-- ── 运行概况（移植自 zen）：右列上半 ──────────────── -->
     <!-- 一张卡内 2×2 四格：Token 消耗 / 模型统计 / 请求总数·成功率 / 运行时长。
          数据来自 /usage 的 total·byModel·startTime·lastRequest，全部进程内累计、
          重启清零。放在右上（运行状态右侧、出口代理上方）。 -->
@@ -192,48 +228,20 @@
           <p class="usage-sub" id="s-up-sub">最后请求 —</p>
         </article>
       </div>
-    </section>
-
-    <!-- ── 模型配置：模型映射 + 可用模型 ─────────────────── -->
-    <section class="card model-workspace-card alias-card models-card" id="modelWorkspace" aria-labelledby="h-model-workspace">
-      <div class="card-head model-workspace-head">
-        <div class="card-title">
-          <p class="eyebrow">模型配置</p>
-          <h2 id="h-model-workspace">模型与映射</h2>
+      <!-- 接入信息:原本挤在「账号池概况」标题右侧,移到概况卡底部单独一段。
+           Key 一行(标签靠左、掩码靠右),四颗按钮下面等宽铺开。 -->
+      <div class="access-card access-inline" aria-labelledby="h-conn">
+        <h2 id="h-conn" class="sr-only">接入信息</h2>
+        <div class="access-head">
+          <span class="access-name">Key:</span>
+          <code class="access-key" id="key-mask" aria-label="当前 API Key"></code>
         </div>
-      </div>
-      <div class="model-workspace-grid">
-        <section class="alias-editor" id="aliasEditor" aria-labelledby="h-alias">
-          <div class="subcard-head">
-            <div>
-              <h3 id="h-alias">模型映射</h3>
-            </div>
-            <span class="count" id="aliasCount"></span>
-          </div>
-          <div class="table-scroll" role="region" tabindex="0" aria-label="模型映射列表，可横向滚动">
-            <table class="tbl alias-table">
-              <thead><tr><th>别名</th><th>映射到</th><th class="action-col">操作</th></tr></thead>
-              <tbody id="aliasBody"><tr><td colspan="3" class="empty">加载中…</td></tr></tbody>
-            </table>
-          </div>
-          <div class="alias-add">
-            <input type="text" id="newAlias" placeholder="别名，如 gpt-5" autocomplete="off" spellcheck="false" aria-label="模型别名">
-            <input type="text" id="newAliasTarget" placeholder="目标模型 ID" autocomplete="off" spellcheck="false" aria-label="目标模型 ID">
-            <button type="button" class="btn primary" id="aliasAdd">添加映射</button>
-          </div>
-          <p class="hint alias-message" id="aliasMsg" aria-live="polite"></p>
-        </section>
-
-        <section class="model-catalog" id="modelCatalog" aria-labelledby="h-models">
-          <div class="subcard-head">
-            <div>
-              <h3 id="h-models">可用模型</h3>
-            </div>
-            <span class="count" id="modelCount"></span>
-          </div>
-          <ul class="models" id="models"></ul>
-          <p class="empty" id="models-empty" hidden>加载中…</p>
-        </section>
+        <div class="access-actions" role="group" aria-label="接入信息操作">
+          <button type="button" class="btn tiny" data-copy-proto="openai">复制 OpenAI</button>
+          <button type="button" class="btn tiny" data-copy-proto="anthropic">复制 Anthropic</button>
+          <button type="button" class="btn tiny" data-copy-key>复制 Key</button>
+          <button type="button" class="btn tiny warn" data-reset-key>重置 Key</button>
+        </div>
       </div>
     </section>
 
@@ -339,6 +347,7 @@
           <span class="hint" id="proxyMessage" aria-live="polite"></span>
         </div>
     </section>
+    </div>
   </div>
 
   <!-- ── 调用日志 ───────────────────────────────────────── -->

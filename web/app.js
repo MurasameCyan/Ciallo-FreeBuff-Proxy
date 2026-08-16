@@ -255,15 +255,29 @@ function accountUsage(probe) {
   return top;
 }
 
-// 可用模型列：只列真正有额度（limit>0）的模型 +（池级统一的）重置时间；0/0 未解锁
-// 模型（如免费号的 glm-5.2）直接隐藏。用量已上移到账号名后。
+// 可用模型列：只列真正有额度（limit>0）的模型，每个模型独占一行；0/0 未解锁模型
+// （如 glm-5.2）直接隐藏。用量已上移到账号名后，重置时间上移到列标题。
 function modelsCellHtml(probe) {
   const rows = usableQuota(probe);
   if (!rows.length) return '<span class="quota">—</span>';
-  const models = rows.map(q => `<b>${esc(q.model)}</b>`).join('');
-  const reset = rows.map(q => q.resetAt).find(Boolean);
-  const resetHtml = reset ? `<span class="quota-reset">重置 ${esc(formatResetAt(reset))}</span>` : '';
-  return `<div class="quota"><div class="quota-models">${models}</div>${resetHtml}</div>`;
+  const items = rows.map((q) => `<li><b>${esc(q.model)}</b></li>`).join('');
+  return `<ul class="quota quota-models">${items}</ul>`;
+}
+
+// 重置时间是池级统一的：同一天里所有账号、所有池共用一个 resetAt（上游按太平洋日
+// 07:00 UTC 结算）。逐行重复一遍没有信息量，提到列标题上只显示一次。
+function poolResetAt() {
+  for (const a of S.accounts) {
+    const reset = usableQuota(S.health[a.key]).map((q) => q.resetAt).find(Boolean);
+    if (reset) return reset;
+  }
+  return '';
+}
+
+function renderQuotaHead() {
+  const reset = poolResetAt();
+  // 还没探测出额度时回落到静态标题，别显示「重置 日期未知」那种半截信息
+  $('quotaHead').textContent = reset ? `可用模型 (重置 ${formatResetAt(reset)})` : '可用模型(重置时间)';
 }
 
 // ISO 时间戳（2026-08-16T07:00:00.000Z）→ 固定北京时间（UTC+8）YYYY-MM-DD HH:mm。
@@ -297,6 +311,7 @@ function renderAccounts() {
   const table = document.querySelector('.account-table');
   table.classList.toggle('is-empty', S.accounts.length === 0);
   $('acctCount').textContent = `${S.accounts.length} 个`;
+  renderQuotaHead();
   if (!S.accounts.length) {
     $('acctBody').innerHTML = '<tr><td colspan="4" class="empty">暂无账号，请切换到「添加」</td></tr>';
     return;
@@ -307,30 +322,27 @@ function renderAccounts() {
     const usageHtml = usage
       ? ` <span class="acct-usage" title="已用 / 总量（每日额度，池级共享）">( ${esc(usage.used ?? '—')} / ${esc(usage.limit ?? '—')} )</span>`
       : '';
+    // 主行=备注名(或邮箱)+池级用量，次行=邮箱。token 短哈希只在既无备注名也无邮箱时
+    // 兜底顶上：有邮箱的账号里它纯属噪音，8 位哈希既不可读也不用于识别账号。
+    const label = a.name || a.email || a.key;
+    const secondary = a.email && a.email !== label ? a.email : (!a.email && a.tokenShort ? a.tokenShort : '');
     return `<tr>
       <td>
-        <div class="nm">${esc(a.name || a.email || a.key)}${usageHtml}</div>
-        <div class="mono">${esc(a.email || '')}</div>
-        <div class="mono">${esc(a.tokenShort || '')}</div>
+        <div class="nm">${esc(label)}${usageHtml}</div>
+        ${secondary ? `<div class="mono">${esc(secondary)}</div>` : ''}
       </td>
       <td>${h ? statePill(h.state) : '<span class="pill muted">未探测</span>'}</td>
       <td>${modelsCellHtml(h)}</td>
       <td>
         <div class="actions">
-          <button class="btn tiny" data-probe="${esc(a.key)}">探测</button>
           ${S.readonly ? '' : `<button class="btn tiny danger" data-del="${esc(a.key)}">删除</button>`}
         </div>
       </td>
     </tr>`;
   }).join('');
 
-  $('acctBody').querySelectorAll('[data-probe]').forEach(b =>
-    b.addEventListener('click', () => run(b, '探测', async () => {
-      const h = await api('/accounts/' + encodeURIComponent(b.dataset.probe));
-      S.health[b.dataset.probe] = h;
-      renderAccounts(); renderStats();
-      return h.label || h.state;
-    })));
+  // 没有「探测」按钮：GET /_api/accounts 每次都会在服务端逐个探测，状态与额度随
+  // 轮询（每小时）和概况区的立即刷新一起更新，手动逐个探测是多余的一层
   $('acctBody').querySelectorAll('[data-del]').forEach(b =>
     b.addEventListener('click', async () => {
       if (!confirm('确认删除账号 ' + b.dataset.del.slice(0, 20) + '…？')) return;
@@ -789,15 +801,6 @@ function wire() {
       return '新 Key 已生效';
     }));
   }
-
-  // 全部探测
-  $('btn-testall').addEventListener('click', () => run($('btn-testall'), '探测', async () => {
-    const acc = await api('/accounts');
-    S.accounts = acc.accounts; S.health = acc.health; S.readonly = acc.readonly;
-    renderStats(); renderAccounts();
-    const alive = Object.values(S.health).filter(h => h.state === 'ok').length;
-    return `${alive}/${S.accounts.length} 存活`;
-  }));
 
   // 代理订阅：完整 URL 只随保存请求发给服务端，后续轮询只接收脱敏地址。
   const proxyForm = $('proxySubscriptionForm');

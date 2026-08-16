@@ -28,7 +28,8 @@ assert.match(html, /class="(?=[^"]*\baccess-card\b)(?=[^"]*\baccess-inline\b)[^"
 for (const id of [
   'sTotal', 'sTotalSub', 'sAlive', 'sWarn', 'sBad',
   'accountSummary',
-  'acctCount', 'btn-testall', 'acctBody', 'addForm', 'addBtn', 'authToken', 'email', 'name',
+  'acctCount', 'acctBody', 'addForm', 'addBtn', 'authToken', 'email', 'name',
+  'quotaHead',
   'oauthStart', 'loginUrl', 'oauthStatus', 'key-mask', 'models', 'models-empty',
   'modelCount',
   'aliasCount', 'aliasBody', 'newAlias', 'newAliasTarget', 'aliasAdd', 'aliasMsg',
@@ -42,33 +43,38 @@ for (const id of [
   assert.match(html, new RegExp(`id=["']${id}["']`), `管理面板丢失 DOM 绑定 #${id}`);
 }
 
-assert.match(css, /\.workspace-grid\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)\s+300px/s,
-  '工作区必须是左弹性、右固定 300px 两列（左数据区 / 右概况·代理）');
-assert.match(css, /\.workspace-grid\s*>\s*\.runtime-card\s*\{[^}]*grid-column:\s*1[^}]*grid-row:\s*1/s,
-  '运行状态卡片必须位于左上');
-assert.match(css, /\.workspace-grid\s*>\s*\.model-workspace-card\s*\{[^}]*grid-column:\s*1[^}]*grid-row:\s*2/s,
-  '模型配置卡片必须位于左下');
-assert.match(css, /\.workspace-grid\s*>\s*\.usage-card\s*\{[^}]*grid-column:\s*2[^}]*grid-row:\s*1/s,
-  '运行概况卡片必须位于右上');
-assert.match(css, /\.workspace-grid\s*>\s*\.proxy-card\s*\{[^}]*grid-column:\s*2[^}]*grid-row:\s*2/s,
-  '出口代理卡片必须位于右下');
-assert.match(css, /\.workspace-grid\s*>\s*\.usage-card\s*\{[^}]*min-height:\s*360px/s,
-  '运行概况卡片必须固定 360 高');
-assert.match(css, /\.workspace-grid\s*>\s*\.proxy-card\s*\{[^}]*min-height:\s*660px/s,
-  '出口代理卡片必须固定 660 高');
-assert.match(css, /\.workspace-grid\s*>\s*\.runtime-card/s,
-  '运行状态卡片必须是工作区直接子项');
-assert.match(css, /\.workspace-grid\s*>\s*\.proxy-card/s,
-  '出口代理卡片必须是工作区直接子项');
-assert.match(css, /\.workspace-grid\s*>\s*\.model-workspace-card/s,
-  '模型配置卡片必须是工作区直接子项');
-assert.match(css, /\.workspace-grid\s*>\s*\.usage-card/s,
-  '运行概况卡片必须是工作区直接子项');
-assert.match(css, /@media\s*\(max-width:\s*1100px\)[\s\S]*?\.workspace-grid\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)/,
+assert.match(css, /\.workspace-grid\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)\s+400px/s,
+  '工作区必须是左弹性、右固定 400px 两列（左数据区 / 右概况·代理）');
+assert.match(html,
+  /class="workspace-col col-main"[\s\S]*class="card account-card[\s\S]*class="card model-workspace-card[\s\S]*class="workspace-col col-side"[\s\S]*id="usageCard"[\s\S]*id="proxyCard"/s,
+  '左列必须是账号池+模型配置，右列必须是运行概况+出口代理');
+assert.match(css, /\.workspace-col\s*\{[^}]*display:\s*flex[^}]*flex-direction:\s*column/s,
+  '每列必须自成一条纵向流，否则同排两卡共享行高会在矮卡下方留出空洞');
+assert.match(css, /\.workspace-grid\s*\{[^}]*align-items:\s*stretch/s,
+  '两列必须等高，底边齐平');
+assert.match(css, /\.col-main\s*>\s*\.model-workspace-card\s*\{[^}]*flex:\s*1\s+1\s+auto/s,
+  '左列末卡必须吸收两列高度差，多出的高度进滚动列表而不是留白');
+assert.match(css, /\.col-side\s*>\s*\.usage-card\s*\{[^}]*min-height:\s*360px/s,
+  '运行概况卡片必须 360 起');
+assert.match(css, /\.col-side\s*>\s*\.proxy-card\s*\{[^}]*min-height:\s*660px/s,
+  '出口代理卡片必须 660 起');
+assert.ok(!/\.workspace-grid\s*>\s*\.[a-z-]+card\s*\{[^}]*grid-row/.test(css),
+  '不应再用 2×2 固定行列定位四张卡（那正是上下空洞的来源）');
+assert.match(css, /@media\s*\(max-width:\s*1200px\)[\s\S]*?\.col-side\s*>\s*\.usage-card,[\s\S]*?min-height:\s*0/s,
+  '单列时侧栏两卡必须解除 360/660 下限，避免拉出空白');
+assert.match(css, /@media\s*\(max-width:\s*1200px\)[\s\S]*?\.workspace-grid\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)/,
   '窄屏工作区必须退化为单列');
 assert.ok(!html.includes('egress-card'), '不应保留重复的出口状态卡片');
 assert.match(css, /\.access-inline\s*\{[^}]*display:\s*(?:flex|grid)/s,
-  '接入信息必须与账号池概况组成横向布局');
+  '接入信息必须是纵向紧凑区块（Key 一行、按钮一行）');
+assert.match(css, /\.access-actions\s*\{[^}]*grid-template-columns:\s*repeat\(auto-fill,\s*minmax\(118px,\s*1fr\)\)/s,
+  '四颗接入按钮必须等宽铺开：窄卡 2×2，宽屏一行四颗且不被拉满');
+assert.match(css, /\.access-actions \.btn\s*\{[^}]*text-align:\s*center/s,
+  '等宽按钮的文字必须居中');
+assert.match(css, /\.usage-card \.access-inline\s*\{[^}]*border-top/s,
+  '接入信息与概况四格之间必须有分隔线');
+assert.ok(!css.includes('.summary-tools'),
+  '接入信息移出账号池概况标题后，summary-tools 容器必须删除');
 assert.match(css, /\.model-workspace-grid\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)\s+max-content/s,
   '模型映射应占剩余空间，可用模型列按内容自适应');
 assert.match(css, /\.model-workspace-grid\s*\{[^}]*align-items:\s*stretch[^}]*--model-list-height:\s*240px/s,
@@ -94,6 +100,16 @@ assert.match(css, /\.stat\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)\s
   '账号统计块必须使用紧凑的横向数字布局');
 assert.match(css, /\.proxy-input-row\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)\s+auto/s,
   '订阅输入与保存按钮必须在同一行');
+assert.ok(!/\.alias-table\s*\{[^}]*min-width:\s*[1-9]/.test(css),
+  '模型映射表不得硬撑最小宽度：容器只有 ~560px，硬撑会把「操作」列顶到隐藏滚动条之外（删除按钮被切）');
+assert.match(css, /\.alias-table th:first-child\s*\{[^}]*width:\s*1%[^}]*white-space:\s*nowrap/s,
+  '别名列必须按内容收窄，多余宽度归「映射到」，两列文字之间只剩单元格内边距');
+assert.match(css, /\.alias-table \.action-col\s*\{[^}]*width:\s*1%/s,
+  '模型映射「操作」列必须按内容收窄，不再定死 84px');
+assert.match(css, /\.tbl td\.empty\s*\{[^}]*white-space:\s*normal/s,
+  '空态行必须能折行：整行 colspan 的长提示被 nowrap 拖成一行会溢出隐藏滚动条');
+assert.match(css, /@media\s*\(max-width:\s*700px\)[\s\S]*?\.alias-table tbody td:first-child\s*\{[^}]*white-space:\s*normal/s,
+  '手机端别名列回到定宽百分比，必须解除 nowrap，否则长别名会顶出格子');
 assert.match(css, /@media\s*\(max-width:\s*700px\)[\s\S]*?\.alias-table\s*\{[^}]*min-width:\s*0/s,
   '手机端模型映射表必须收缩到视口内');
 assert.match(css, /\.account-table\.is-empty\s*\{[^}]*min-width:\s*0/s,
@@ -104,11 +120,20 @@ assert.match(css, /@media\s*\(max-width:\s*480px\)/,
 assert.match(css, /@media\s*\(max-width:\s*660px\)/,
   '手机端侧栏必须退化为单列');
 assert.ok(html.includes('aria-live="polite"'), 'OAuth 状态变化必须可被辅助技术播报');
-assert.match(html, /<th>可用模型\(重置时间\)<\/th>/, '额度列标题必须改为“可用模型(重置时间)”');
+assert.match(html, /<th id="quotaHead">可用模型\(重置时间\)<\/th>/,
+  '额度列标题必须带 id 以便脚本改写为“可用模型 (重置 …)”，并保留静态回落文案');
+assert.ok(app.includes('function poolResetAt') && app.includes('function renderQuotaHead'),
+  '重置时间必须提到列标题（池级统一，逐行重复无信息量）');
+assert.ok(app.includes('`可用模型 (重置 ${formatResetAt(reset)})`'),
+  '列标题必须渲染成“可用模型 (重置 YYYY-MM-DD HH:mm)”');
+assert.ok(app.includes('renderQuotaHead()'), 'renderAccounts 必须刷新额度列标题');
+assert.ok(!app.includes('quota-reset'), '重置时间已上移列标题，行内不应再有 quota-reset');
+assert.ok(!app.includes('esc(a.tokenShort || \'\')'),
+  'token 短哈希不再无条件占一行，仅在既无备注名也无邮箱时兜底');
 assert.ok(app.includes('esc(usage.used') && app.includes('esc(usage.limit'),
   '账号用量必须移动到账号名之后（池级共享，视作账号通用）呈现 (已用/总量)');
 assert.match(app, /class="acct-usage"/, '账号名后必须有 acct-usage 承载用量');
-assert.match(app, /class="quota-models"/, '可用模型列必须列出账号可用模型');
+assert.match(app, /class="quota quota-models"/, '可用模型列必须列出账号可用模型');
 assert.match(app, /function usableQuota/, '必须提供 usableQuota 以过滤未解锁模型');
 assert.match(app, /Number\(q\.limit\)\s*>\s*0/,
   '可用模型与账号用量必须只取 limit>0 的池，隐藏 0/0 未解锁模型（如 glm-5.2）');
@@ -116,8 +141,10 @@ assert.match(app, /8 \* 3600 \* 1000/, '重置时间必须显式折算到北京�
 assert.match(app, /getUTCHours\(\)/, '北京时间格式化必须基于 UTC 偏移而非浏览器本地时区');
 assert.ok(!app.includes('quota-row'), '旧的每模型 quota-row 用量行必须移除');
 assert.match(css, /\.acct-usage\s*\{[^}]*white-space:\s*nowrap/s, '账号用量必须单行不换行');
-assert.match(css, /\.quota-models\s*\{[^}]*flex-wrap:\s*wrap/s,
-  '可用模型必须内联并允许换行，而非每项独占一行撑高条目');
+assert.match(css, /\.quota-models\s*\{[^}]*display:\s*flex[^}]*flex-wrap:\s*wrap/s,
+  '可用模型必须横向排列并自动换行，而非每项独占一行');
+assert.match(css, /\.quota-models\s*\{[^}]*list-style:\s*none/s,
+  '可用模型清单必须去掉列表符号');
 assert.match(html, /id="repo-link"[^>]*aria-label="GitHub 仓库"/s,
   '纯图标仓库链接必须有可访问名称');
 assert.match(html, /id="tab-manage"[^>]*aria-controls="pane-manage"/s,
@@ -131,30 +158,61 @@ for (const binding of ['data-copy-proto="openai"', 'data-copy-proto="anthropic"'
 }
 assert.match(html,
   /class="(?=[^"]*\baccess-inline\b)[^"]*"[\s\S]*data-copy-proto="openai"[\s\S]*data-copy-proto="anthropic"[\s\S]*data-copy-key[\s\S]*data-reset-key/s,
-  '接入信息四个按钮必须合并到账号池概况右侧并保持同组');
+  '接入信息四个按钮必须保持同组');
+assert.match(html,
+  /id="usageCard"[\s\S]*class="usage-grid"[\s\S]*class="(?=[^"]*\baccess-card\b)[^"]*"[\s\S]*data-reset-key[\s\S]*id="proxyCard"/s,
+  '接入信息必须落在运行概况卡内、四格统计下方');
+assert.ok(html.indexOf('data-copy-key') > html.indexOf('id="usageCard"'),
+  '账号池概况里不应再残留接入信息按钮（必须整组在概况卡之后）');
 assert.match(html,
   /class="model-workspace-grid"[\s\S]*class="alias-editor"[\s\S]*class="model-catalog"/s,
-  '模型配置内部顺序必须为模型映射 | 可用模型');
+  '模型配置内部顺序必须为模型映射 | 模型列表');
 assert.match(html, /id="h-model-workspace">模型与映射<\/h2>/,
   '模型卡标题必须简化为“模型与映射”');
+assert.match(html, /<h3 id="h-models">模型列表<\/h3>/,
+  '右侧子卡标题必须是“模型列表”（原“可用模型”）');
+assert.ok(!/^\.models li\s*\{[^}]*(?:border:|background:)/m.test(css),
+  '模型列表条目必须是纯文本，不再套卡片（无边框、无底色）');
+assert.match(css, /^\.models li\s*\{[^}]*font:\s*10px/m,
+  '模型名称字号必须比原来小 1px（11 → 10）');
+assert.match(css, /^\.models\s*\{[^}]*gap:\s*[0-4]px/m,
+  '模型列表行距必须收紧（去掉卡片后 7px 太散）');
 assert.match(css, /\.model-catalog \.models[\s\S]*scrollbar-width:\s*none/s,
-  '可用模型列表必须使用卡片内滚动且隐藏滚动条');
+  '模型列表必须使用卡片内滚动且隐藏滚动条');
 assert.match(css, /\.model-catalog \.models\s*\{[^}]*justify-items:\s*start/s,
-  '可用模型条目必须按模型名称宽度自适应');
+  '模型列表条目必须按模型名称宽度自适应');
 assert.match(css, /\.model-catalog \.models li\s*\{[^}]*width:\s*fit-content/s,
-  '可用模型条目不应横向拉伸并留下空白');
+  '模型列表条目不应横向拉伸并留下空白');
 assert.ok(!html.includes('class="page-intro"'), '页面顶部不应保留运行面板介绍区');
 for (const removedText of ['控制台', '运行面板', '账号、模型与出口代理集中管理']) {
   assert.ok(!html.includes(`>${removedText}<`), `页面必须移除介绍文案: ${removedText}`);
 }
-assert.ok(!html.includes('access-label'), '接入信息可见标签文本必须移除');
+assert.match(html, /<span class="access-name">Key:<\/span>\s*<code class="access-key" id="key-mask"/s,
+  'Key 掩码前必须有可见的「Key:」标签');
+assert.match(css, /\.access-head\s*\{[^}]*justify-content:\s*space-between/s,
+  '「Key:」贴左、掩码贴右，中间留空');
 assert.ok(!html.includes('定时检测节点可用性'), '自动测活说明文案必须移除');
 assert.ok(app.includes('切换到「添加」'), '空账号提示必须指向现有的“添加”标签');
-assert.match(html, /<th><div class="th-actions">操作<button[^>]*id="btn-testall"/s,
-  '全部探测按钮必须移入账号表“操作”表头右侧');
+assert.match(html, /<th>操作<\/th>/,
+  '“操作”表头只剩纯文本：全部探测按钮已移除');
+assert.ok(!html.includes('btn-testall') && !html.includes('全部探测'),
+  '全部探测按钮必须移除（GET /_api/accounts 每次都会在服务端逐个探测）');
+assert.ok(!html.includes('th-actions'), '表头工具条容器随全部探测一起移除');
+assert.ok(!app.includes('btn-testall'), '全部探测的事件处理必须一并移除');
+assert.ok(!app.includes('data-probe'), '逐行“探测”按钮及其事件处理必须移除');
 assert.ok(!html.includes('pane-bar'), '独立的探测工具条必须移除');
 assert.match(css, /\.account-table thead th:last-child\s*\{[^}]*width:\s*1%/s,
-  '账号表“操作”列必须收窄到内容宽度，避免操作与全部探测间留白');
+  '账号表“操作”列必须收窄到内容宽度');
+assert.match(css, /\.account-table thead th:first-child\s*\{[^}]*width:\s*1%[^}]*white-space:\s*nowrap/s,
+  '账号列必须按内容自适应宽度，不再拉伸留白');
+assert.match(css, /\.account-table tbody td:first-child\s*\{[^}]*white-space:\s*nowrap/s,
+  '账号列单元格必须单行不换行，列宽才等于最长的账号名/邮箱');
+assert.match(css, /\.account-table thead th:nth-child\(2\)\s*\{[^}]*width:\s*1%/s,
+  '状态列必须一并收窄，把宽度让给可用模型');
+assert.match(css, /\.btn\s*\{[^}]*white-space:\s*nowrap/s,
+  '按钮文字必须横排：收缩列里中文会逐字折行（「删除」竖成两行）');
+assert.ok(!/\.account-table th:nth-child\(1\)/.test(css),
+  '小屏不应再用百分比切死账号表列宽，否则会盖掉自适应规则');
 assert.match(css, /@media\s*\(max-width:\s*900px\)[\s\S]*?\.model-catalog\s+\.models\s*\{[^}]*height:\s*var\(--model-list-height\)/s,
   '窄屏可用模型列表必须回退到固定高度');
 assert.ok(app.includes("api('/proxy')"), '面板轮询必须读取代理订阅状态');
@@ -227,17 +285,17 @@ assert.match(css, /\.calllog\s*\{[^}]*scrollbar-width:\s*none/s,
 assert.match(css, /\.calllog-main\s*\{[^}]*flex-wrap:\s*wrap/s,
   '调用日志主行必须可折行，避免横向溢出');
 
-// ── 运行概况卡（移植自 zen；占工作区右上格，出口代理上方） ────────────
+// ── 运行概况卡（移植自 zen；右列上半，出口代理上方） ────────────
 for (const id of ['usageCard', 's-tok', 's-tok-sub', 's-models', 's-models-empty',
   's-req', 's-req-sub', 's-rate', 's-rate-bar', 's-up', 's-up-sub', 'h-usage']) {
   assert.match(html, new RegExp(`id=["']${id}["']`), `概况卡丢失 DOM 绑定 #${id}`);
 }
 assert.match(html, /<section class="card usage-card" id="usageCard"/,
   '概况必须是 usage-card 卡');
-assert.match(html, /class="workspace-grid"[\s\S]*id="usageCard"/s,
-  '概况卡必须移入工作区网格（右上格）');
+assert.match(html, /class="workspace-col col-side"[\s\S]*id="usageCard"/s,
+  '概况卡必须在工作区右列');
 assert.match(html, /id="usageCard"[\s\S]*id="proxyCard"/s,
-  '概况卡（右上）必须排在出口代理（右下）之前');
+  '概况卡必须排在出口代理之前（右列自上而下）');
 assert.match(html, /<h2 id="h-usage">概况<\/h2>/, '概况标题必须为“概况”');
 assert.match(html, /class="usage-grid"/, '概况必须用 usage-grid 承载 2×2 四格');
 const usageStatCount = (html.match(/class="usage-stat"/g) || []).length;

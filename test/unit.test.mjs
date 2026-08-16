@@ -8,7 +8,7 @@ const src = readFileSync(new URL('../worker.js', import.meta.url), 'utf-8');
 // 使内部函数在沙箱全局可见，供单测直接调用。
 const wrapper = src.replace('export default {', 'const __workerDefault__ = {') +
   '\n\nglobalThis.__workerDefault__ = __workerDefault__;\n' +
-  'globalThis.__unitTestApi__ = { normalizeChatThinking, anthropicThinkingToEffort, collectReasoningTexts, anthropicStopReason, anthropicModelToOpenAI, parseModelAliases, resolveModelAlias, resolveModelConfig, findModelConfig, setTestAliases: (raw) => { currentAliases = parseModelAliases(raw); }, cooldown, cooldownInfo, inCooldown, markSessionInvalidated, wasRecentlyInvalidated, singleFlight, sessionRemainingMs, INVALIDATION_WINDOW_MS, SESSION_REUSE_SAFE_MS, SESSION_VERIFY_WINDOW_MS, executeChat, readCallUsage, accountLabel, logCall, callLogSnapshot, readUsageFull, recordRequest, blankUsageTotals };\n';
+  'globalThis.__unitTestApi__ = { normalizeChatThinking, anthropicThinkingToEffort, namedEffort, normalizeReasoningEffort, collectReasoningTexts, anthropicStopReason, anthropicModelToOpenAI, parseModelAliases, resolveModelAlias, resolveModelConfig, findModelConfig, setTestAliases: (raw) => { currentAliases = parseModelAliases(raw); }, cooldown, cooldownInfo, inCooldown, markSessionInvalidated, wasRecentlyInvalidated, singleFlight, sessionRemainingMs, INVALIDATION_WINDOW_MS, SESSION_REUSE_SAFE_MS, SESSION_VERIFY_WINDOW_MS, executeChat, readCallUsage, accountLabel, logCall, callLogSnapshot, readUsageFull, recordRequest, blankUsageTotals };\n';
 
 // 可编程 fetch mock：测试里可替换 sandbox.fetch，返回可定制的 Response 形状
 // （worker 里用的是 { status, ok, headers, text() } 简化形状）。
@@ -29,7 +29,7 @@ sandbox.globalThis = sandbox;
 vm.createContext(sandbox);
 vm.runInContext(wrapper, sandbox);
 
-const { normalizeChatThinking, anthropicThinkingToEffort, collectReasoningTexts, anthropicStopReason, anthropicModelToOpenAI, parseModelAliases, resolveModelAlias, resolveModelConfig, findModelConfig, setTestAliases, cooldown, cooldownInfo, inCooldown, markSessionInvalidated, wasRecentlyInvalidated, singleFlight, sessionRemainingMs, INVALIDATION_WINDOW_MS, SESSION_REUSE_SAFE_MS, SESSION_VERIFY_WINDOW_MS, executeChat, readCallUsage, accountLabel, logCall, callLogSnapshot, readUsageFull, recordRequest, blankUsageTotals } = sandbox.__unitTestApi__;
+const { normalizeChatThinking, anthropicThinkingToEffort, namedEffort, normalizeReasoningEffort, collectReasoningTexts, anthropicStopReason, anthropicModelToOpenAI, parseModelAliases, resolveModelAlias, resolveModelConfig, findModelConfig, setTestAliases, cooldown, cooldownInfo, inCooldown, markSessionInvalidated, wasRecentlyInvalidated, singleFlight, sessionRemainingMs, INVALIDATION_WINDOW_MS, SESSION_REUSE_SAFE_MS, SESSION_VERIFY_WINDOW_MS, executeChat, readCallUsage, accountLabel, logCall, callLogSnapshot, readUsageFull, recordRequest, blankUsageTotals } = sandbox.__unitTestApi__;
 
 let pass = 0, fail = 0;
 function t(name, fn) {
@@ -66,6 +66,18 @@ t('既有 reasoning_effort 不覆盖', () => {
   const r = normalizeChatThinking({ thinking: { type: 'high' }, reasoning_effort: 'low' });
   if (r.reasoning_effort !== 'low') throw new Error('got ' + r.reasoning_effort);
 });
+t('顶层 thinking.max → max', () => {
+  const r = normalizeChatThinking({ thinking: { type: 'max' } });
+  if (r.reasoning_effort !== 'max') throw new Error('got ' + r.reasoning_effort);
+});
+t('thinking.effort MAX → max（大小写归一）', () => {
+  const r = normalizeChatThinking({ thinking: { effort: 'MAX' } });
+  if (r.reasoning_effort !== 'max') throw new Error('got ' + r.reasoning_effort);
+});
+t('thinking.effort 未知值原样透传给上游', () => {
+  const r = normalizeChatThinking({ thinking: { effort: 'turbo' } });
+  if (r.reasoning_effort !== 'turbo') throw new Error('got ' + r.reasoning_effort);
+});
 
 console.log('--- anthropicThinkingToEffort (thinking → effort 映射) ---');
 t('thinking disabled → none', () => {
@@ -86,14 +98,58 @@ t('enabled budget 16384 → high', () => {
 t('enabled budget 32768 → xhigh', () => {
   if (anthropicThinkingToEffort({ thinking: { type: 'enabled', budget_tokens: 32768 } }) !== 'xhigh') throw new Error('nope');
 });
-t('adaptive + effort max → xhigh', () => {
-  if (anthropicThinkingToEffort({ thinking: { type: 'adaptive' }, output_config: { effort: 'max' } }) !== 'xhigh') throw new Error('nope');
+// 点名的档位不降级：CC 侧设 max 必须原样到达上游，否则在 efforts=[low,high,max]
+// 的模型上会被 clamp 成 high（曾经的 max→xhigh 折算就是这么失效的）
+t('adaptive + effort max → max（不再折成 xhigh）', () => {
+  if (anthropicThinkingToEffort({ thinking: { type: 'adaptive' }, output_config: { effort: 'max' } }) !== 'max') throw new Error('nope');
+});
+t('adaptive + effort xhigh → xhigh', () => {
+  if (anthropicThinkingToEffort({ thinking: { type: 'adaptive' }, output_config: { effort: 'xhigh' } }) !== 'xhigh') throw new Error('nope');
+});
+t('adaptive + effort ultra → ultra', () => {
+  if (anthropicThinkingToEffort({ thinking: { type: 'adaptive' }, output_config: { effort: 'ultra' } }) !== 'ultra') throw new Error('nope');
+});
+t('adaptive + effort none → none', () => {
+  if (anthropicThinkingToEffort({ thinking: { type: 'adaptive' }, output_config: { effort: 'none' } }) !== 'none') throw new Error('nope');
+});
+t('adaptive 无 effort → auto', () => {
+  if (anthropicThinkingToEffort({ thinking: { type: 'adaptive' } }) !== 'auto') throw new Error('nope');
+});
+t('adaptive + 未知 effort → auto', () => {
+  if (anthropicThinkingToEffort({ thinking: { type: 'adaptive' }, output_config: { effort: 'turbo' } }) !== 'auto') throw new Error('nope');
+});
+t('enabled + effort max（无 budget）→ max', () => {
+  if (anthropicThinkingToEffort({ thinking: { type: 'enabled', effort: 'MAX' } }) !== 'max') throw new Error('nope');
+});
+t('enabled 时 effort 优先于 budget', () => {
+  if (anthropicThinkingToEffort({ thinking: { type: 'enabled', effort: 'max', budget_tokens: 1024 } }) !== 'max') throw new Error('nope');
 });
 t('auto + effort medium → medium', () => {
   if (anthropicThinkingToEffort({ thinking: { type: 'auto' }, output_config: { effort: 'medium' } }) !== 'medium') throw new Error('nope');
 });
 t('no thinking → undefined', () => {
   if (anthropicThinkingToEffort({}) !== undefined) throw new Error('nope');
+});
+
+console.log('--- normalizeReasoningEffort (per-model clamp) ---');
+// 官方 efforts 表：deepseek-v4-* = [low, high, max]，gpt-5.6-luna = [low..max 含 xhigh]
+t('max 在 deepseek-v4-pro 上原样保留', () => {
+  if (normalizeReasoningEffort('deepseek/deepseek-v4-pro', 'max') !== 'max') throw new Error('nope');
+});
+t('xhigh 在 deepseek-v4-pro 上被下取成 high（所以 max 绝不能先折成 xhigh）', () => {
+  if (normalizeReasoningEffort('deepseek/deepseek-v4-pro', 'xhigh') !== 'high') throw new Error('nope');
+});
+t('medium 在 deepseek-v4-flash 上被下取成 low（该模型无 medium 档）', () => {
+  if (normalizeReasoningEffort('deepseek/deepseek-v4-flash', 'medium') !== 'low') throw new Error('nope');
+});
+t('max 在 gpt-5.6-luna 上原样保留', () => {
+  if (normalizeReasoningEffort('openai/gpt-5.6-luna', 'max') !== 'max') throw new Error('nope');
+});
+t('ultra 在 gpt-5.6-luna 上被下取成 max', () => {
+  if (normalizeReasoningEffort('openai/gpt-5.6-luna', 'ultra') !== 'max') throw new Error('nope');
+});
+t('未列入 efforts 表的模型原样透传 max', () => {
+  if (normalizeReasoningEffort('crof/kimi-k3-eco', 'max') !== 'max') throw new Error('nope');
 });
 
 console.log('--- collectReasoningTexts ---');

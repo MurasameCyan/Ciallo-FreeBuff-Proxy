@@ -137,39 +137,38 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
 
 .workspace-grid {
   display: grid;
-  /* 2×2：左列弹性承担数据密集区（账号池 / 模型），右列固定 300px 放运行概况(360)与出口代理(660)。 */
-  grid-template-columns: minmax(0, 1fr) 300px;
-  grid-template-rows: auto auto;
+  /* 左列弹性承担数据密集区(账号池 / 模型),右列固定 400px(概况 / 出口代理)。
+     两列各自是一条独立的纵向流:旧的 2×2 网格里同排两张卡会被高的那张撑到等高,
+     矮的那张下面就空出几百像素;拆成两列后没有共享行高,也就没有空洞。 */
+  grid-template-columns: minmax(0, 1fr) 400px;
   gap: 20px;
   align-items: stretch;
 }
-.workspace-grid > .runtime-card,
-.workspace-grid > .usage-card,
-.workspace-grid > .proxy-card,
-.workspace-grid > .model-workspace-card { min-width: 0; }
-.workspace-grid > .runtime-card { grid-column: 1; grid-row: 1; }
-.workspace-grid > .usage-card { grid-column: 2; grid-row: 1; display: flex; flex-direction: column; min-height: 360px; align-self: start; }
-/* 概况固定 360 高：让内部 2×2 吃满卡高，四格均分不留空洞。 */
-.workspace-grid > .usage-card .usage-grid { flex: 1 1 auto; grid-auto-rows: 1fr; }
-.workspace-grid > .model-workspace-card { grid-column: 1; grid-row: 2; }
-.workspace-grid > .proxy-card { grid-column: 2; grid-row: 2; min-height: 660px; align-self: start; }
+.workspace-col {
+  display: flex; flex-direction: column;
+  gap: 20px; min-width: 0;
+}
+/* 两列高度差交给左列末卡吸收,底边就能齐平。多出来的高度进「模型映射」表格和
+   「可用模型」列表(两者都是滚动区,越高越有用),不会变成空洞。 */
+.col-main > .runtime-card { flex: none; }  /* 账号池按内容高,不参与高度差分配(它 overflow:hidden,被压缩会切内容) */
+.col-main > .model-workspace-card {
+  flex: 1 1 auto;
+  display: flex; flex-direction: column;
+}
+.col-main > .model-workspace-card > .model-workspace-grid { flex: 1 1 auto; }
+.col-side > .usage-card { display: flex; flex-direction: column; min-height: 360px; }
+/* 概况 360 起:让内部 2×2 吃满卡高,四格均分不留空洞。 */
+.col-side > .usage-card .usage-grid { flex: 1 1 auto; grid-auto-rows: 1fr; }
+.col-side > .proxy-card { min-height: 660px; }
 
-@media (max-width: 1100px) {
-  .workspace-grid {
-    grid-template-columns: minmax(0, 1fr);
-    grid-template-rows: auto;
-  }
-  .workspace-grid > .runtime-card,
-  .workspace-grid > .usage-card,
-  .workspace-grid > .model-workspace-card,
-  .workspace-grid > .proxy-card {
-    grid-column: auto;
-    grid-row: auto;
-    min-height: 0;
-    align-self: auto;
-  }
+/* 收起两列的临界点跟着侧栏宽度走:侧栏 400 时,1200 以下左列已经不够「模型映射」
+   摆下 别名+映射到+操作 三列(会把操作列顶进隐藏滚动条),不如直接退成单列。 */
+@media (max-width: 1200px) {
+  .workspace-grid { grid-template-columns: minmax(0, 1fr); }
+  /* 单列时两张侧栏卡按内容高即可,撑到 360/660 只会拉出空白 */
+  .col-side > .usage-card,
+  .col-side > .proxy-card { min-height: 0; }
   .summary-heading { align-items: flex-start; flex-wrap: wrap; }
-  .summary-tools { flex: 1 1 100%; justify-content: space-between; }
 }
 @media (max-width: 660px) {
   .top { flex-wrap: wrap; padding: 12px 14px; }
@@ -180,11 +179,6 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
   #main.dashboard { padding: 20px 14px 44px; gap: 16px; }
   .section-heading h1 { font-size: 19px; }
   .card-head .hint { margin-left: 0; text-align: left; }
-  .summary-tools { flex-wrap: wrap; justify-content: flex-start; }
-  .access-inline { flex: 1 1 100%; align-items: flex-start; }
-  .access-actions { flex: 1 1 100%; overflow-x: auto; scrollbar-width: none; -ms-overflow-style: none; }
-  .access-actions::-webkit-scrollbar { display: none; }
-  .access-actions .btn { flex: 0 0 auto; }
 }
 
 /* ── 卡片 ─────────────────────────────────────────────── */
@@ -224,10 +218,6 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
   gap: 14px; margin-bottom: 10px; min-width: 0;
 }
 .summary-heading h2 { font-size: 16px; font-weight: 650; }
-.summary-tools {
-  display: flex; align-items: center; justify-content: flex-end;
-  gap: 9px; min-width: 0;
-}
 .summary-live {
   display: inline-flex; align-items: center; gap: 7px;
   margin-top: 4px; color: var(--fg-2); font-size: 11px; white-space: nowrap;
@@ -244,20 +234,32 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
 .summary-refresh:disabled { cursor: default; opacity: .55; }
 .summary-refresh svg { pointer-events: none; }
 .summary-refresh.spin svg { animation: spin .9s linear infinite; }
+/* 接入信息:一段独立区块,现挂在「运行概况」卡底部(见 .usage-card .access-inline) */
 .access-inline {
-  display: flex; flex-direction: column; align-items: flex-end;
+  display: flex; flex-direction: column; align-items: stretch;
   gap: 7px; min-width: 0;
 }
 .access-head {
-  display: inline-flex; align-items: center; gap: 6px; min-width: 0;
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 10px; min-width: 0;
+}
+/* 「Key:」贴左、掩码贴右(space-between),中间那段空白就是分隔 */
+.access-name {
+  flex: none; color: var(--fg-2);
+  font: 10px var(--mono); letter-spacing: .02em;
 }
 .access-inline .access-key {
-  max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   color: var(--mint); font: 10px var(--mono);
 }
-.access-actions { display: inline-flex; align-items: center; gap: 5px; min-width: 0; }
+/* 四颗按钮等宽铺开:窄卡(内宽 260)排成 2×2,宽屏单列时自动排成一行四颗,
+   auto-fill 留空轨道,所以按钮不会被拉成整行那么宽。 */
+.access-actions {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(118px, 1fr));
+  gap: 6px; min-width: 0;
+}
 .access-actions .btn {
-  padding: 5px 7px; font-size: 10px; white-space: nowrap;
+  padding: 6px 8px; font-size: 11px; text-align: center; white-space: nowrap;
 }
 .account-card > .card-head { padding: 20px 20px 0; margin-bottom: 16px; }
 .account-card > .pane { padding: 0 20px 20px; }
@@ -360,14 +362,23 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
 }
 .tbl .empty { color: var(--fg-2); font-size: 13px; padding: 24px 12px; text-align: center; }
 .account-table { min-width: 680px; }
-.alias-table { min-width: 620px; }
-.action-col { width: 84px; }
-/* 账号表:全部探测并入“操作”表头右侧,省掉单独一行工具条 */
+/* 模型映射表:不再硬撑 620px。容器只有 ~560,硬撑就把「操作」列顶出可视区(滚动条
+   在这张卡里是隐藏的,看起来就是删除按钮被切掉一半)。 */
+.alias-table { min-width: 0; }
+/* 别名与操作按内容收窄,剩下的宽度全归「映射到」——两列文字之间只剩单元格内边距,
+   不再隔着几十像素的空档。 */
+.alias-table th:first-child { width: 1%; white-space: nowrap; }
+.alias-table .action-col { width: 1%; white-space: nowrap; }
+.alias-table tbody td:first-child { white-space: nowrap; }
+/* 账号 / 状态 / 操作三列都按内容收窄(width:1% 让表格算法退到最小内容宽),腾出来的
+   宽度全归「可用模型」——那列条目多且模型 id 长,横向折行才摆得开 */
+.account-table thead th:first-child { width: 1%; white-space: nowrap; }
+.account-table thead th:nth-child(2) { width: 1%; white-space: nowrap; }
 .account-table thead th:last-child { width: 1%; white-space: nowrap; }
-.account-table thead .th-actions {
-  display: flex; align-items: center; gap: 14px; white-space: nowrap;
-}
-.account-table thead .th-actions .btn { text-transform: none; letter-spacing: normal; }
+.account-table tbody td:first-child { white-space: nowrap; }
+/* 空态行是整行 colspan 的长句子,不能被上面两条 nowrap 拖成一行(那句提示比表格还宽,
+   而这两张表的滚动条都是隐藏的,溢出就等于被切掉)。放在后面靠源序覆盖。 */
+.tbl td.empty { white-space: normal; }
 
 .actions { display: flex; gap: 6px; flex-wrap: wrap; }
 
@@ -388,29 +399,35 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
 .pill.warn   { color: var(--amber); border-color: color-mix(in oklab, var(--amber) 35%, var(--line)); }
 .pill.danger { color: var(--rose); border-color: color-mix(in oklab, var(--rose) 35%, var(--line)); }
 
-/* 模型列表里的 free 胶囊（比普通 pill 更小更紧凑） */
+/* 模型列表里的 free 胶囊（比模型名再小一号，保持从属关系） */
 .pill.free {
-  font-size: 10px; padding: 1px 7px; border-radius: 999px;
+  font-size: 9px; padding: 1px 6px; border-radius: 999px;
   color: var(--mint); border-color: color-mix(in oklab, var(--mint) 30%, transparent);
-  background: transparent; margin-left: 6px; vertical-align: 1px;
+  background: transparent; vertical-align: 1px;
 }
+/* 模型列表：纯文本清单，不再给每个模型名套卡片(边框+底色)——一屏九行卡片噪音大过信息，
+   去掉包裹后行距收紧到 3px、字号降到 10px，列表宽度也跟着按最长模型名收窄。 */
 .models {
-  display: grid; gap: 7px;
+  display: grid; gap: 3px;
   max-height: 400px; overflow-y: auto; padding-right: 3px;
 }
 .models li {
-  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
-  min-width: 0; padding: 9px 10px;
-  border: 1px solid var(--line); border-radius: 8px;
-  background: var(--card-2); color: var(--fg-2);
-  font: 11px/1.4 var(--mono); overflow-wrap: anywhere;
+  display: flex; align-items: center; gap: 4px; flex-wrap: wrap;
+  min-width: 0; padding: 1px 0;
+  color: var(--fg-2);
+  font: 10px/1.5 var(--mono); overflow-wrap: anywhere;
 }
 
 /* 可用模型列:列出账号可用模型 + 池级统一重置时间;用量已上移到账号名后的 .acct-usage */
 .quota { font-size: 11px; color: var(--fg-2); display: grid; gap: 5px; }
-.quota-models { display: flex; align-items: baseline; flex-wrap: wrap; gap: 2px 10px; line-height: 1.3; }
+/* 可用模型自动换行：账号列收窄后这列拿到大部分宽度,模型横向排、排满再折行,
+   比每项独占一行省掉大半纵向空间 */
+.quota-models {
+  display: flex; flex-wrap: wrap; gap: 3px 14px;
+  margin: 0; padding: 0; list-style: none; line-height: 1.35;
+}
+.quota-models li { min-width: 0; overflow-wrap: anywhere; }
 .quota b { color: var(--fg); font-family: var(--mono); }
-.quota-reset { color: var(--fg-2); white-space: nowrap; }
 .acct-usage { font-weight: 500; font-size: 11px; color: var(--fg-2); font-family: var(--mono); white-space: nowrap; }
 
 /* ── 表单 / 接入信息 ──────────────────────────────────── */
@@ -640,6 +657,9 @@ select:disabled { opacity: .5; cursor: not-allowed; }
   background: var(--card-2); color: var(--fg);
   padding: 8px 14px; font: 500 13px var(--sans);
   cursor: pointer;
+  /* 按钮文字永远横排:中文每个字之间都是折行点,一旦按钮落在 width:1% 的收缩列里
+     (如账号表「操作」),min-content 就等于一个字宽,「删除」会被竖成两行 */
+  white-space: nowrap;
   transition: background .13s, border-color .13s, transform .08s;
 }
 .btn:hover:not(:disabled) { background: var(--line); border-color: var(--fg-2); }
@@ -687,13 +707,14 @@ select:disabled { opacity: .5; cursor: not-allowed; }
   .alias-table { min-width: 0; table-layout: fixed; }
   .account-table.is-empty { min-width: 0; table-layout: fixed; }
   .tbl th, .tbl td { padding-left: 8px; padding-right: 8px; }
-  .account-table th:nth-child(1) { width: 34%; }
-  .account-table th:nth-child(2) { width: 22%; }
-  .account-table th:nth-child(3) { width: 26%; }
-  .account-table th:nth-child(4) { width: 18%; }
+  /* 账号表不再按百分比切列:桌面的 width:1% 收窄规则在小屏同样适用,
+     省下的宽度留给「可用模型」折行 */
   .alias-table th:nth-child(1) { width: 31%; }
   .alias-table th:nth-child(2) { width: 47%; }
   .alias-table th:nth-child(3) { width: 22%; }
+  /* 手机端改回定宽百分比,别名列必须能折行:桌面那条 nowrap 会把长别名顶出 31% 的格子 */
+  .alias-table th:first-child,
+  .alias-table tbody td:first-child { white-space: normal; }
   .alias-table .btn { padding-left: 6px; padding-right: 6px; white-space: nowrap; }
   .tbl .mono { overflow-wrap: anywhere; word-break: break-word; }
   .actions { gap: 4px; }
@@ -907,6 +928,13 @@ details[open] > .calllog-summary { margin-bottom: 14px; }
   display: block; height: 100%; width: 0; border-radius: 999px;
   background: linear-gradient(90deg, var(--mint-dim), var(--mint));
   transition: width .5s cubic-bezier(.2, .7, .3, 1);
+}
+
+/* 接入信息压在概况卡最底部:usage-grid 是 flex:1 会先吃掉多余高度,这块自然贴底。
+   一条分隔线把它与四格数据分开——它是操作区,不是又一格统计。 */
+.usage-card .access-inline {
+  margin-top: 14px; padding-top: 13px;
+  border-top: 1px solid var(--line);
 }
 
 /* 四格叠成一列：窄档每格内容只剩百来像素，Token 那串副行会折成几行，
