@@ -693,6 +693,7 @@ async function refresh() {
     const acc = await api('/accounts').catch(() => null);
     const proxy = await api('/proxy').catch(() => null);
     const usage = await api('/usage').catch(() => null);
+    const usagePersistence = await api('/usage-persistence').catch(() => null);
     if (cfg) {
       S.aliases = cfg.aliases || {};
       S.apiKey = cfg.apiKey || 'freebuff-default-key';
@@ -705,6 +706,10 @@ async function refresh() {
     if (acc) { S.accounts = acc.accounts || []; S.health = acc.health || {}; S.readonly = acc.readonly; }
     if (proxy) S.proxy = proxy.proxy || proxy;
     if (usage) S.usage = usage;
+    if (usagePersistence) {
+      const toggle = $('usagePersistence');
+      if (toggle) toggle.checked = usagePersistence.enabled === true;
+    }
     // /v1/models 是 worker 路由,带 key 头直连
     const models = await rawApi('/v1/models', { headers: { 'Authorization': 'Bearer ' + S.apiKey } }).catch(() => null);
     if (models) S.models = models.data || [];
@@ -951,6 +956,27 @@ function wire() {
   };
   $('proxyAutoUpdate')?.addEventListener('change', saveProxyUpdate);
   $('proxyUpdateInterval')?.addEventListener('change', saveProxyUpdate);
+
+  // 概况统计持久化开关。只切设置，不连带全量刷新、也不打任何上游接口；
+  // 失败恢复旧状态（开关没真正生效，就不能显示成已生效）。
+  $('usagePersistence')?.addEventListener('change', async (e) => {
+    const toggle = e.currentTarget;
+    const prev = !toggle.checked;   // 记录点击前状态，失败时回滚
+    toggle.disabled = true;
+    try {
+      const r = await api('/usage-persistence', {
+        method: 'PUT', body: JSON.stringify({ enabled: toggle.checked }),
+      });
+      // 服务端是唯一真相；回写它确认后的值（正常情况下与 toggle.checked 一致）。
+      toggle.checked = r?.enabled === true;
+      toast(toggle.checked ? '统计持久化已开启' : '统计持久化已关闭', 'ok');
+    } catch (err) {
+      toggle.checked = prev;
+      toast(`切换持久化失败:${err.message}`, 'err');
+    } finally {
+      toggle.disabled = false;
+    }
+  });
 
   // 手动添加账号
   $('addForm').addEventListener('submit', (e) => {
