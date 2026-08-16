@@ -413,6 +413,32 @@ assert.match(css, /\.usage-card \.usage-bar span\s*\{[^}]*linear-gradient/s,
 assert.match(css, /@media\s*\(max-width:\s*660px\)[\s\S]*?\.usage-card \.usage-grid\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)/s,
   '窄屏概况必须退化为单列');
 
+// ── 概况统计持久化开关（无文字胶囊开关，右侧） ────────────
+assert.match(html,
+  /<label class="switch usage-persistence-toggle" title="持久化统计数据（默认关闭）">[\s\S]*?<input type="checkbox" id="usagePersistence">[\s\S]*?<span class="switch-track"[\s\S]*?<span class="sr-only">持久化统计数据（默认关闭）<\/span>/s,
+  '概况标题右侧必须有无文字胶囊开关，悬停提示「持久化统计数据（默认关闭）」');
+// 开关必须落在概况卡 .card-head 内（标题之后），不是卡别处。
+const usageHead = html.slice(html.indexOf('<div class="card-head">', html.indexOf('id="usageCard"')), html.indexOf('<div class="usage-grid">'));
+assert.match(usageHead, /id="usagePersistence"/, '持久化开关必须位于概况卡 card-head 内');
+// 可见文字只有 sr-only 的可访问名：label 里除 sr-only 外不应有文字节点承载说明。
+assert.ok(html.includes('持久化统计数据（默认关闭）'), '开关悬停提示与无障碍名必须写明「默认关闭」');
+// 默认关闭：checkbox 不带 checked 属性。
+assert.ok(!/<input type="checkbox" id="usagePersistence"[^>]*checked/.test(html),
+  '持久化开关 HTML 默认必须关闭');
+// 前端接线：加载读 GET、切换发 PUT、失败恢复旧状态、成功回写服务端确认值。
+assert.ok(app.includes("api('/usage-persistence')"), '面板必须读取持久化开关状态');
+assert.match(app, /\$\('usagePersistence'\)[\s\S]*api\('\/usage-persistence',\s*\{[\s\S]*method:\s*'PUT'[\s\S]*enabled:/s,
+  '切换开关必须 PUT /usage-persistence 并带 enabled 布尔');
+assert.match(app, /catch\s*\(err\)\s*\{[\s\S]*toggle\.checked\s*=\s*prev/s,
+  'PUT 失败必须恢复旧状态（开关没生效不能显示成生效）');
+assert.ok(app.includes('toggle.checked = r?.enabled === true'),
+  '开关最终状态必须回写服务端确认值，而非本地猜测');
+// 开关切设置不得触发 refresh()（那条会连带探账号/拉模型表）。
+const persistFlow = app.slice(app.indexOf("$('usagePersistence')?.addEventListener"), app.indexOf('// 手动添加账号'));
+assert.ok(persistFlow.includes("api('/usage-persistence'"), '持久化开关切换必须调用自己的 API');
+assert.ok(!persistFlow.includes('refresh()'),
+  '持久化开关切换不应触发全量 refresh()，也不应打任何上游接口');
+
 // 所有 id 必须唯一，避免重排后 renderStats/renderModels 写入错误节点。
 const ids = [...html.matchAll(/\bid=["']([^"']+)["']/g)].map((m) => m[1]);
 const duplicates = ids.filter((id, i) => ids.indexOf(id) !== i);
