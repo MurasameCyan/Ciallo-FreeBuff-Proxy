@@ -20,6 +20,7 @@ import {
   mihomo,
   noteEgressReject,
 } from './server/proxy.mjs';
+import { createUsagePersistence } from './server/usage-persistence.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -678,6 +679,37 @@ async function handleWebApi(req, res, url) {
     return json(res, 200, snapshot);
   }
 
+  // ---------- 概况统计持久化开关 ----------
+  // GET  /_api/usage-persistence → { enabled }
+  // PUT  /_api/usage-persistence { enabled: boolean } → 切换开关；开启时立即保存当前快照。
+  // 统计文件在数据目录（DATA_DIR），不落仓库根；损坏/缺失按空统计启动，不阻断服务。
+  if (seg === 'usage-persistence') {
+    if (method === 'GET') {
+      return json(res, 200, { enabled: usageStore.enabled() });
+    }
+    if (method === 'PUT') {
+      let body;
+      try { body = JSON.parse((await readBody(req)).toString('utf-8') || '{}'); } catch { return err(res, 400, 'Invalid JSON'); }
+      if (typeof body.enabled !== 'boolean') return err(res, 400, 'enabled 必须是布尔值', 'invalid_enabled');
+      try {
+        if (body.enabled) {
+          // 开启时立即把当前内存快照写进文件（避免下次重启前丢失已累计数据）。
+          await usageStore.setEnabled(true);
+          const snap = typeof handler.usageSnapshot === 'function'
+            ? handler.usageSnapshot()
+            : typeof handler.getCallLog === 'function' ? handler.getCallLog() : {};
+          await usageStore.save(snap);
+        } else {
+          await usageStore.setEnabled(false);
+        }
+        return json(res, 200, { enabled: usageStore.enabled() });
+      } catch (e) {
+        return err(res, 500, '写入统计失败: ' + e.message, 'io_error');
+      }
+    }
+    return err(res, 405, 'method not allowed');
+  }
+
   // ---------- Freebuff 授权码登录（OAuth） ----------
   if (seg === 'login') {
     if (method === 'POST' && sub === 'start') {
@@ -866,6 +898,21 @@ if (startupSubscription) {
 // 加载 worker（顶层 await，Node 20+ 支持）
 const worker = await import('./worker.js');
 const handler = worker.default;
+
+// 概况统计持久化：开关与累计文件在数据目录。默认关闭；损坏/缺失回退空统计。
+// store 只在 server 侧持有；worker 通过注入的适配器在每次 recordRequest 后触发 save。
+const usageStore = createUsagePersistence(dataFile('usage-stats.json'));
+if (typeof handler.configureUsagePersistence === 'function') {
+  handler.configureUsagePersistence({
+    load: () => usageStore.load(),
+    save: (snapshot) => usageStore.save(snapshot),
+    enabled: () => usageStore.enabled(),
+  });
+}
+if (usageStore.enabled() && typeof handler.restoreUsageSnapshot === 'function') {
+  handler.restoreUsageSnapshot(usageStore.load());
+  console.log('[server] 概况统计持久化已开启，恢复累计: ' + JSON.stringify(usageStore.load().total));
+}
 
 server.listen(CFG.port, CFG.host, () => {
   const n = listAccounts().length;
