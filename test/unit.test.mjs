@@ -8,7 +8,7 @@ const src = readFileSync(new URL('../worker.js', import.meta.url), 'utf-8');
 // 使内部函数在沙箱全局可见，供单测直接调用。
 const wrapper = src.replace('export default {', 'const __workerDefault__ = {') +
   '\n\nglobalThis.__workerDefault__ = __workerDefault__;\n' +
-  'globalThis.__unitTestApi__ = { normalizeChatThinking, anthropicThinkingToEffort, namedEffort, normalizeReasoningEffort, collectReasoningTexts, anthropicStopReason, anthropicModelToOpenAI, parseModelAliases, resolveModelAlias, resolveModelConfig, findModelConfig, setTestAliases: (raw) => { currentAliases = parseModelAliases(raw); }, cooldown, cooldownInfo, inCooldown, markSessionInvalidated, wasRecentlyInvalidated, singleFlight, sessionRemainingMs, INVALIDATION_WINDOW_MS, SESSION_REUSE_SAFE_MS, SESSION_VERIFY_WINDOW_MS, executeChat, readCallUsage, accountLabel, logCall, callLogSnapshot, readUsageFull, recordRequest, blankUsageTotals, recordAccountObservation, setTestEgressReject: (fn) => { onEgressReject = fn; } };\n';
+  'globalThis.__unitTestApi__ = { normalizeChatThinking, anthropicThinkingToEffort, namedEffort, normalizeReasoningEffort, collectReasoningTexts, anthropicStopReason, anthropicModelToOpenAI, parseModelAliases, resolveModelAlias, resolveModelConfig, findModelConfig, setTestAliases: (raw) => { currentAliases = parseModelAliases(raw); }, cooldown, cooldownInfo, inCooldown, markSessionInvalidated, wasRecentlyInvalidated, singleFlight, sessionRemainingMs, INVALIDATION_WINDOW_MS, SESSION_REUSE_SAFE_MS, SESSION_VERIFY_WINDOW_MS, executeChat, readCallUsage, accountLabel, logCall, callLogSnapshot, readUsageFull, recordRequest, blankUsageTotals, recordAccountObservation, configureUsagePersistence, restoreUsageSnapshot, usageSnapshot, setTestEgressReject: (fn) => { onEgressReject = fn; } };\n';
 
 // 可编程 fetch mock：测试里可替换 sandbox.fetch，返回可定制的 Response 形状
 // （worker 里用的是 { status, ok, headers, text() } 简化形状）。
@@ -29,7 +29,7 @@ sandbox.globalThis = sandbox;
 vm.createContext(sandbox);
 vm.runInContext(wrapper, sandbox);
 
-const { normalizeChatThinking, anthropicThinkingToEffort, namedEffort, normalizeReasoningEffort, collectReasoningTexts, anthropicStopReason, anthropicModelToOpenAI, parseModelAliases, resolveModelAlias, resolveModelConfig, findModelConfig, setTestAliases, cooldown, cooldownInfo, inCooldown, markSessionInvalidated, wasRecentlyInvalidated, singleFlight, sessionRemainingMs, INVALIDATION_WINDOW_MS, SESSION_REUSE_SAFE_MS, SESSION_VERIFY_WINDOW_MS, executeChat, readCallUsage, accountLabel, logCall, callLogSnapshot, readUsageFull, recordRequest, blankUsageTotals, recordAccountObservation, setTestEgressReject } = sandbox.__unitTestApi__;
+const { normalizeChatThinking, anthropicThinkingToEffort, namedEffort, normalizeReasoningEffort, collectReasoningTexts, anthropicStopReason, anthropicModelToOpenAI, parseModelAliases, resolveModelAlias, resolveModelConfig, findModelConfig, setTestAliases, cooldown, cooldownInfo, inCooldown, markSessionInvalidated, wasRecentlyInvalidated, singleFlight, sessionRemainingMs, INVALIDATION_WINDOW_MS, SESSION_REUSE_SAFE_MS, SESSION_VERIFY_WINDOW_MS, executeChat, readCallUsage, accountLabel, logCall, callLogSnapshot, readUsageFull, recordRequest, blankUsageTotals, recordAccountObservation, configureUsagePersistence, restoreUsageSnapshot, usageSnapshot, setTestEgressReject } = sandbox.__unitTestApi__;
 
 let pass = 0, fail = 0;
 function t(name, fn) {
@@ -554,6 +554,60 @@ for (const [name, status, body, expect] of [
   });
 }
 setTestEgressReject(null);
+
+console.log('\n--- 概况统计持久化注入（worker 侧）---');
+async function at(name, fn) {
+  try { await fn(); pass++; console.log('  PASS', name); }
+  catch (e) { fail++; console.log('  FAIL', name, '-', e.message); }
+}
+
+await at('注入适配器且开启时 recordRequest 触发 save（带最新快照）', async () => {
+  const saves = [];
+  configureUsagePersistence({ load: null, save: (s) => { saves.push(s); }, enabled: () => true });
+  const before = callLogSnapshot().total.requests;
+  recordRequest('m-persist-A', { prompt_tokens: 7, completion_tokens: 3, total_tokens: 10 }, true);
+  await new Promise((r) => setTimeout(r, 0)); // 让 save 钩子的微任务落地
+  if (saves.length !== 1) throw new Error('save 应恰好被调一次，实际 ' + saves.length);
+  const snap = saves[0];
+  if (snap.total.requests !== before + 1) throw new Error('save 快照应含最新 requests');
+  if (snap.byModel['m-persist-A'].success !== 1) throw new Error('save 快照应含 byModel 累计');
+  if (snap.lastRequest == null) throw new Error('save 快照应含 lastRequest');
+});
+
+await at('注入适配器但关闭时 recordRequest 不触发 save', async () => {
+  const saves = [];
+  configureUsagePersistence({ load: null, save: (s) => { saves.push(s); }, enabled: () => false });
+  recordRequest('m-persist-B', null, false);
+  await new Promise((r) => setTimeout(r, 0));
+  if (saves.length !== 0) throw new Error('关闭时不应调用 save，实际 ' + saves.length);
+});
+
+await at('save 抛异常不阻断 recordRequest', async () => {
+  configureUsagePersistence({ load: null, save: () => { throw new Error('disk full'); }, enabled: () => true });
+  recordRequest('m-persist-C', null, false); // 不应抛
+  await new Promise((r) => setTimeout(r, 0));
+});
+
+await at('restoreUsageSnapshot 覆盖初始累计（startTime/byModel/total）', async () => {
+  configureUsagePersistence({ load: null, save: null, enabled: () => false });
+  restoreUsageSnapshot({
+    total: { requests: 11, success: 9, fail: 2, promptTokens: 100, completionTokens: 50, reasoningTokens: 0, totalTokens: 150, cacheReadTokens: 0, cacheWriteTokens: 0 },
+    byModel: { 'm-restore': { requests: 4, success: 4, fail: 0, promptTokens: 40, completionTokens: 20, reasoningTokens: 0, totalTokens: 60, cacheReadTokens: 0, cacheWriteTokens: 0 } },
+    startTime: 12345, lastRequest: 67890,
+  });
+  const s = callLogSnapshot();
+  if (s.total.requests !== 11) throw new Error('total 未覆盖：' + s.total.requests);
+  if (s.byModel['m-restore']?.requests !== 4) throw new Error('byModel 未覆盖');
+  if (s.startTime !== 12345) throw new Error('startTime 未覆盖：' + s.startTime);
+  if (s.lastRequest !== 67890) throw new Error('lastRequest 未覆盖');
+});
+
+await at('restoreUsageSnapshot 对畸形对象不破坏内部状态', async () => {
+  restoreUsageSnapshot(null);
+  restoreUsageSnapshot('garbage');
+  restoreUsageSnapshot({ total: { requests: 'NaN' }, byModel: { x: 42 } });
+  // 走到这里不抛即可；fields 用 num() 归一化，字符串 NaN → 0
+});
 
 console.log(`\n${pass} passed, ${fail} failed`);
 if (fail) process.exit(1);

@@ -651,7 +651,7 @@ const callTotals = { rateLimited: 0, timeout: 0, upstreamError: 0 };
 // 与 callTotals（逐次上游尝试的失败计数）刻意不同口径：这里每个客户端请求只记
 // 一次，落在终态（成功一次；或换号全失败/本地 429 各算一次失败）。同样只在内存
 // （进程级），重启即清空、不落盘，面板通过 GET /_api/usage 连同调用日志一起拉取。
-const OVERVIEW_START = Date.now();
+let OVERVIEW_START = Date.now();
 let lastRequestAt = null;
 function blankUsageTotals() {
   return {
@@ -754,6 +754,64 @@ function recordRequest(model, usage, success) {
     b.cacheWriteTokens += u.cacheWriteTokens;
   }
   lastRequestAt = Date.now();
+  usageSaveHook();
+}
+
+// ---------------------------------------------------------------------------
+// 概况统计持久化（可选）：server.js 注入 { load, save, enabled } 适配器后，worker
+// 在每次 recordRequest 更新内存后通知适配器保存。保存是异步安全的——异常不冒泡
+// 到请求处理。关闭时不保存；load() 提供启动快照，restoreUsageSnapshot 用它覆盖
+// 内存累计（仅接受规范化形状）。默认不注入：保持「纯内存、重启即清」的旧行为。
+// ---------------------------------------------------------------------------
+const usagePersistence = { load: null, save: null, enabled: null };
+
+function configureUsagePersistence(adapter) {
+  if (!adapter || typeof adapter !== "object") return;
+  usagePersistence.load = typeof adapter.load === "function" ? adapter.load : null;
+  usagePersistence.save = typeof adapter.save === "function" ? adapter.save : null;
+  usagePersistence.enabled = typeof adapter.enabled === "function" ? adapter.enabled : null;
+}
+
+function usageSaveHook() {
+  const save = usagePersistence.save;
+  if (!save) return;
+  if (usagePersistence.enabled && usagePersistence.enabled() !== true) return;
+  const snapshot = usageSnapshot();
+  Promise.resolve()
+    .then(() => save(snapshot))
+    .catch(() => { /* 磁盘写失败不阻断请求处理；内存统计照常累计。 */ });
+}
+
+function usageSnapshot() {
+  const byModel = {};
+  for (const k of Object.keys(usageByModel)) byModel[k] = { ...usageByModel[k] };
+  return {
+    total: { ...usageTotals },
+    byModel,
+    startTime: OVERVIEW_START,
+    lastRequest: lastRequestAt,
+  };
+}
+
+// 用启动时加载的持久化快照覆盖内存累计。只认规范化形状，缺字段回退空值；
+// 外部传入畸形对象不会破坏内部状态。
+function restoreUsageSnapshot(src) {
+  if (!src || typeof src !== "object") return;
+  const t = src.total && typeof src.total === "object" ? src.total : {};
+  const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+  const keys = ["requests", "success", "fail", "promptTokens", "completionTokens", "reasoningTokens", "totalTokens", "cacheReadTokens", "cacheWriteTokens"];
+  for (const k of keys) usageTotals[k] = num(t[k]);
+  for (const k of Object.keys(usageByModel)) delete usageByModel[k];
+  if (src.byModel && typeof src.byModel === "object") {
+    for (const [model, v] of Object.entries(src.byModel)) {
+      if (!v || typeof v !== "object") continue;
+      const b = blankUsageTotals();
+      for (const k of keys) b[k] = num(v[k]);
+      usageByModel[model] = b;
+    }
+  }
+  if (Number.isFinite(Number(src.startTime))) OVERVIEW_START = num(src.startTime);
+  lastRequestAt = Number.isFinite(Number(src.lastRequest)) ? num(src.lastRequest) : null;
 }
 
 // 记录一次成功调用。firstTokenAt 为空（非流式）时首字记 null。
@@ -775,16 +833,15 @@ function recordChatCall(env, token, mc, effort, t0, firstTokenAt, usage) {
 
 // 面板读取用的快照（数组/计数/概况都深拷一层，避免外部改到内部状态）。
 function callLogSnapshot() {
-  const byModel = {};
-  for (const k of Object.keys(usageByModel)) byModel[k] = { ...usageByModel[k] };
+  const usage = usageSnapshot();
   return {
     calls: callLogBuf.slice(),
     totals: { ...callTotals },
     // total（单数）= 客户端请求口径的累计；totals（复数）= 逐次尝试的失败计数。
-    total: { ...usageTotals },
-    byModel,
-    startTime: OVERVIEW_START,
-    lastRequest: lastRequestAt,
+    total: usage.total,
+    byModel: usage.byModel,
+    startTime: usage.startTime,
+    lastRequest: usage.lastRequest,
   };
 }
 
