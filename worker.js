@@ -408,6 +408,8 @@ const DESKTOP_INCLUDE_RATE_LIMITS = { "x-freebuff-include-unused-rate-limits": "
 
 
 export default {
+  // 面板调用日志快照（server.js 的 GET /_api/usage 直接吐出）。
+  getCallLog() { return callLogSnapshot(); },
   async fetch(request, env) {
     // 上游出站 fetch 注入（Node adapter 配了订阅时传入走 mihomo 的 fetch）。
     // env 可放函数（Node 的 env 是普通对象）；Cloudflare Worker 的 env 是 KV 型
@@ -617,6 +619,158 @@ function summarizeAccountHealth(pool, health) {
     unknown_accounts,
     account_states,
     account_details,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 调用日志（call log）：每次成功的上游调用记一行，环形缓冲上限 200 条。
+// 只记成功；失败按类别累加到 callTotals（供面板"累计限流/超时/错误"展示）。
+// 明细里的"账号名"由 server.js 经 env.FREEBUFF_ACCOUNT_LABELS（token→展示名）
+// 注入，worker 只在记录时解析成"调度的账号名"；拿不到名字时回落 token 短哈希。
+// 数据只在内存里（进程级），面板通过 GET /_api/usage 拉取整份，不落盘。
+// ---------------------------------------------------------------------------
+const CALL_LOG_LIMIT = 200;
+const callLogBuf = [];
+const callTotals = { rateLimited: 0, timeout: 0, upstreamError: 0 };
+
+// 概况（移植自 zen）：客户端请求口径的累计统计——请求/成功/失败 + 各类 token。
+// 与 callTotals（逐次上游尝试的失败计数）刻意不同口径：这里每个客户端请求只记
+// 一次，落在终态（成功一次；或换号全失败/本地 429 各算一次失败）。同样只在内存
+// （进程级），重启即清空、不落盘，面板通过 GET /_api/usage 连同调用日志一起拉取。
+const OVERVIEW_START = Date.now();
+let lastRequestAt = null;
+function blankUsageTotals() {
+  return {
+    requests: 0, success: 0, fail: 0,
+    promptTokens: 0, completionTokens: 0, reasoningTokens: 0,
+    totalTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
+  };
+}
+const usageTotals = blankUsageTotals();
+const usageByModel = {}; // { 模型id: blankUsageTotals() }
+
+// 归一化上游 usage：chat（prompt/completion_tokens）与 Responses（input/output_tokens）
+// 两套命名都吃；推理 token 取 completion/output_tokens_details.reasoning_tokens。
+function readCallUsage(usage) {
+  if (!usage || typeof usage !== "object") return null;
+  const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+  return {
+    in: num(usage.prompt_tokens ?? usage.input_tokens),
+    out: num(usage.completion_tokens ?? usage.output_tokens),
+    reasoning: num(
+      usage.completion_tokens_details?.reasoning_tokens ??
+      usage.output_tokens_details?.reasoning_tokens,
+    ),
+  };
+}
+
+// 概况用的完整 usage 归一化：在 readCallUsage 的入/出/推理之外，补上 total 与
+// 缓存读/写。chat 与 Responses 两套命名都吃；缓存字段各家上游命名不一，逐个兜。
+// 空/非对象一律归零（不像 readCallUsage 返回 null）—— 累加方直接读字段，不判空。
+function readUsageFull(usage) {
+  const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+  if (!usage || typeof usage !== "object") {
+    return { promptTokens: 0, completionTokens: 0, reasoningTokens: 0, totalTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
+  }
+  const pd = usage.prompt_tokens_details || {};
+  const id = usage.input_tokens_details || {};
+  const prompt = num(usage.prompt_tokens ?? usage.input_tokens);
+  const completion = num(usage.completion_tokens ?? usage.output_tokens);
+  const reasoning = num(
+    usage.completion_tokens_details?.reasoning_tokens ??
+    usage.output_tokens_details?.reasoning_tokens,
+  );
+  return {
+    promptTokens: prompt,
+    completionTokens: completion,
+    reasoningTokens: reasoning,
+    totalTokens: num(usage.total_tokens) || prompt + completion,
+    cacheReadTokens: num(
+      pd.cached_tokens ?? id.cached_tokens ??
+      usage.cache_read_input_tokens ?? usage.prompt_cache_hit_tokens,
+    ),
+    cacheWriteTokens: num(usage.cache_creation_input_tokens ?? pd.cache_creation_tokens),
+  };
+}
+
+// token → 调度的账号名。env 注入的 token→名字映射优先；无名回落 token 前 6 位。
+function accountLabel(env, token) {
+  if (!token) return "";
+  const labels = env && env.FREEBUFF_ACCOUNT_LABELS;
+  if (labels && typeof labels === "object") {
+    const hit = labels[token];
+    if (hit) return String(hit).trim();
+  }
+  return token.slice(0, 6) + "…";
+}
+
+// 追加一条调用记录。字段名取短的：整个数组会被整份读写。
+function logCall(entry) {
+  callLogBuf.push({
+    at: Date.now(),
+    account: String(entry.account ?? "").trim(),
+    model: String(entry.model ?? "").trim(),
+    // "" = 没发 reasoning_effort（随上游默认），和"发了 high"是两回事
+    effort: String(entry.effort ?? "").trim(),
+    ttfb: entry.ttfb > 0 ? Math.round(entry.ttfb) : null,
+    ms: entry.ms != null ? Math.round(entry.ms) : null,
+    in: entry.in ?? 0,
+    out: entry.out ?? 0,
+    reasoning: entry.reasoning ?? 0,
+  });
+  if (callLogBuf.length > CALL_LOG_LIMIT) {
+    callLogBuf.splice(0, callLogBuf.length - CALL_LOG_LIMIT);
+  }
+}
+
+// 记一次客户端请求的终态到概况累计。success=true 时带 usage（累加各类 token），
+// 失败时 usage 传空。总量与「该模型」两处一并累加，模型键用解析后的模型 id。
+function recordRequest(model, usage, success) {
+  const u = readUsageFull(usage);
+  const key = (model && String(model).trim()) || "unknown";
+  if (!usageByModel[key]) usageByModel[key] = blankUsageTotals();
+  for (const b of [usageTotals, usageByModel[key]]) {
+    b.requests++;
+    if (success) b.success++; else b.fail++;
+    b.promptTokens += u.promptTokens;
+    b.completionTokens += u.completionTokens;
+    b.reasoningTokens += u.reasoningTokens;
+    b.totalTokens += u.totalTokens;
+    b.cacheReadTokens += u.cacheReadTokens;
+    b.cacheWriteTokens += u.cacheWriteTokens;
+  }
+  lastRequestAt = Date.now();
+}
+
+// 记录一次成功调用。firstTokenAt 为空（非流式）时首字记 null。
+function recordChatCall(env, token, mc, effort, t0, firstTokenAt, usage) {
+  const u = readCallUsage(usage);
+  logCall({
+    account: accountLabel(env, token),
+    model: mc && mc.id ? mc.id : "",
+    effort,
+    ttfb: firstTokenAt ? firstTokenAt - t0 : null,
+    ms: Date.now() - t0,
+    in: u ? u.in : 0,
+    out: u ? u.out : 0,
+    reasoning: u ? u.reasoning : 0,
+  });
+  // 成功调用 == 该客户端请求的成功终态，顺带记入概况累计（每次成功恰好一条）。
+  recordRequest(mc && mc.id ? mc.id : "", usage, true);
+}
+
+// 面板读取用的快照（数组/计数/概况都深拷一层，避免外部改到内部状态）。
+function callLogSnapshot() {
+  const byModel = {};
+  for (const k of Object.keys(usageByModel)) byModel[k] = { ...usageByModel[k] };
+  return {
+    calls: callLogBuf.slice(),
+    totals: { ...callTotals },
+    // total（单数）= 客户端请求口径的累计；totals（复数）= 逐次尝试的失败计数。
+    total: { ...usageTotals },
+    byModel,
+    startTime: OVERVIEW_START,
+    lastRequest: lastRequestAt,
   };
 }
 
@@ -1718,6 +1872,8 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
         ? Math.max(1, Math.ceil(lock.retryAfterMs / 1000))
         : Math.max(1, Math.ceil((lock.until - Date.now()) / 1000));
       if (debug) console.log(`[acct ${acctTry + 1}] local 429 lock (${retryAfterSec}s), skip upstream`);
+      // 客户端拿到 429 即该请求的失败终态，记一次失败（概况口径，非逐次尝试计数）。
+      recordRequest(mc && mc.id ? mc.id : "", null, false);
       return jsonResponse({
         error: {
           message: `账号额度已用完,请 ${retryAfterSec}s 后重试`,
@@ -1728,6 +1884,9 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
     }
 
     try {
+      // 调用日志计时起点：涵盖 session/run/chat 全过程，与面板"耗时"口径一致。
+      const t0 = Date.now();
+      let effort = "";
       // 1) session
       const sess = await createSession(token, mc.session);
       if (debug) console.log(`[acct ${acctTry + 1}] session=${sess.instanceId}`);
@@ -1741,6 +1900,8 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
       let resp, errText = "", sessForChat = sess;
       for (let attempt = 0; attempt < 2; attempt++) {
         const payload = buildUpstreamPayload(chatParams, mc, sessForChat, run.runId);
+        // 记录本次实际发给上游的思考强度（clamp 后）；供调用日志"强度"列展示。
+        effort = payload.reasoning_effort || "";
         const headers = {
           Authorization: "Bearer " + token,
           "Content-Type": "application/json",
@@ -1818,6 +1979,9 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
         break;
       }
       if (!resp.ok) {
+        // 累计口径：429 记限流，其余上游失败记错误（超时走 catch 分支单独计）。
+        if (resp.status === 429) callTotals.rateLimited++;
+        else callTotals.upstreamError++;
         lastErrMsg = "upstream error: " + (errText || "").slice(0, 300);
         if (debug) console.log(`[acct ${acctTry + 1}] failed ${resp.status}, switch account`);
         continue;
@@ -1825,18 +1989,30 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
 
       if (isStream) {
         const { readable, writable } = new TransformStream();
-        if (mode === "responses") pipeUpstreamToResponsesStream(resp.body, writable, mc);
-        else pipeUpstreamToClient(resp.body, writable);
+        // 流式：首字延迟与 usage 只有管道跑完才知道，用 onComplete 收尾记一行。
+        const onDone = (info) =>
+          recordChatCall(env, token, mc, effort, t0, info && info.firstTokenAt, info && info.usage);
+        if (mode === "responses") pipeUpstreamToResponsesStream(resp.body, writable, mc, onDone);
+        else pipeUpstreamToClient(resp.body, writable, onDone);
         return new Response(readable, { status: 200, headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", ...corsHeaders() } });
       }
 
-      if (mode === "responses") return jsonResponse(await responsesToNonStream(resp.body, mc), 200);
+      if (mode === "responses") {
+        const out = await responsesToNonStream(resp.body, mc);
+        recordChatCall(env, token, mc, effort, t0, null, out && out.usage);
+        return jsonResponse(out, 200);
+      }
 
       const agg = await streamToNonStream(resp.body, mc.upstream);
+      recordChatCall(env, token, mc, effort, t0, null, agg && agg.usage);
       return jsonResponse(agg, 200);
     } catch (e) {
       console.error("[" + mode + "]", e);
       const msg = String(e.message || e);
+      // 累计口径：额度耗尽记限流，超时/中断记超时，其余异常记错误。
+      if (e instanceof QuotaExhaustedError) callTotals.rateLimited++;
+      else if (/abort|timeout|timed out|terminated/i.test(msg)) callTotals.timeout++;
+      else callTotals.upstreamError++;
       // 额度探测确认耗尽：清除当前模型 session，按上游 retryAfterMs 冷却后切号。
       if (e instanceof QuotaExhaustedError) {
         sessCache.delete(token + ":" + mc.session);
@@ -1861,6 +2037,8 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
       if (debug) console.log(`[acct ${acctTry + 1}] exception: ${msg.slice(0, 120)}, switch account`);
     }
   }
+  // 全池换号仍失败：该请求的失败终态，记一次失败（每个客户端请求只落一次）。
+  recordRequest(mc && mc.id ? mc.id : "", null, false);
   return jsonResponse({ error: { message: lastErrMsg, type: "api_error" } }, 502);
 }
 
@@ -2228,6 +2406,7 @@ function pipeUpstreamToClient(upstreamBody, writable, onComplete) {
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
   let buf = "";
+  let firstTokenAt = null, usage = null; // 调用日志：首字时刻 + 末尾 usage 块
   (async () => {
     try {
       while (true) {
@@ -2242,6 +2421,11 @@ function pipeUpstreamToClient(upstreamBody, writable, onComplete) {
             if (payload === "" || payload === "[DONE]") { await writer.write(encoder.encode(line + "\n\n")); continue; }
             try {
               const normalized = unwrapData(JSON.parse(payload));
+              if (!firstTokenAt) {
+                const d = normalized?.choices?.[0]?.delta;
+                if (d && (d.content || d.reasoning_content)) firstTokenAt = Date.now();
+              }
+              if (normalized?.usage) usage = normalized.usage;
               await writer.write(encoder.encode("data: " + JSON.stringify(normalized) + "\n\n"));
             } catch { await writer.write(encoder.encode(line + "\n")); }
           } else {
@@ -2251,7 +2435,7 @@ function pipeUpstreamToClient(upstreamBody, writable, onComplete) {
       }
     } catch {}
     finally {
-      try { if (onComplete) await onComplete(); } catch {}
+      try { if (onComplete) await onComplete({ firstTokenAt, usage }); } catch {}
       try { await writer.close(); } catch {}
     }
   })();
@@ -2369,7 +2553,7 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
   const encoder = new TextEncoder();
   const respId = "resp_" + Math.random().toString(36).slice(2, 10);
   const createdAt = Math.floor(Date.now() / 1000);
-  let buf = "", model = "", usage = null;
+  let buf = "", model = "", usage = null, firstTokenAt = null;
   const send = (obj) => writer.write(encoder.encode("data: " + JSON.stringify(obj) + "\n\n"));
 
   // 按上游出现顺序记录输出项：message（文本）或 function_call（工具调用）
@@ -2429,6 +2613,9 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
             const delta = choice.delta || {};
                 if (obj.model) model = obj.model;
                 if (obj.usage) usage = obj.usage;
+                // 调用日志首字：文本/推理/工具调用任一先到即计。
+                if (!firstTokenAt && (delta.content || delta.reasoning_content ||
+                  (Array.isArray(delta.tool_calls) && delta.tool_calls.length))) firstTokenAt = Date.now();
 
             // 推理增量 → response.reasoning_summary_text.delta（OpenAI 客户端按事件名消费）
             const reasonDeltas = collectReasoningTexts(delta.reasoning_content);
@@ -2523,7 +2710,7 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
       await send({ type: "response.completed", response: resp });
     } catch {}
     finally {
-      try { if (onComplete) await onComplete(); } catch {}
+      try { if (onComplete) await onComplete({ firstTokenAt, usage }); } catch {}
       try { await writer.close(); } catch {}
     }
   })();

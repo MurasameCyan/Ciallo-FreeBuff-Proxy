@@ -152,6 +152,17 @@ function allTokens() {
   return toks;
 }
 
+// token → 展示名映射（喂给 worker，用于调用日志的"调度的账号名"）。
+// 名字取 备注名 → 邮箱；都没有时不放，由 worker 回落 token 短哈希。
+function accountLabels() {
+  const labels = {};
+  for (const acct of listAccounts()) {
+    const name = acct.name || acct.email || '';
+    if (acct.token && name) labels[acct.token.trim()] = name;
+  }
+  return labels;
+}
+
 // === Web 面板会话鉴权 ===
 const sessions = new Map(); // sessionId -> { exp, createdAt }
 
@@ -325,7 +336,10 @@ function serveStatic(req, res, pathname) {
   if (!safe.startsWith(resolve(__dirname, 'web'))) return false;
   if (!existsSync(safe) || !statSync(safe).isFile()) return false;
   const mime = MIME[extname(safe)] || 'application/octet-stream';
-  res.writeHead(200, { 'Content-Type': mime, 'Cache-Control': 'no-cache' });
+  // 面板资源随构建更新,且都是小文件、每次从磁盘现读;用 no-store 保证前端改动
+  // 部署后立即生效。no-cache 不带校验器(ETag/Last-Modified)时,个别浏览器软刷新
+  // 仍会复用旧 app.js —— 会出现"改了却没生效"(新 index.html + 旧 app.js)的错觉。
+  res.writeHead(200, { 'Content-Type': mime, 'Cache-Control': 'no-store' });
   res.end(readFileSync(safe));
   return true;
 }
@@ -464,6 +478,8 @@ function buildWorkerEnv() {
     CODEBUFF_API: env.CODEBUFF_API || '',
     RELAY_KEY: env.RELAY_KEY || '',
     MODEL_ALIASES: aliasStr,
+    // 调用日志的"调度的账号名"：token→展示名映射，worker 记录时解析。
+    FREEBUFF_ACCOUNT_LABELS: accountLabels(),
     // 出口代理注入（有订阅且 mihomo 就绪时返回走代理的 fetch；否则 undefined → worker 直连）
     FREEBUFF_UPSTREAM_FETCH: getUpstreamFetch() || undefined,
   };
@@ -650,6 +666,13 @@ async function handleWebApi(req, res, url) {
       return json(res, 200, await probeAccount(acct.token));
     }
     return err(res, 405, 'method not allowed');
+  }
+
+  // ---------- 调用日志（成功调用的环形缓冲 + 失败累计计数） ----------
+  // 数据仅存在于 worker 进程内存中，不落盘；来源为 handler.getCallLog()。
+  if (seg === 'usage' && method === 'GET') {
+    const snapshot = typeof handler.getCallLog === 'function' ? handler.getCallLog() : { calls: [], totals: {} };
+    return json(res, 200, snapshot);
   }
 
   // ---------- Freebuff 授权码登录（OAuth） ----------

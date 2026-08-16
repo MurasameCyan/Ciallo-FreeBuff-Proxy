@@ -9,7 +9,7 @@ const POLL_MS = 3600000; // 默认 1 小时自动刷新；需要即时数据可�
 
 const S = {
   accounts: [], health: {}, aliases: {},
-  models: [], proxy: null,
+  models: [], proxy: null, usage: null,
   build: '', buildUrl: '', repoUrl: '', trackRef: '', latest: '',
 };
 
@@ -78,6 +78,129 @@ function tag(cls, text) {
   s.className = cls;
   s.textContent = text;
   return s;
+}
+
+// ── 调用日志格式化（与 zen core.js 同口径） ──────────────
+const grouped = new Intl.NumberFormat('en-US');
+const compact = new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 });
+
+/** 12345 -> "12,345" */
+function fmtCount(n) {
+  return grouped.format(Number(n) || 0);
+}
+
+/** 1234567 -> "1.2M"；token 数动辄七位，面板上放不下全长 */
+function fmtTokens(n) {
+  return compact.format(Number(n) || 0);
+}
+
+/** 时间戳 -> HH:MM:SS（本地时区）；日志每行都要，坏值不能炸 */
+function fmtClock(ts) {
+  const d = ts == null ? new Date() : new Date(ts);
+  return Number.isNaN(d.getTime()) ? '--:--:--' : d.toTimeString().slice(0, 8);
+}
+
+/**
+ * 毫秒时长 -> 显示文本，逐级向上换单位。没测过是 '—'，不是 0。
+ * 首字节测不到（非流式）与「零延迟」不是一回事，null/≤0 都显示 —。
+ */
+function fmtDelay(ms) {
+  const n = Number(ms);
+  if (!Number.isFinite(n) || n <= 0) return '—';
+  if (n >= 60000) return `${(n / 60000).toFixed(1)}m`;
+  return n >= 1000 ? `${(n / 1000).toFixed(1)}s` : `${Math.round(n)}ms`;
+}
+
+/**
+ * calls -> 可直接渲染的行 + 汇总。最近的排最前。
+ * 只有成功的调用会进来（见 worker.js 的 logCall），失败只累计到 totals。
+ */
+function callLog(calls) {
+  const rows = [];
+  const acc = { ttfbMs: 0, ttfbCount: 0, durationMs: 0, durationCount: 0 };
+  let tokens = 0;
+  for (const c of Array.isArray(calls) ? calls : []) {
+    if (!c || typeof c !== 'object') continue;
+    const n = (k) => Number(c[k]) || 0;
+    const row = {
+      at: n('at'),
+      // 详情里的「节点」在本项目改为调度的账号名（见 worker.js accountLabel）
+      account: String(c.account ?? '').trim(),
+      model: String(c.model ?? '').trim(),
+      // '' 保留原样 —— 前端显示 '—'，表示没发这个字段（随上游默认）
+      effort: String(c.effort ?? '').trim(),
+      in: n('in'), out: n('out'), reasoning: n('reasoning'),
+      // null 和 0 要分开：测不到首字节和「零延迟」不是一回事
+      ttfb: Number.isFinite(Number(c.ttfb)) && Number(c.ttfb) > 0 ? Number(c.ttfb) : null,
+      ms: Number.isFinite(Number(c.ms)) ? Number(c.ms) : null,
+    };
+    row.total = row.in + row.out;
+    tokens += row.total;
+    if (row.ttfb != null) { acc.ttfbMs += row.ttfb; acc.ttfbCount++; }
+    if (row.ms != null) { acc.durationMs += row.ms; acc.durationCount++; }
+    rows.push(row);
+  }
+  // 后端是 push 追加的，数组本身即时间序；倒过来即可，同毫秒两条也保真实先后
+  rows.reverse();
+  const avg = (sum, count) => (count > 0 ? sum / count : null);
+  return {
+    rows, tokens,
+    ttfb: avg(acc.ttfbMs, acc.ttfbCount),
+    duration: avg(acc.durationMs, acc.durationCount),
+  };
+}
+
+/** 「标签 + 值」那一小块。值加粗，标签留灰，扫的时候只看粗体就行 */
+function num(label, value) {
+  const s = tag('num', `${label} `);
+  const b = document.createElement('b');
+  b.textContent = value;
+  s.append(b);
+  return s;
+}
+
+// ── 概况格式化（与 zen core.js 同口径） ──────────────────
+
+/** 毫秒时长 -> 中文粗粒度，只保留两级单位（天时 / 时分 / 分秒 / 秒） */
+function fmtUptime(ms) {
+  const s = Math.max(0, Math.floor((Number(ms) || 0) / 1000));
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  if (d) return `${d} 天 ${h} 时`;
+  if (h) return `${h} 时 ${m} 分`;
+  if (m) return `${m} 分 ${s % 60} 秒`;
+  return `${s} 秒`;
+}
+
+/** 成功率。没有任何请求时返回 null —— 显示 0% 会被当成全挂了，其实是「还没跑过」 */
+function successRate(total) {
+  const req = Number(total?.requests) || 0;
+  if (!req) return null;
+  return (Number(total?.success) || 0) / req;
+}
+
+/** 0.9231 -> "92.3%"；null -> "—" */
+function fmtPercent(r) {
+  return r == null ? '—' : `${(r * 100).toFixed(1)}%`;
+}
+
+/**
+ * { 模型: {success,requests,totalTokens} } -> 按成功次数降序的数组。
+ * 排序和过滤都用 success：一个模型每次都失败却排榜首没意义；一次都没成功过的
+ * 直接不出现。limit=0 表示不截断（模型统计那格全量显示，自己滚动）。
+ */
+function rankBreakdown(map, limit = 5) {
+  const rows = Object.entries(map || {})
+    .map(([key, v]) => ({
+      key,
+      success: Number(v?.success) || 0,
+      requests: Number(v?.requests) || 0,
+      totalTokens: Number(v?.totalTokens) || 0,
+    }))
+    .filter((r) => r.success > 0)
+    .sort((a, b) => b.success - a.success || a.key.localeCompare(b.key));
+  return limit > 0 ? rows.slice(0, limit) : rows;
 }
 
 // ── 渲染 ────────────────────────────────────────────────
@@ -265,6 +388,37 @@ function renderModels() {
   }
 }
 
+// 间隔候选值(秒)。检测间隔:1/5/10/30 分钟 + 1/6/12 小时;更新间隔:1/3/6/12/24 小时。
+const HEALTH_INTERVALS = [60, 300, 600, 1800, 3600, 21600, 43200];
+const UPDATE_INTERVALS = [3600, 10800, 21600, 43200, 86400];
+
+// 秒 → 人类可读标签:整除 3600 → N 小时;整除 60 → N 分钟;否则 N 秒。
+function fmtInterval(sec) {
+  if (sec % 3600 === 0) return `${sec / 3600} 小时`;
+  if (sec % 60 === 0) return `${sec / 60} 分钟`;
+  return `${sec} 秒`;
+}
+
+// 用固定候选值受控重建间隔下拉:升序去重、分钟/小时标签。不再把后端存的非标准秒值
+// 追加成「N 秒」垃圾项(旧逻辑会累积出 300 秒 / 43 秒)。存值不在候选里时吸附到最近项。
+function syncIntervalSelect(select, canonical, savedSec, fallbackSec) {
+  const values = [...new Set(canonical)].sort((a, b) => a - b);
+  const saved = Number.isFinite(savedSec) && savedSec > 0 ? Math.round(savedSec) : fallbackSec;
+  let pick = values[0];
+  for (const v of values) if (Math.abs(v - saved) < Math.abs(pick - saved)) pick = v;
+  const signature = `${values.join(',')}|${pick}`;
+  if (select.dataset.intervalSig !== signature) {
+    select.dataset.intervalSig = signature;
+    select.replaceChildren(...values.map((v) => {
+      const option = document.createElement('option');
+      option.value = String(v);
+      option.textContent = fmtInterval(v);
+      return option;
+    }));
+  }
+  select.value = String(pick);
+}
+
 /** 代理订阅状态只显示服务端脱敏结果，浏览器不接触完整订阅 URL。 */
 function renderProxy() {
   const p = S.proxy || {};
@@ -344,14 +498,7 @@ function renderProxy() {
   if (healthSelect) {
     // 后端始终以秒返回（上限 86400）。超过上限的才当作误存的毫秒值折算回秒。
     const seconds = rawInterval > 86400 ? Math.round(rawInterval / 1000) : rawInterval;
-    const value = String(Number.isFinite(seconds) && seconds > 0 ? seconds : 600);
-    if (![...healthSelect.options].some((option) => option.value === value)) {
-      const option = document.createElement('option');
-      option.value = value;
-      option.textContent = `${value} 秒`;
-      healthSelect.append(option);
-    }
-    healthSelect.value = value;
+    syncIntervalSelect(healthSelect, HEALTH_INTERVALS, seconds, 600);
     healthSelect.disabled = !healthEnabled || state === 'disabled' || state === 'starting';
   }
 
@@ -364,25 +511,148 @@ function renderProxy() {
     updateToggle.disabled = state === 'disabled' || state === 'starting';
   }
   if (updateSelect) {
-    const value = String(Number.isFinite(rawUpdateInterval) && rawUpdateInterval > 0 ? rawUpdateInterval : 21600);
-    if (![...updateSelect.options].some((option) => option.value === value)) {
-      const option = document.createElement('option');
-      option.value = value;
-      option.textContent = `${value} 秒`;
-      updateSelect.append(option);
-    }
-    updateSelect.value = value;
+    syncIntervalSelect(updateSelect, UPDATE_INTERVALS, rawUpdateInterval, 21600);
     updateSelect.disabled = !updateEnabled || state === 'disabled' || state === 'starting';
   }
 }
 
 // ── 轮询 ────────────────────────────────────────────────
 
+/**
+ * 调用日志卡。数据来自 /usage.calls —— 每条成功的上游调用一行，最近的在最前。
+ * 详情主行的账号名（.nm）就是那次实际调度到的账号（worker 记录时解析）。
+ */
+function renderCallLog() {
+  const { rows, tokens, ttfb, duration } = callLog(S.usage?.calls);
+  // 失败三项来自 totals（逐条只收成功的）。标「累计」：它是开机至今的总数，
+  // 和前面「最近 N 条」不是同一个窗口，不标会被当成这 N 条里的失败数
+  const totals = S.usage?.totals || {};
+  const tc = (k) => fmtCount(totals[k] || 0);
+  $('calllog-empty').hidden = rows.length > 0;
+  $('calllog-sum').textContent = rows.length
+    ? `最近 ${fmtCount(rows.length)} 条 · Token ${fmtTokens(tokens)}`
+      // 折叠状态下只看得见这行，两个平均值放这儿：哪次慢展开才知道，
+      // 但「整体现在快不快」不该逼人先点开
+      + ` · 平均首字 ${fmtDelay(ttfb)} · 平均耗时 ${fmtDelay(duration)}`
+      + ` · 累计限流 ${tc('rateLimited')} · 超时 ${tc('timeout')} · 错误 ${tc('upstreamError')}`
+    : '每条成功的上游调用记一行，失败的尝试只累计到限流/超时/错误。';
+
+  // 列表是自己的滚动容器（限高 + 藏起来的滚动条），replaceChildren 清空瞬间
+  // scrollTop 会被夹回 0；存回来，否则每次轮询就把人弹回顶部，翻旧记录翻不动
+  const ul = $('callLog');
+  const top = ul.scrollTop;
+  ul.replaceChildren(...rows.map((r) => {
+    const li = document.createElement('li');
+    li.className = 'calllog-row';
+
+    // 时刻在最左：这张表按时间倒序，没有它看不出两行差了多久。
+    // 和账号名拆成两个元素 —— 时刻要等宽数字才对得齐，账号名要能省略号截断
+    const at = tag('at', fmtClock(r.at));
+    const nm = tag('nm', r.account || '—');
+    nm.title = r.account;
+    const main = document.createElement('div');
+    main.className = 'calllog-main';
+    main.append(
+      at, nm,
+      // 模型和强度紧跟账号名 —— 排查透传时要的就是这两个数，挨着看才对得上。
+      // 强度 '—' = 没发这个字段（随上游默认），和显式发了 high 是两回事。
+      num('模型', r.model || '—'),
+      num('强度', r.effort || '—'),
+      num('首字', fmtDelay(r.ttfb)),
+      num('耗时', fmtDelay(r.ms)),
+    );
+
+    const sub = document.createElement('p');
+    sub.className = 'sub';
+    // Token 总数下来和分项同行：它就是入+出的和，拆两行对不起来。
+    // 推理 token 单列：它不计入 total（上游算在 completion 里），但「这次想了
+    // 多少」是判断强度有没有生效最直接的一个数
+    sub.textContent = `Token ${fmtTokens(r.total)} · 入 ${fmtTokens(r.in)}`
+      + ` · 出 ${fmtTokens(r.out)} · 推理 ${fmtTokens(r.reasoning)}`;
+
+    li.append(main, sub);
+    return li;
+  }));
+  ul.scrollTop = top;
+}
+
+/**
+ * 概况卡（移植自 zen）。数据来自 /usage 的 total·byModel·startTime·lastRequest。
+ * 和 renderStats() 刻意分开：那个渲染账号池的存活状态（存活/异常/失效），
+ * 这个渲染请求与 token 的累计用量（开机至今，重启清零）。
+ */
+function renderUsageOverview() {
+  const t = S.usage?.total;
+  if (!t) return;
+
+  $('s-req').textContent = fmtCount(t.requests);
+  $('s-req-sub').textContent = `成功 ${fmtCount(t.success)} · 失败 ${fmtCount(t.fail)}`;
+
+  // 「成功率」三个字由那列的 <h3> 出，这里只填数值与进度条宽度
+  const rate = successRate(t);
+  $('s-rate').textContent = fmtPercent(rate);
+  $('s-rate-bar').style.width = `${(rate ?? 0) * 100}%`;
+
+  $('s-tok').textContent = fmtTokens(t.totalTokens);
+  $('s-tok-sub').textContent =
+    `输入 ${fmtTokens(t.promptTokens)} · 输出 ${fmtTokens(t.completionTokens)}`
+    + ` · 推理 ${fmtTokens(t.reasoningTokens)} · 缓存读 ${fmtTokens(t.cacheReadTokens)}`
+    + ` · 缓存写 ${fmtTokens(t.cacheWriteTokens)}`;
+
+  $('s-up').textContent = fmtUptime(Date.now() - (S.usage.startTime || Date.now()));
+  $('s-up-sub').textContent = S.usage.lastRequest
+    ? `最后请求 ${fmtClock(S.usage.lastRequest)}`
+    : '还没有请求';
+
+  renderUsageModels();
+}
+
+/**
+ * 模型统计格：各模型的**成功**调用次数，按次数降序（排序在 rankBreakdown）。
+ * 口径和「调用日志」刻意不同：那张表是最近 200 条的时间线，这一格是开机至今的
+ * 累计分布 —— 逐条日志被环形缓冲截断后，早期调用只在这个累计数里还留着。
+ */
+function renderUsageModels() {
+  const rows = rankBreakdown(S.usage?.byModel, 0);
+  $('s-models-empty').hidden = rows.length > 0;
+
+  const ul = $('s-models');
+  ul.replaceChildren(...rows.map((r) => {
+    const li = document.createElement('li');
+    const nm = tag('nm', r.key);
+    nm.title = r.key;              // 窄档省略号截断，悬停看全名
+    const n = document.createElement('b');
+    n.textContent = fmtCount(r.success);
+    li.append(nm, n);
+    return li;
+  }));
+
+  // 行高量出来写进 --row，让 CSS 的「5 行」有准确基准：等宽 <b> 在 baseline 对齐下
+  // 行盒更高，calc(5*1.45em) 会差几像素露出第六行的边，交给 JS 量准。
+  const first = ul.firstElementChild;
+  if (first) {
+    const h = first.getBoundingClientRect().height;
+    if (h > 0) ul.style.setProperty('--row', `${h}px`);
+  }
+
+  // 限高 5 行、滚动条藏了：装不下时给键盘一条路（有 tabindex 才聚焦得了、
+  // 方向键才滚得动），正好装得下时不加 —— 不可滚的容器占个 Tab 停留点是白挡路。
+  const over = ul.scrollHeight > ul.clientHeight + 1;   // +1 吸收亚像素误差
+  if (over) {
+    ul.tabIndex = 0;
+    ul.setAttribute('role', 'group');
+  } else {
+    ul.removeAttribute('tabindex');
+    ul.removeAttribute('role');
+  }
+}
+
 async function refresh() {
   try {
     const cfg = await api('/config').catch(() => null);
     const acc = await api('/accounts').catch(() => null);
     const proxy = await api('/proxy').catch(() => null);
+    const usage = await api('/usage').catch(() => null);
     if (cfg) {
       S.aliases = cfg.aliases || {};
       S.apiKey = cfg.apiKey || 'freebuff-default-key';
@@ -394,10 +664,11 @@ async function refresh() {
     }
     if (acc) { S.accounts = acc.accounts || []; S.health = acc.health || {}; S.readonly = acc.readonly; }
     if (proxy) S.proxy = proxy.proxy || proxy;
+    if (usage) S.usage = usage;
     // /v1/models 是 worker 路由,带 key 头直连
     const models = await rawApi('/v1/models', { headers: { 'Authorization': 'Bearer ' + S.apiKey } }).catch(() => null);
     if (models) S.models = models.data || [];
-    renderStats(); renderAccounts(); renderAliases(); renderModels(); renderProxy();
+    renderStats(); renderAccounts(); renderAliases(); renderModels(); renderProxy(); renderUsageOverview(); renderCallLog();
   } catch (e) {
     if (e.message !== '未登录') toast('加载失败:' + e.message, 'err');
   }

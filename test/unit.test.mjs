@@ -8,7 +8,7 @@ const src = readFileSync(new URL('../worker.js', import.meta.url), 'utf-8');
 // 使内部函数在沙箱全局可见，供单测直接调用。
 const wrapper = src.replace('export default {', 'const __workerDefault__ = {') +
   '\n\nglobalThis.__workerDefault__ = __workerDefault__;\n' +
-  'globalThis.__unitTestApi__ = { normalizeChatThinking, anthropicThinkingToEffort, collectReasoningTexts, anthropicStopReason, anthropicModelToOpenAI, parseModelAliases, resolveModelAlias, resolveModelConfig, findModelConfig, setTestAliases: (raw) => { currentAliases = parseModelAliases(raw); }, cooldown, cooldownInfo, inCooldown, markSessionInvalidated, wasRecentlyInvalidated, singleFlight, sessionRemainingMs, INVALIDATION_WINDOW_MS, SESSION_REUSE_SAFE_MS, SESSION_VERIFY_WINDOW_MS, executeChat };\n';
+  'globalThis.__unitTestApi__ = { normalizeChatThinking, anthropicThinkingToEffort, collectReasoningTexts, anthropicStopReason, anthropicModelToOpenAI, parseModelAliases, resolveModelAlias, resolveModelConfig, findModelConfig, setTestAliases: (raw) => { currentAliases = parseModelAliases(raw); }, cooldown, cooldownInfo, inCooldown, markSessionInvalidated, wasRecentlyInvalidated, singleFlight, sessionRemainingMs, INVALIDATION_WINDOW_MS, SESSION_REUSE_SAFE_MS, SESSION_VERIFY_WINDOW_MS, executeChat, readCallUsage, accountLabel, logCall, callLogSnapshot, readUsageFull, recordRequest, blankUsageTotals };\n';
 
 // 可编程 fetch mock：测试里可替换 sandbox.fetch，返回可定制的 Response 形状
 // （worker 里用的是 { status, ok, headers, text() } 简化形状）。
@@ -29,7 +29,7 @@ sandbox.globalThis = sandbox;
 vm.createContext(sandbox);
 vm.runInContext(wrapper, sandbox);
 
-const { normalizeChatThinking, anthropicThinkingToEffort, collectReasoningTexts, anthropicStopReason, anthropicModelToOpenAI, parseModelAliases, resolveModelAlias, resolveModelConfig, findModelConfig, setTestAliases, cooldown, cooldownInfo, inCooldown, markSessionInvalidated, wasRecentlyInvalidated, singleFlight, sessionRemainingMs, INVALIDATION_WINDOW_MS, SESSION_REUSE_SAFE_MS, SESSION_VERIFY_WINDOW_MS, executeChat } = sandbox.__unitTestApi__;
+const { normalizeChatThinking, anthropicThinkingToEffort, collectReasoningTexts, anthropicStopReason, anthropicModelToOpenAI, parseModelAliases, resolveModelAlias, resolveModelConfig, findModelConfig, setTestAliases, cooldown, cooldownInfo, inCooldown, markSessionInvalidated, wasRecentlyInvalidated, singleFlight, sessionRemainingMs, INVALIDATION_WINDOW_MS, SESSION_REUSE_SAFE_MS, SESSION_VERIFY_WINDOW_MS, executeChat, readCallUsage, accountLabel, logCall, callLogSnapshot, readUsageFull, recordRequest, blankUsageTotals } = sandbox.__unitTestApi__;
 
 let pass = 0, fail = 0;
 function t(name, fn) {
@@ -372,6 +372,106 @@ t('空订阅抛错', () => {
   let threw = false;
   try { buildMihomoYaml(''); } catch { threw = true; }
   if (!threw) throw new Error('空订阅应该抛错');
+});
+
+// ── 调用日志（call-log 环形缓冲 + 用量归一 + 调度账号名） ─────────────
+console.log('--- 调用日志（call-log） ---');
+t('readCallUsage 吃 chat 与 Responses 两套字段', () => {
+  const a = readCallUsage({ prompt_tokens: 100, completion_tokens: 40, completion_tokens_details: { reasoning_tokens: 12 } });
+  if (a.in !== 100 || a.out !== 40 || a.reasoning !== 12) throw new Error('chat 形状: ' + JSON.stringify(a));
+  const b = readCallUsage({ input_tokens: 7, output_tokens: 3, output_tokens_details: { reasoning_tokens: 2 } });
+  if (b.in !== 7 || b.out !== 3 || b.reasoning !== 2) throw new Error('responses 形状: ' + JSON.stringify(b));
+});
+t('readCallUsage 非对象 → null；缺字段 → 0', () => {
+  if (readCallUsage(null) !== null || readCallUsage('x') !== null) throw new Error('非对象应返回 null');
+  const c = readCallUsage({});
+  if (c.in !== 0 || c.out !== 0 || c.reasoning !== 0) throw new Error('缺字段应归零');
+});
+t('accountLabel：命中映射→展示名，未命中→token 前 6 位，空 token→空串', () => {
+  const env = { FREEBUFF_ACCOUNT_LABELS: { 'tok-abcdef123': '小明' } };
+  if (accountLabel(env, 'tok-abcdef123') !== '小明') throw new Error('命中应返回展示名');
+  if (accountLabel(env, 'zzzzzzzz9999') !== 'zzzzzz…') throw new Error('未命中应回落短哈希: ' + accountLabel(env, 'zzzzzzzz9999'));
+  if (accountLabel({}, 'abcdefgh') !== 'abcdef…') throw new Error('无映射也应回落短哈希');
+  if (accountLabel(env, '') !== '') throw new Error('空 token 应返回空串');
+});
+t('logCall：ttfb≤0 记 null，ms 取整，字段落库正确', () => {
+  logCall({ account: 'A', model: 'm', effort: 'max', ttfb: 0, ms: 12.7, in: 1, out: 2, reasoning: 0 });
+  const calls = callLogSnapshot().calls;
+  const last = calls[calls.length - 1];
+  if (last.ttfb !== null) throw new Error('ttfb=0 应记 null');
+  if (last.ms !== 13) throw new Error('ms 应四舍五入: ' + last.ms);
+  if (last.account !== 'A' || last.model !== 'm' || last.effort !== 'max') throw new Error('字段落库不对');
+});
+t('环形缓冲上限 200，超出丢最旧', () => {
+  for (let i = 0; i < 250; i++) logCall({ account: 'x', model: 'ring-' + i, effort: '', ttfb: 5, ms: 5, in: 0, out: 0, reasoning: 0 });
+  const calls = callLogSnapshot().calls;
+  if (calls.length !== 200) throw new Error('应裁到 200，实际 ' + calls.length);
+  if (calls[199].model !== 'ring-249') throw new Error('最新记录应在末尾');
+  if (calls[0].model !== 'ring-50') throw new Error('最旧应被丢弃，首项应为 ring-50，实际 ' + calls[0].model);
+});
+t('callLogSnapshot 返回副本，外部改动不污染内部', () => {
+  const snap = callLogSnapshot();
+  const before = snap.calls.length;
+  snap.calls.push({ model: 'injected' });
+  snap.totals.rateLimited = 99999;
+  if (callLogSnapshot().calls.length !== before) throw new Error('calls 应是副本');
+  if (callLogSnapshot().totals.rateLimited === 99999) throw new Error('totals 应是副本');
+});
+
+// ── 概况累计（客户端请求口径：requests/success/fail + 各类 token） ───────
+console.log('--- 概况累计（overview） ---');
+t('readUsageFull：chat/responses 命名 + 缓存读写 + total 兜底', () => {
+  const a = readUsageFull({ prompt_tokens: 100, completion_tokens: 40, total_tokens: 140,
+    completion_tokens_details: { reasoning_tokens: 12 },
+    prompt_tokens_details: { cached_tokens: 30, cache_creation_tokens: 5 } });
+  if (a.promptTokens !== 100 || a.completionTokens !== 40 || a.reasoningTokens !== 12) throw new Error('chat 形状: ' + JSON.stringify(a));
+  if (a.totalTokens !== 140 || a.cacheReadTokens !== 30 || a.cacheWriteTokens !== 5) throw new Error('缓存/总量: ' + JSON.stringify(a));
+  const b = readUsageFull({ input_tokens: 7, output_tokens: 3,
+    output_tokens_details: { reasoning_tokens: 2 },
+    input_tokens_details: { cached_tokens: 4 }, cache_creation_input_tokens: 9 });
+  if (b.promptTokens !== 7 || b.completionTokens !== 3 || b.reasoningTokens !== 2) throw new Error('responses 形状: ' + JSON.stringify(b));
+  if (b.totalTokens !== 10 || b.cacheReadTokens !== 4 || b.cacheWriteTokens !== 9) throw new Error('total 应回落 prompt+completion，缓存两套命名都吃: ' + JSON.stringify(b));
+});
+t('readUsageFull：空/非对象 → 全零', () => {
+  for (const v of [null, undefined, 'x', 0]) {
+    const u = readUsageFull(v);
+    if (u.promptTokens || u.completionTokens || u.totalTokens || u.cacheReadTokens || u.cacheWriteTokens || u.reasoningTokens)
+      throw new Error('空值应全零: ' + JSON.stringify(u));
+  }
+});
+t('recordRequest：成功累加 token 与 success，byModel 分模型', () => {
+  const b0 = callLogSnapshot();
+  const req0 = b0.total.requests, ok0 = b0.total.success, tok0 = b0.total.totalTokens;
+  recordRequest('m-ov-A', { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 }, true);
+  const s = callLogSnapshot();
+  if (s.total.requests !== req0 + 1 || s.total.success !== ok0 + 1) throw new Error('总量 requests/success 应各 +1');
+  if (s.total.totalTokens !== tok0 + 15) throw new Error('总量 token 应累加 15，实际 Δ=' + (s.total.totalTokens - tok0));
+  if (!s.byModel['m-ov-A'] || s.byModel['m-ov-A'].success !== 1 || s.byModel['m-ov-A'].totalTokens !== 15)
+    throw new Error('byModel 应按模型累计: ' + JSON.stringify(s.byModel['m-ov-A']));
+  if (typeof s.startTime !== 'number' || s.lastRequest == null) throw new Error('startTime/lastRequest 应存在');
+});
+t('recordRequest：失败只 +fail，不动 token', () => {
+  const b0 = callLogSnapshot();
+  const req0 = b0.total.requests, bad0 = b0.total.fail, tok0 = b0.total.totalTokens;
+  recordRequest('m-ov-B', null, false);
+  const s = callLogSnapshot();
+  if (s.total.requests !== req0 + 1 || s.total.fail !== bad0 + 1) throw new Error('失败应 requests/fail 各 +1');
+  if (s.total.totalTokens !== tok0) throw new Error('失败不应改动 token 总量');
+  if (!s.byModel['m-ov-B'] || s.byModel['m-ov-B'].fail !== 1 || s.byModel['m-ov-B'].success !== 0)
+    throw new Error('byModel 失败计数不对: ' + JSON.stringify(s.byModel['m-ov-B']));
+});
+t('recordRequest：空模型名归到 unknown', () => {
+  recordRequest('', { prompt_tokens: 1, completion_tokens: 1 }, true);
+  const s = callLogSnapshot();
+  if (!s.byModel['unknown']) throw new Error('空模型名应归到 unknown 键');
+});
+t('callLogSnapshot：total/byModel 是副本，外部改动不污染内部', () => {
+  const snap = callLogSnapshot();
+  const before = snap.total.requests;
+  snap.total.requests = 88888;
+  Object.values(snap.byModel)[0] && (Object.values(snap.byModel)[0].success = 77777);
+  if (callLogSnapshot().total.requests !== before) throw new Error('total 应是副本');
+  if (Object.values(callLogSnapshot().byModel).some((v) => v.success === 77777)) throw new Error('byModel 各项应是副本');
 });
 
 console.log(`\n${pass} passed, ${fail} failed`);

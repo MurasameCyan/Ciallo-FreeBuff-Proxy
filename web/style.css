@@ -772,3 +772,144 @@ body.login {
   font-family: var(--sans); font-size: 14px;
 }
 .login-card .btn.primary { height: 46px; font-size: 14px; }
+
+/* ── 调用日志 ─────────────────────────────────────────────
+   通栏折叠卡。原生 <details>/<summary> 保留浏览器自带的展开标记和键盘行为，
+   内部沿用卡头布局。 */
+.calllog-card { padding: 20px; }
+.calllog-summary { cursor: pointer; list-style-position: outside; }
+.calllog-summary .card-head {
+  display: inline-flex; width: calc(100% - 20px);
+  margin-bottom: 0; vertical-align: middle;
+}
+.calllog-title { font-size: 16px; font-weight: 650; letter-spacing: -.01em; }
+.calllog-summary .hint { margin-left: auto; text-align: right; font-weight: 400; }
+details[open] > .calllog-summary { margin-bottom: 14px; }
+
+/* 列表限高 + 内部滚动，滚动条藏掉（要求如此）：高度用 vh 而非行高整数倍，
+   末行被切一半就是「下面还有」仅剩的暗示；键盘滚动靠 <ul> 上的 tabindex。 */
+.calllog {
+  list-style: none; margin: 0; padding: 0;
+  display: grid; gap: 7px;
+  max-height: 60vh; overflow-y: auto;
+  scrollbar-width: none;                 /* Firefox */
+}
+.calllog::-webkit-scrollbar { display: none; }  /* WebKit/Blink */
+.calllog-card .empty { color: var(--fg-2); font-size: 12px; }
+
+.calllog-row {
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--card-2);
+}
+/* 数字全用行内标签（「强度 max」）而不是表头列：flex-wrap 一开窄屏自动折行，
+   不会有对不齐的表头，也就永远不会横向溢出。 */
+.calllog-main { display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px 14px; }
+/* 时刻不参与伸缩：等宽 + 固定宽度，竖着扫一眼就能比出两行差了多久 */
+.calllog-row .at {
+  flex: 0 0 auto;
+  font-family: var(--mono); font-size: 12px; color: var(--fg-2);
+  font-variant-numeric: tabular-nums;
+}
+/* 账号名可截断：太长的备注不该把模型/强度挤到折行 */
+.calllog-row .nm {
+  flex: 1 1 140px; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 13px; font-weight: 600;
+}
+.calllog-row .num {
+  font-family: var(--mono); font-size: 12px; color: var(--fg-2);
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+.calllog-row .num b { color: var(--fg); font-weight: 600; }
+/* 右对齐，贴在主行那串数字下面：主行右半是「发了什么、花了多少」，Token 明细属于右半 */
+.calllog-row .sub {
+  margin: 5px 0 0; text-align: right;
+  font-family: var(--mono); font-size: 11px; color: var(--fg-2);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── 概况（移植自 zen） ───────────────────────────────────
+   通栏卡内 2×2 四格。刻意用 .usage-* 私有类，不复用账号池概况的 .stats/.stat
+   （那套是 4 列存活统计，样式口径不同），避免互相污染。 */
+.usage-card .usage-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+/* 每格声明为查询容器：大数字按格子自身宽度缩放（见 .usage-big 的 clamp）。 */
+.usage-card .usage-stat {
+  container-type: inline-size;
+  min-width: 0;
+  padding: 12px 14px 13px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--card-2);
+}
+.usage-card .usage-stat h3 {
+  font-size: 11px; font-weight: 500; letter-spacing: .07em;
+  text-transform: uppercase; color: var(--fg-2);
+}
+.usage-card .usage-big {
+  font-family: var(--mono);
+  font-size: clamp(18px, 6cqi, 27px); font-weight: 650;
+  letter-spacing: -.02em; margin: 7px 0 5px;
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+.usage-card .usage-sub {
+  color: var(--fg-2); font-size: 12px; line-height: 1.5;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 请求总数那格装两个数：左「请求总数」右「成功率」，各靠格子两端，中间留白即分隔。
+   每列连标签成块，两个 <h3> 同线、两个数字同线，不用手写对齐。 */
+.usage-card .usage-duo { display: flex; justify-content: space-between; gap: 10px; }
+.usage-card .usage-duo > div { min-width: 0; }
+.usage-card .usage-duo > div:last-child { text-align: right; }
+.usage-card .usage-duo .usage-big { font-size: clamp(16px, 5cqi, 22px); }
+
+/* 模型统计：模型名 + 成功次数，一行一个，按次数降序（排序在 app.js rankBreakdown）。
+   限高 5 行、内部滚动：免费池放出来的模型有十几个，全列会把这格顶得比 Token 那格
+   高出一截，2×2 就不齐平了。高度按行数算（--row 由 JS 量出真实行高写入），
+   滚动条两处都关（Firefox 认 scrollbar-width，WebKit/Blink 认伪元素）。 */
+.usage-card .usage-models {
+  list-style: none; margin: 8px 0 0; padding: 0;
+  display: flex; flex-direction: column; gap: 4px;
+  font-size: 12px; line-height: 1.45;
+  max-height: calc(5 * var(--row, 18.4px) + 16px); overflow-y: auto;
+  scrollbar-width: none;                 /* Firefox */
+  overscroll-behavior: contain;          /* 滑到底不接着滚整页 */
+}
+.usage-card .usage-models::-webkit-scrollbar { display: none; }  /* WebKit/Blink */
+.usage-card .usage-models li { display: flex; align-items: baseline; gap: 8px; }
+/* 名字吃掉剩余宽度并省略号截断，次数永远贴右边不被挤走 */
+.usage-card .usage-models .nm {
+  flex: 1 1 auto; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--fg-2);
+}
+.usage-card .usage-models b {
+  flex: 0 0 auto;
+  font-family: var(--mono); font-weight: 600; font-variant-numeric: tabular-nums;
+}
+.usage-card .usage-empty { color: var(--fg-2); font-size: 12px; padding: 8px 0 2px; }
+
+/* 成功率进度条：唯一不用读数字就能看出健康度的东西，压在那格最底下。 */
+.usage-card .usage-bar {
+  height: 5px; margin-top: 9px; border-radius: 999px;
+  background: var(--line); overflow: hidden;
+}
+.usage-card .usage-bar span {
+  display: block; height: 100%; width: 0; border-radius: 999px;
+  background: linear-gradient(90deg, var(--mint-dim), var(--mint));
+  transition: width .5s cubic-bezier(.2, .7, .3, 1);
+}
+
+/* 四格叠成一列：窄档每格内容只剩百来像素，Token 那串副行会折成几行，
+   竖着排反而更矮、更好读。 */
+@media (max-width: 660px) {
+  .usage-card .usage-grid { grid-template-columns: minmax(0, 1fr); }
+}
+
+
