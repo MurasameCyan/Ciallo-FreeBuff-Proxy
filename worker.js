@@ -410,6 +410,10 @@ const DESKTOP_INCLUDE_RATE_LIMITS = { "x-freebuff-include-unused-rate-limits": "
 export default {
   // 面板调用日志快照（server.js 的 GET /_api/usage 直接吐出）。
   getCallLog() { return callLogSnapshot(); },
+  // 概况统计持久化适配器（server.js 启动时注入）。
+  configureUsagePersistence,
+  restoreUsageSnapshot,
+  usageSnapshot,
   async fetch(request, env) {
     // 上游出站 fetch 注入（Node adapter 配了订阅时传入走 mihomo 的 fetch）。
     // env 可放函数（Node 的 env 是普通对象）；Cloudflare Worker 的 env 是 KV 型
