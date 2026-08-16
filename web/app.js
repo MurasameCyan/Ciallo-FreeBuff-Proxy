@@ -544,7 +544,7 @@ function renderCallLog() {
       // 但「整体现在快不快」不该逼人先点开
       + ` · 平均首字 ${fmtDelay(ttfb)} · 平均耗时 ${fmtDelay(duration)}`
       + ` · 累计限流 ${tc('rateLimited')} · 超时 ${tc('timeout')} · 错误 ${tc('upstreamError')}`
-    : '每条成功的上游调用记一行，失败的尝试只累计到限流/超时/错误。';
+    : '';
 
   // 列表是自己的滚动容器（限高 + 藏起来的滚动条），replaceChildren 清空瞬间
   // scrollTop 会被夹回 0；存回来，否则每次轮询就把人弹回顶部，翻旧记录翻不动

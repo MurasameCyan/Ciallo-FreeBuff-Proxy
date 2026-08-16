@@ -42,8 +42,8 @@ for (const id of [
   assert.match(html, new RegExp(`id=["']${id}["']`), `管理面板丢失 DOM 绑定 #${id}`);
 }
 
-assert.match(css, /\.workspace-grid\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1\.3fr\)\s+minmax\(360px,\s*1fr\)/s,
-  '工作区必须是左宽右窄两列（左数据区 / 右概况·代理）');
+assert.match(css, /\.workspace-grid\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)\s+300px/s,
+  '工作区必须是左弹性、右固定 300px 两列（左数据区 / 右概况·代理）');
 assert.match(css, /\.workspace-grid\s*>\s*\.runtime-card\s*\{[^}]*grid-column:\s*1[^}]*grid-row:\s*1/s,
   '运行状态卡片必须位于左上');
 assert.match(css, /\.workspace-grid\s*>\s*\.model-workspace-card\s*\{[^}]*grid-column:\s*1[^}]*grid-row:\s*2/s,
@@ -52,6 +52,10 @@ assert.match(css, /\.workspace-grid\s*>\s*\.usage-card\s*\{[^}]*grid-column:\s*2
   '运行概况卡片必须位于右上');
 assert.match(css, /\.workspace-grid\s*>\s*\.proxy-card\s*\{[^}]*grid-column:\s*2[^}]*grid-row:\s*2/s,
   '出口代理卡片必须位于右下');
+assert.match(css, /\.workspace-grid\s*>\s*\.usage-card\s*\{[^}]*min-height:\s*360px/s,
+  '运行概况卡片必须固定 360 高');
+assert.match(css, /\.workspace-grid\s*>\s*\.proxy-card\s*\{[^}]*min-height:\s*660px/s,
+  '出口代理卡片必须固定 660 高');
 assert.match(css, /\.workspace-grid\s*>\s*\.runtime-card/s,
   '运行状态卡片必须是工作区直接子项');
 assert.match(css, /\.workspace-grid\s*>\s*\.proxy-card/s,
@@ -210,6 +214,8 @@ assert.ok(app.includes('renderCallLog()'), 'refresh 必须渲染调用日志');
 for (const label of ['最近 ', '平均首字', '平均耗时', '累计限流', '超时', '错误']) {
   assert.ok(app.includes(label), `调用日志摘要缺少字段: ${label}`);
 }
+assert.ok(!app.includes('每条成功的上游调用记一行'),
+  '调用日志空态摘要不再展示记账口径说明（已按要求移除）');
 assert.match(app, /Token \$\{fmtTokens\(r\.total\)\}[\s\S]*入[\s\S]*出[\s\S]*推理/,
   '逐条明细必须呈现 Token 总量与入/出/推理分项');
 
