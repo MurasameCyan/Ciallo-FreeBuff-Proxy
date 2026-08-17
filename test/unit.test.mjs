@@ -8,7 +8,7 @@ const src = readFileSync(new URL('../worker.js', import.meta.url), 'utf-8');
 // 使内部函数在沙箱全局可见，供单测直接调用。
 const wrapper = src.replace('export default {', 'const __workerDefault__ = {') +
   '\n\nglobalThis.__workerDefault__ = __workerDefault__;\n' +
-  'globalThis.__unitTestApi__ = { normalizeChatThinking, anthropicThinkingToEffort, namedEffort, normalizeReasoningEffort, collectReasoningTexts, anthropicStopReason, anthropicModelToOpenAI, parseModelAliases, resolveModelAlias, resolveModelConfig, findModelConfig, setTestAliases: (raw) => { currentAliases = parseModelAliases(raw); }, cooldown, cooldownInfo, inCooldown, parseCooldown, nextPacificMidnight: typeof nextPacificMidnight === "function" ? nextPacificMidnight : null, pickToken, releaseToken: typeof releaseToken === "function" ? releaseToken : null, accountPoolExhaustion: typeof accountPoolExhaustion === "function" ? accountPoolExhaustion : null, waitingRoomResponse: typeof waitingRoomResponse === "function" ? waitingRoomResponse : null, pipeUpstreamToClient, pipeUpstreamToResponsesStream, anthropicStream, streamToNonStream, anthropicFromChat, responsesToNonStream, markSessionInvalidated, wasRecentlyInvalidated, singleFlight, sessionRemainingMs, INVALIDATION_WINDOW_MS, SESSION_REUSE_SAFE_MS, SESSION_VERIFY_WINDOW_MS, executeChat, readCallUsage, accountLabel, logCall, callLogSnapshot, readUsageFull, recordRequest, blankUsageTotals, recordAccountObservation, configureUsagePersistence, restoreUsageSnapshot, usageSnapshot, setTestEgressReject: (fn) => { onEgressReject = fn; } };\n';
+  'globalThis.__unitTestApi__ = { normalizeChatThinking, anthropicThinkingToEffort, namedEffort, normalizeReasoningEffort, collectReasoningTexts, anthropicStopReason, anthropicModelToOpenAI, parseModelAliases, resolveModelAlias, resolveModelConfig, findModelConfig, setTestAliases: (raw) => { currentAliases = parseModelAliases(raw); }, cooldown, cooldownInfo, inCooldown, parseCooldown, nextPacificMidnight: typeof nextPacificMidnight === "function" ? nextPacificMidnight : null, pickToken, releaseToken: typeof releaseToken === "function" ? releaseToken : null, accountPoolExhaustion: typeof accountPoolExhaustion === "function" ? accountPoolExhaustion : null, waitingRoomResponse: typeof waitingRoomResponse === "function" ? waitingRoomResponse : null, pipeUpstreamToClient, pipeUpstreamToResponsesStream, anthropicStream, streamToNonStream, anthropicFromChat, responsesToNonStream, markSessionInvalidated, wasRecentlyInvalidated, singleFlight, sessionRemainingMs, INVALIDATION_WINDOW_MS, SESSION_REUSE_SAFE_MS, SESSION_VERIFY_WINDOW_MS, executeChat, readCallUsage, accountLabel, logCall, callLogSnapshot, readUsageFull, recordRequest, blankUsageTotals, recordAccountObservation, configureUsagePersistence, restoreUsageSnapshot, usageSnapshot, setTestEgressReject: (fn) => { onEgressReject = fn; }, MODEL_TIERS, handleModels };\n';
 
 // 可编程 fetch mock：测试里可替换 sandbox.fetch，返回可定制的 Response 形状
 // （worker 里用的是 { status, ok, headers, text() } 简化形状）。
@@ -30,7 +30,7 @@ sandbox.globalThis = sandbox;
 vm.createContext(sandbox);
 vm.runInContext(wrapper, sandbox);
 
-const { normalizeChatThinking, anthropicThinkingToEffort, namedEffort, normalizeReasoningEffort, collectReasoningTexts, anthropicStopReason, anthropicModelToOpenAI, parseModelAliases, resolveModelAlias, resolveModelConfig, findModelConfig, setTestAliases, cooldown, cooldownInfo, inCooldown, parseCooldown, nextPacificMidnight, pickToken, releaseToken, accountPoolExhaustion, waitingRoomResponse, pipeUpstreamToClient, pipeUpstreamToResponsesStream, anthropicStream, streamToNonStream, anthropicFromChat, responsesToNonStream, markSessionInvalidated, wasRecentlyInvalidated, singleFlight, sessionRemainingMs, INVALIDATION_WINDOW_MS, SESSION_REUSE_SAFE_MS, SESSION_VERIFY_WINDOW_MS, executeChat, readCallUsage, accountLabel, logCall, callLogSnapshot, readUsageFull, recordRequest, blankUsageTotals, recordAccountObservation, configureUsagePersistence, restoreUsageSnapshot, usageSnapshot, setTestEgressReject } = sandbox.__unitTestApi__;
+const { normalizeChatThinking, anthropicThinkingToEffort, namedEffort, normalizeReasoningEffort, collectReasoningTexts, anthropicStopReason, anthropicModelToOpenAI, parseModelAliases, resolveModelAlias, resolveModelConfig, findModelConfig, setTestAliases, cooldown, cooldownInfo, inCooldown, parseCooldown, nextPacificMidnight, pickToken, releaseToken, accountPoolExhaustion, waitingRoomResponse, pipeUpstreamToClient, pipeUpstreamToResponsesStream, anthropicStream, streamToNonStream, anthropicFromChat, responsesToNonStream, markSessionInvalidated, wasRecentlyInvalidated, singleFlight, sessionRemainingMs, INVALIDATION_WINDOW_MS, SESSION_REUSE_SAFE_MS, SESSION_VERIFY_WINDOW_MS, executeChat, readCallUsage, accountLabel, logCall, callLogSnapshot, readUsageFull, recordRequest, blankUsageTotals, recordAccountObservation, configureUsagePersistence, restoreUsageSnapshot, usageSnapshot, setTestEgressReject, MODEL_TIERS, handleModels } = sandbox.__unitTestApi__;
 
 let pass = 0, fail = 0;
 function t(name, fn) {
@@ -133,7 +133,7 @@ t('no thinking → undefined', () => {
 });
 
 console.log('--- normalizeReasoningEffort (per-model clamp) ---');
-// 官方 efforts 表：deepseek-v4-* = [low, high, max]，gpt-5.6-luna = [low..max 含 xhigh]
+// 官方 efforts 表：deepseek-v4-* = [low, high, max]；gpt-5.6-luna 由服务端钉死 high
 t('max 在 deepseek-v4-pro 上原样保留', () => {
   if (normalizeReasoningEffort('deepseek/deepseek-v4-pro', 'max') !== 'max') throw new Error('nope');
 });
@@ -143,11 +143,20 @@ t('xhigh 在 deepseek-v4-pro 上被下取成 high（所以 max 绝不能先折�
 t('medium 在 deepseek-v4-flash 上被下取成 low（该模型无 medium 档）', () => {
   if (normalizeReasoningEffort('deepseek/deepseek-v4-flash', 'medium') !== 'low') throw new Error('nope');
 });
-t('max 在 gpt-5.6-luna 上原样保留', () => {
-  if (normalizeReasoningEffort('openai/gpt-5.6-luna', 'max') !== 'max') throw new Error('nope');
+// luna：上游注入 reasoning.effort=high，任何不等于 high 的 reasoning_effort 都会 400
+// （"both provided with conflicting values"），所以是钉死不是 clamp —— 低档也要抬回 high。
+t('max 在 gpt-5.6-luna 上被钉成 high', () => {
+  if (normalizeReasoningEffort('openai/gpt-5.6-luna', 'max') !== 'high') throw new Error('nope');
 });
-t('ultra 在 gpt-5.6-luna 上被下取成 max', () => {
-  if (normalizeReasoningEffort('openai/gpt-5.6-luna', 'ultra') !== 'max') throw new Error('nope');
+t('低档 low 在 gpt-5.6-luna 上同样被钉成 high', () => {
+  if (normalizeReasoningEffort('openai/gpt-5.6-luna', 'low') !== 'high') throw new Error('nope');
+});
+t('不在 ladder 上的 none/auto 在 gpt-5.6-luna 上也被钉成 high', () => {
+  if (normalizeReasoningEffort('openai/gpt-5.6-luna', 'none') !== 'high') throw new Error('nope');
+  if (normalizeReasoningEffort('openai/gpt-5.6-luna', 'auto') !== 'high') throw new Error('nope');
+});
+t('未发 reasoning_effort 时不给 gpt-5.6-luna 补一个', () => {
+  if (normalizeReasoningEffort('openai/gpt-5.6-luna', undefined) !== undefined) throw new Error('nope');
 });
 t('未列入 efforts 表的模型原样透传 max', () => {
   if (normalizeReasoningEffort('crof/kimi-k3-eco', 'max') !== 'max') throw new Error('nope');
@@ -542,6 +551,27 @@ await tAsync('首次 401 凭据失效当次返回 503', async () => {
   }
 });
 
+await tAsync('上游 400 原文回传，不换号也不冷却账号', async () => {
+  // luna 的 reasoning_effort 冲突就是这种 400：换号也是同一个 400，
+  // 旧行为会把整池冷却 60s 并把原文换成"当前没有可用账号"。
+  const chatCalls = installSingleChatFailure(400, {
+    error: { message: '"reasoning_effort" and "reasoning.effort" are both provided with conflicting values', code: 400 },
+  });
+  const tokenA = 'upstream-400-aaaaaa';
+  const tokenB = 'upstream-400-bbbbbb';
+  const env = { FREEBUFF_TOKEN: `${tokenA}\n${tokenB}`, FREEBUFF_DEBUG: 'false', FREEBUFF_ACCOUNT_STATE: {} };
+  const response = await executeChat(env, integrationChat, integrationModel, false, 'chat');
+  const body = await response.json();
+  if (chatCalls() !== 1) throw new Error(`400 仍在换号重试: 上游 chat 被调用 ${chatCalls()} 次`);
+  if (response.status !== 400 || body.error?.type !== 'invalid_request_error') {
+    throw new Error(`400 被误分类: ${response.status} ${JSON.stringify(body)}`);
+  }
+  if (!String(body.error.message).includes('conflicting values')) {
+    throw new Error('上游原文被吞: ' + body.error.message);
+  }
+  if (inCooldown(tokenA) || inCooldown(tokenB)) throw new Error('400 不应冷却账号');
+});
+
 await tAsync('Reviewer 首次上游 429 当次返回结构化池耗尽响应', async () => {
   const chatCalls = installSingleChatFailure(429, { status: 'rate_limited', retryAfterMs: 60000 });
   const env = { FREEBUFF_TOKEN: 'first-review-429-123456', FREEBUFF_DEBUG: 'false', FREEBUFF_ACCOUNT_STATE: {} };
@@ -561,6 +591,63 @@ await tAsync('Reviewer 首次明确 banned 当次返回 403', async () => {
   if (chatCalls() !== 1) throw new Error(`上游 reviewer 调用 ${chatCalls()} 次`);
   if (response.status !== 403 || body.error?.type !== 'account_banned') {
     throw new Error(`Reviewer 首次 banned 被误分类: ${response.status} ${JSON.stringify(body)}`);
+  }
+});
+
+await tAsync('Reviewer 上游 400 原文回传，不换号也不冷却账号', async () => {
+  // 与 chat 同口径：reviewer 那条支路以前会冷却+换号，把一个「请求不合法」
+  // 的确定性 400 扩散成整池冷却 + "当前没有可用账号"。
+  const chatCalls = installSingleChatFailure(400, {
+    error: { message: 'reviewer payload rejected: bad reasoning_effort', code: 400 },
+  });
+  const tokenA = 'review-400-aaaaaa';
+  const tokenB = 'review-400-bbbbbb';
+  const env = { FREEBUFF_TOKEN: `${tokenA}\n${tokenB}`, FREEBUFF_DEBUG: 'false', FREEBUFF_ACCOUNT_STATE: {} };
+  const response = await executeChat(env, integrationReview, integrationReviewModel, false, 'chat');
+  const body = await response.json();
+  if (chatCalls() !== 1) throw new Error(`400 仍在换号重试: 上游 reviewer 被调用 ${chatCalls()} 次`);
+  if (response.status !== 400 || body.error?.type !== 'invalid_request_error') {
+    throw new Error(`Reviewer 400 被误分类: ${response.status} ${JSON.stringify(body)}`);
+  }
+  if (!String(body.error.message).includes('bad reasoning_effort')) {
+    throw new Error('上游原文被吞: ' + body.error.message);
+  }
+  if (inCooldown(tokenA) || inCooldown(tokenB)) throw new Error('400 不应冷却账号');
+});
+
+console.log('--- /v1/models 分组 tag ---');
+await tAsync('模型按 免费 → US/SG → 限定 分组打 tier', async () => {
+  if (MODEL_TIERS.map(([k]) => k).join(',') !== 'free,us_sg,limited') {
+    throw new Error('分组顺序错了: ' + MODEL_TIERS.map(([k]) => k).join(','));
+  }
+  const tierOf = (id) => {
+    const i = MODEL_TIERS.findIndex(([, ids]) => ids.has(id));
+    return i < 0 ? null : MODEL_TIERS[i][0];
+  };
+  const expected = {
+    'mimo/mimo-v2.5': 'free',
+    'deepseek/deepseek-v4-flash': 'free',
+    'minimax/minimax-m3': 'us_sg',
+    'deepseek/deepseek-v4-pro': 'us_sg',
+    'openai/gpt-5.6-luna': 'us_sg',
+    'crof/kimi-k3-eco': 'us_sg',
+    'meta/muse-spark-1.2-contributor': 'us_sg',
+    'z-ai/glm-5.2': 'limited',
+    'anthropic/claude-fable-5': 'limited',
+  };
+  for (const [id, want] of Object.entries(expected)) {
+    if (tierOf(id) !== want) throw new Error(`${id} tier=${tierOf(id)}，期望 ${want}`);
+  }
+  // handleModels 的拼装：带 tier、不再有旧的 free 字段、内部排序键要摘掉
+  const body = await (await handleModels()).json();
+  const mimo = body.data.find((m) => m.id === 'mimo/mimo-v2.5');
+  if (!mimo || mimo.tier !== 'free' || 'free' in mimo || '_sort' in mimo) {
+    throw new Error('handleModels 输出不对: ' + JSON.stringify(mimo));
+  }
+  // 有分组的一定排在无分组的前面，且组内序号单调不减
+  const ranks = body.data.map((m) => (m.tier ? MODEL_TIERS.findIndex(([k]) => k === m.tier) : MODEL_TIERS.length));
+  for (let i = 1; i < ranks.length; i++) {
+    if (ranks[i] < ranks[i - 1]) throw new Error('模型列表没按分组排序: ' + JSON.stringify(body.data.map((m) => m.id)));
   }
 });
 

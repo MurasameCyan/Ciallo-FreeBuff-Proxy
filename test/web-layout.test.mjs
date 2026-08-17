@@ -52,8 +52,37 @@ assert.match(css, /\.workspace-col\s*\{[^}]*display:\s*flex[^}]*flex-direction:\
   '每列必须自成一条纵向流，否则同排两卡共享行高会在矮卡下方留出空洞');
 assert.match(css, /\.workspace-grid\s*\{[^}]*align-items:\s*stretch/s,
   '两列必须等高，底边齐平');
-assert.match(css, /\.col-main\s*>\s*\.model-workspace-card\s*\{[^}]*flex:\s*1\s+1\s+auto/s,
-  '左列末卡必须吸收两列高度差，多出的高度进滚动列表而不是留白');
+// 两列底边对齐的收缩链：左列矮 → 模型卡长高吃掉差额；左列高 → 差额从账号表扣、走内联滚动。
+assert.match(css, /\.col-main\s*>\s*\.model-workspace-card\s*\{[^}]*flex:\s*1\s+0\s+auto/s,
+  '左列末卡只涨不缩：左列比右列矮时它吸收差额（进映射表/模型列表而不是留白），比右列高时差额得从账号表扣，模型卡保持自然高');
+assert.match(css, /\.col-main\s*>\s*\.runtime-card\s*\{[^}]*flex:\s*0\s+1\s+auto[^}]*min-height:\s*0/s,
+  '账号池卡必须是唯一可收缩的那张，否则账号一多整列就比右列高出一两百像素');
+assert.match(css, /\.account-card\s*\{[^}]*overflow:\s*hidden[^}]*display:\s*flex[^}]*flex-direction:\s*column/s,
+  '账号池卡必须是纵向 flex 且裁掉溢出，表格才能成为唯一的伸缩区');
+assert.match(css, /\.account-card > \.card-head\s*\{[^}]*flex:\s*none/s,
+  '账号池概况与标题固定高度，压缩只允许发生在表格上');
+assert.match(css, /\.account-card \.table-scroll\s*\{[^}]*flex:\s*1\s+1\s+auto[^}]*min-height:\s*1[0-9][0-9]px[^}]*overflow:\s*auto/s,
+  '账号表必须内联滚动吸收高度差，并留出至少三位数的下限（再挤宁可整列略高，也不把表压成一条缝）');
+assert.match(css, /\.account-card \.table-scroll\s*\{[^}]*scrollbar-width:\s*none/s,
+  '账号表内联滚动必须隐藏滚动条');
+assert.match(css, /\.account-card \.table-scroll::-webkit-scrollbar\s*\{[^}]*display:\s*none/s,
+  'WebKit/Blink 认伪元素而非 scrollbar-width，两处都要关');
+assert.match(css, /\.account-card > \.pane\.add-pane\s*\{[^}]*overflow-y:\s*auto/s,
+  '「添加」分页在卡被压矮时也要内联滚动，否则表单被 overflow:hidden 切掉');
+// 纯 CSS 收不住左列：Chrome 里纵向 flex 容器的 min-content 高度等于 max-content，
+// grid-template-rows:min-content / min-height:0 都是空转，只有显式 max-height 才封得住。
+assert.match(app, /function syncColumnBottoms\(\)[\s\S]*?\$\('proxyCard'\)/s,
+  '底边对齐必须以右列末卡 #proxyCard 的底边为基准');
+assert.match(app, /function syncColumnBottoms\(\)[\s\S]*?main\.style\.maxHeight = ''/s,
+  '重算前必须先清掉上一次的上限，否则量到的是被自己压过的高度');
+assert.match(app, /function syncColumnBottoms\(\)[\s\S]*?getBoundingClientRect\(\)\.top[\s\S]*?return/s,
+  '两列上边不齐（≤1200px 退成单列）时必须直接返回，限高只会白白裁掉内容');
+assert.match(app, /function syncColumnBottoms\(\)[\s\S]*?main\.style\.maxHeight = cap \+ 'px'/s,
+  '对齐靠给 .col-main 设 max-height 实现（Chrome 下纵向 flex 的 min-content == max-content，纯 CSS 收不住）');
+assert.match(app, /ResizeObserver[\s\S]*?\$\('usageCard'\), \$\('proxyCard'\)/s,
+  '右列自己长高/变矮时要重算；只观察右列两卡，避免与自己设的 maxHeight 互相触发');
+assert.ok(app.includes('watchColumnBottoms();'), '底边对齐必须挂上 resize/ResizeObserver 监听');
+assert.ok(app.includes('syncColumnBottoms();'), '每轮渲染后必须重算底边对齐（账号行数会变）');
 assert.match(css, /\.col-side\s*>\s*\.usage-card\s*\{[^}]*min-height:\s*360px/s,
   '运行概况卡片必须 360 起');
 assert.match(css, /\.col-side\s*>\s*\.proxy-card\s*\{[^}]*min-height:\s*660px/s,
@@ -85,8 +114,10 @@ assert.match(css, /\.model-catalog\s+\.models\s*\{[^}]*flex:\s*1\s+1\s+0/s,
   '可用模型列表必须填满卡片高度以对齐模型映射并消除留白');
 assert.match(css, /\.alias-editor\s+\.table-scroll\s*\{[^}]*height:\s*var\(--model-list-height\)/s,
   '模型映射列表必须以默认列表高度作为基准以支持内联滚动');
-assert.match(css, /\.alias-editor\s+\.table-scroll\s*\{[^}]*flex:\s*1\s+0\s+auto/s,
-  '模型映射列表必须吸收多余高度，把添加行顶到卡片底边，消除下方留白');
+assert.match(css, /\.alias-editor\s+\.table-scroll\s*\{[^}]*flex:\s*1\s+1\s+auto/s,
+  '模型映射列表要能双向伸缩：涨着把添加行顶到卡片底边消除留白，映射条数多又被压矮时收缩、多出的行走内联滚动');
+assert.match(css, /\.alias-editor\s+\.table-scroll\s*\{[^}]*min-height:\s*96px/s,
+  '模型映射至少露出表头 + 一行，再挤就不缩了');
 assert.match(css, /\.model-workspace-card\s+\.table-scroll\s*\{[^}]*scrollbar-width:\s*none/s,
   '模型映射内联滚动必须隐藏滚动条');
 assert.match(css, /\.proxy-card[\s\S]*?\.proxy-metrics/s,
@@ -134,6 +165,10 @@ assert.ok(app.includes('esc(usage.used') && app.includes('esc(usage.limit'),
   '账号用量必须移动到账号名之后（池级共享，视作账号通用）呈现 (已用/总量)');
 assert.match(app, /class="acct-usage"/, '账号名后必须有 acct-usage 承载用量');
 assert.match(app, /class="quota quota-models"/, '可用模型列必须列出账号可用模型');
+assert.match(app, /probe && probe\.isolatedUntil/,
+  '无额度表的封禁账号必须在可用模型列显示本地隔离到期时间，而不是一个光秃秃的 —');
+assert.ok(!/解封 \$\{|解封至/.test(app),
+  '不能把本地 24h 兜底说成「解封」：上游 banned 响应不含解封时间，措辞必须是「隔离至」');
 assert.match(app, /function usableQuota/, '必须提供 usableQuota 以过滤未解锁模型');
 assert.match(app, /Number\(q\.limit\)\s*>\s*0/,
   '可用模型与账号用量必须只取 limit>0 的池，隐藏 0/0 未解锁模型（如 glm-5.2）');
@@ -207,6 +242,10 @@ assert.match(css, /\.model-catalog \.models\s*\{[^}]*justify-items:\s*start/s,
   '模型列表条目必须按模型名称宽度自适应');
 assert.match(css, /\.model-catalog \.models li\s*\{[^}]*width:\s*fit-content/s,
   '模型列表条目不应横向拉伸并留下空白');
+assert.match(app, /MODEL_TIER_LABELS = \{ free: '免费', us_sg: 'US \/ SG', limited: '限定' \}/,
+  '模型列表的三个分组 tag 文案必须是 免费 / US / SG / 限定');
+assert.match(app, /MODEL_TIER_LABELS\[m\.tier\]/,
+  '分组 tag 必须读 /v1/models 的 tier 字段（旧的 m.free 已废弃）');
 assert.ok(!html.includes('class="page-intro"'), '页面顶部不应保留运行面板介绍区');
 for (const removedText of ['控制台', '运行面板', '账号、模型与出口代理集中管理']) {
   assert.ok(!html.includes(`>${removedText}<`), `页面必须移除介绍文案: ${removedText}`);
