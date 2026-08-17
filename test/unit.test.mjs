@@ -8,7 +8,7 @@ const src = readFileSync(new URL('../worker.js', import.meta.url), 'utf-8');
 // 使内部函数在沙箱全局可见，供单测直接调用。
 const wrapper = src.replace('export default {', 'const __workerDefault__ = {') +
   '\n\nglobalThis.__workerDefault__ = __workerDefault__;\n' +
-  'globalThis.__unitTestApi__ = { normalizeChatThinking, anthropicThinkingToEffort, namedEffort, normalizeReasoningEffort, collectReasoningTexts, anthropicStopReason, anthropicModelToOpenAI, parseModelAliases, resolveModelAlias, resolveModelConfig, findModelConfig, setTestAliases: (raw) => { currentAliases = parseModelAliases(raw); }, cooldown, cooldownInfo, inCooldown, parseCooldown, nextPacificMidnight: typeof nextPacificMidnight === "function" ? nextPacificMidnight : null, pickToken, releaseToken: typeof releaseToken === "function" ? releaseToken : null, accountPoolExhaustion: typeof accountPoolExhaustion === "function" ? accountPoolExhaustion : null, waitingRoomResponse: typeof waitingRoomResponse === "function" ? waitingRoomResponse : null, pipeUpstreamToClient, pipeUpstreamToResponsesStream, markSessionInvalidated, wasRecentlyInvalidated, singleFlight, sessionRemainingMs, INVALIDATION_WINDOW_MS, SESSION_REUSE_SAFE_MS, SESSION_VERIFY_WINDOW_MS, executeChat, readCallUsage, accountLabel, logCall, callLogSnapshot, readUsageFull, recordRequest, blankUsageTotals, recordAccountObservation, configureUsagePersistence, restoreUsageSnapshot, usageSnapshot, setTestEgressReject: (fn) => { onEgressReject = fn; } };\n';
+  'globalThis.__unitTestApi__ = { normalizeChatThinking, anthropicThinkingToEffort, namedEffort, normalizeReasoningEffort, collectReasoningTexts, anthropicStopReason, anthropicModelToOpenAI, parseModelAliases, resolveModelAlias, resolveModelConfig, findModelConfig, setTestAliases: (raw) => { currentAliases = parseModelAliases(raw); }, cooldown, cooldownInfo, inCooldown, parseCooldown, nextPacificMidnight: typeof nextPacificMidnight === "function" ? nextPacificMidnight : null, pickToken, releaseToken: typeof releaseToken === "function" ? releaseToken : null, accountPoolExhaustion: typeof accountPoolExhaustion === "function" ? accountPoolExhaustion : null, waitingRoomResponse: typeof waitingRoomResponse === "function" ? waitingRoomResponse : null, pipeUpstreamToClient, pipeUpstreamToResponsesStream, anthropicStream, streamToNonStream, anthropicFromChat, responsesToNonStream, markSessionInvalidated, wasRecentlyInvalidated, singleFlight, sessionRemainingMs, INVALIDATION_WINDOW_MS, SESSION_REUSE_SAFE_MS, SESSION_VERIFY_WINDOW_MS, executeChat, readCallUsage, accountLabel, logCall, callLogSnapshot, readUsageFull, recordRequest, blankUsageTotals, recordAccountObservation, configureUsagePersistence, restoreUsageSnapshot, usageSnapshot, setTestEgressReject: (fn) => { onEgressReject = fn; } };\n';
 
 // 可编程 fetch mock：测试里可替换 sandbox.fetch，返回可定制的 Response 形状
 // （worker 里用的是 { status, ok, headers, text() } 简化形状）。
@@ -30,7 +30,7 @@ sandbox.globalThis = sandbox;
 vm.createContext(sandbox);
 vm.runInContext(wrapper, sandbox);
 
-const { normalizeChatThinking, anthropicThinkingToEffort, namedEffort, normalizeReasoningEffort, collectReasoningTexts, anthropicStopReason, anthropicModelToOpenAI, parseModelAliases, resolveModelAlias, resolveModelConfig, findModelConfig, setTestAliases, cooldown, cooldownInfo, inCooldown, parseCooldown, nextPacificMidnight, pickToken, releaseToken, accountPoolExhaustion, waitingRoomResponse, pipeUpstreamToClient, pipeUpstreamToResponsesStream, markSessionInvalidated, wasRecentlyInvalidated, singleFlight, sessionRemainingMs, INVALIDATION_WINDOW_MS, SESSION_REUSE_SAFE_MS, SESSION_VERIFY_WINDOW_MS, executeChat, readCallUsage, accountLabel, logCall, callLogSnapshot, readUsageFull, recordRequest, blankUsageTotals, recordAccountObservation, configureUsagePersistence, restoreUsageSnapshot, usageSnapshot, setTestEgressReject } = sandbox.__unitTestApi__;
+const { normalizeChatThinking, anthropicThinkingToEffort, namedEffort, normalizeReasoningEffort, collectReasoningTexts, anthropicStopReason, anthropicModelToOpenAI, parseModelAliases, resolveModelAlias, resolveModelConfig, findModelConfig, setTestAliases, cooldown, cooldownInfo, inCooldown, parseCooldown, nextPacificMidnight, pickToken, releaseToken, accountPoolExhaustion, waitingRoomResponse, pipeUpstreamToClient, pipeUpstreamToResponsesStream, anthropicStream, streamToNonStream, anthropicFromChat, responsesToNonStream, markSessionInvalidated, wasRecentlyInvalidated, singleFlight, sessionRemainingMs, INVALIDATION_WINDOW_MS, SESSION_REUSE_SAFE_MS, SESSION_VERIFY_WINDOW_MS, executeChat, readCallUsage, accountLabel, logCall, callLogSnapshot, readUsageFull, recordRequest, blankUsageTotals, recordAccountObservation, configureUsagePersistence, restoreUsageSnapshot, usageSnapshot, setTestEgressReject } = sandbox.__unitTestApi__;
 
 let pass = 0, fail = 0;
 function t(name, fn) {
@@ -338,6 +338,81 @@ async function tAsync(name, fn) {
   try { await fn(); pass++; console.log('  PASS', name); }
   catch (e) { fail++; console.log('  FAIL', name, '-', e.message); }
 }
+
+function buildUpstreamToolStream() {
+  const argument = '{"command":"echo hello"}';
+  return new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode('data: ' + JSON.stringify({
+        choices: [{ delta: { tool_calls: [{ index: 0, id: 'call-1', function: { name: 'Bash', arguments: argument } }] } }],
+      }) + '\n\ndata: [DONE]\n\n'));
+      controller.close();
+    },
+  });
+}
+
+function parseSseData(text) {
+  return [...text.matchAll(/data: (\{.*\})\n\n/g)].map((m) => JSON.parse(m[1]));
+}
+
+async function collectPipedSse(startPipe) {
+  const { readable, writable } = new TransformStream();
+  startPipe(buildUpstreamToolStream(), writable);
+  return parseSseData(await new Response(readable).text());
+}
+
+await tAsync('Anthropic 工具参数流只发送一次，不重复追加累计参数', async () => {
+  const response = new Response(buildUpstreamToolStream()).body.pipeThrough(anthropicStream({ id: 'deepseek/deepseek-v4-pro' }));
+  const text = await new Response(response).text();
+  const partials = [...text.matchAll(/data: (\{.*\})\n\n/g)]
+    .map((m) => JSON.parse(m[1]))
+    .filter((event) => event.type === 'content_block_delta' && event.delta?.type === 'input_json_delta')
+    .map((event) => event.delta.partial_json);
+  if (partials.length !== 1) throw new Error('工具参数增量次数应为 1，实际 ' + partials.length);
+  if (partials[0] !== '{"command":"echo hello"}') throw new Error('工具参数被重复或改写: ' + partials.join(''));
+});
+
+await tAsync('OpenAI 工具参数流透明转发一次', async () => {
+  const events = await collectPipedSse((body, writable) => pipeUpstreamToClient(body, writable));
+  const partials = events.flatMap((event) => event.choices?.[0]?.delta?.tool_calls || [])
+    .map((tool) => tool.function?.arguments).filter(Boolean);
+  if (partials.length !== 1) throw new Error('工具参数增量次数应为 1，实际 ' + partials.length);
+  if (partials.join('') !== '{"command":"echo hello"}') throw new Error('工具参数被重复或改写: ' + partials.join(''));
+});
+
+await tAsync('Responses 工具参数 delta 只发送一次，done 保存完整参数', async () => {
+  const events = await collectPipedSse((body, writable) =>
+    pipeUpstreamToResponsesStream(body, writable, { id: 'deepseek/deepseek-v4-pro' }));
+  const deltas = events.filter((event) => event.type === 'response.function_call_arguments.delta')
+    .map((event) => event.delta);
+  if (deltas.length !== 1) throw new Error('工具参数增量次数应为 1，实际 ' + deltas.length);
+  if (deltas.join('') !== '{"command":"echo hello"}') throw new Error('工具参数被重复或改写: ' + deltas.join(''));
+  const done = events.filter((event) => event.type === 'response.output_item.done' && event.item?.type === 'function_call');
+  if (done.length !== 1) throw new Error('function_call done 次数应为 1，实际 ' + done.length);
+  if (done[0].item.arguments !== '{"command":"echo hello"}') throw new Error('done 参数不完整: ' + done[0].item.arguments);
+});
+
+await tAsync('OpenAI 非流式工具参数聚合一次并保留 tool_calls', async () => {
+  const response = await streamToNonStream(buildUpstreamToolStream(), 'deepseek/deepseek-v4-pro');
+  const calls = response.choices?.[0]?.message?.tool_calls || [];
+  if (calls.length !== 1) throw new Error('tool_calls 数量应为 1，实际 ' + calls.length);
+  if (calls[0].function?.arguments !== '{"command":"echo hello"}') throw new Error('工具参数丢失或重复: ' + calls[0].function?.arguments);
+});
+
+await tAsync('Anthropic 非流式工具参数经共享聚合器只解析一次', async () => {
+  const openai = await streamToNonStream(buildUpstreamToolStream(), 'deepseek/deepseek-v4-pro');
+  const response = anthropicFromChat(openai, { id: 'deepseek/deepseek-v4-pro' });
+  const tools = response.content.filter((block) => block.type === 'tool_use');
+  if (tools.length !== 1) throw new Error('tool_use 数量应为 1，实际 ' + tools.length);
+  if (tools[0].input?.command !== 'echo hello') throw new Error('工具参数未正确解析: ' + JSON.stringify(tools[0].input));
+});
+
+await tAsync('Responses 非流式工具参数聚合一次', async () => {
+  const response = await responsesToNonStream(buildUpstreamToolStream(), { id: 'deepseek/deepseek-v4-pro' });
+  const tools = response.output.filter((item) => item.type === 'function_call');
+  if (tools.length !== 1) throw new Error('function_call 数量应为 1，实际 ' + tools.length);
+  if (tools[0].arguments !== '{"command":"echo hello"}') throw new Error('工具参数丢失或重复: ' + tools[0].arguments);
+});
 
 const T = 't-integration-token';
 // 构造上游 mock：session 创建 200，chat 首次 429 带 retryAfterMs

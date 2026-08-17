@@ -2758,6 +2758,12 @@ function anthropicStream(mc, opts = {}) {
     events(ctl, "content_block_stop", { index: state.text.index });
     state.text.started = false; state.text.index = -1;
   };
+  const flushToolArgs = (ctl, tool) => {
+    if (!tool.started || tool.sentArgs >= tool.args.length) return;
+    const pending = tool.args.slice(tool.sentArgs);
+    tool.sentArgs = tool.args.length;
+    if (pending) events(ctl, "content_block_delta", { index: tool.index, delta: { type: "input_json_delta", partial_json: pending } });
+  };
   const ensureStarted = (ctl) => {
     if (state.started) return;
     state.started = true;
@@ -2773,7 +2779,7 @@ function anthropicStream(mc, opts = {}) {
     stopText(ctl);
     for (const t of state.tools.values()) {
       if (!t.started) continue;
-      if (t.args) events(ctl, "content_block_delta", { index: t.index, delta: { type: "input_json_delta", partial_json: t.args } });
+      flushToolArgs(ctl, t);
       events(ctl, "content_block_stop", { index: t.index });
     }
     const usage = { output_tokens: state.output };
@@ -2838,7 +2844,7 @@ function anthropicStream(mc, opts = {}) {
             if (!t) {
               const slot = { index: -1 };
               const blkIdx = blockIndex(slot);
-              t = { index: blkIdx, id: "", name: "", started: false, args: "" };
+              t = { index: blkIdx, id: "", name: "", started: false, args: "", sentArgs: 0 };
               state.tools.set(srcIdx, t);
             }
             if (tc.id) t.id = tc.id;
@@ -2849,9 +2855,7 @@ function anthropicStream(mc, opts = {}) {
               events(ctl, "content_block_start", { index: t.index, content_block: { type: "tool_use", id: t.id || ("toolu_" + Math.random().toString(36).slice(2, 10)), name: t.name, input: {} } });
               t.started = true;
             }
-            if (t.started && fn.arguments) {
-              events(ctl, "content_block_delta", { index: t.index, delta: { type: "input_json_delta", partial_json: fn.arguments } });
-            }
+            flushToolArgs(ctl, t);
           }
         }
         if (choice.finish_reason) state.reason = anthropicStopReason(choice.finish_reason);
@@ -2951,6 +2955,7 @@ async function streamToNonStream(upstreamBody, upstreamModel) {
   const reader = upstreamBody.getReader();
   const decoder = new TextDecoder();
   let buf = "", content = "", reasoning = "", finishReason = null, model = "", id = "", usage = null;
+  const toolItems = new Map(); // 上游 tool_calls index → {id, type, function:{name, arguments}}
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
@@ -2969,6 +2974,22 @@ async function streamToNonStream(upstreamBody, upstreamModel) {
         if (delta.content) content += delta.content;
         if (delta.reasoning_content) reasoning += delta.reasoning_content;
         if (choice.finish_reason) finishReason = choice.finish_reason;
+        if (Array.isArray(delta.tool_calls)) {
+          for (const tc of delta.tool_calls) {
+            if (!tc || typeof tc !== "object") continue;
+            const ti = tc.index ?? 0;
+            let item = toolItems.get(ti);
+            if (!item) {
+              const fn = tc.function || {};
+              item = { id: tc.id || "call_" + Math.random().toString(36).slice(2, 10), type: "function", function: { name: fn.name || "", arguments: "" } };
+              toolItems.set(ti, item);
+            }
+            const fn = tc.function || {};
+            if (tc.id && !item.id) item.id = tc.id;
+            if (fn.name && !item.function.name) item.function.name = fn.name;
+            if (fn.arguments) item.function.arguments += fn.arguments;
+          }
+        }
         if (obj.id) id = obj.id;
         if (obj.model) model = obj.model;
         if (obj.usage) usage = obj.usage;
@@ -2978,6 +2999,7 @@ async function streamToNonStream(upstreamBody, upstreamModel) {
   const msg = { role: "assistant", content };
   if (reasoning && !content) { msg.content = reasoning; msg.reasoning_used_as_content = true; }
   else if (reasoning) msg.reasoning_content = reasoning;
+  if (toolItems.size) msg.tool_calls = [...toolItems.values()];
   return {
     id: id || "gen_" + Date.now(),
     object: "chat.completion",
