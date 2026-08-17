@@ -315,6 +315,12 @@ async function probeAccount(token) {
   // 只有管理员主动探测得到明确存活结果时才清除持久隔离；业务成功响应
   // 不自动清除，避免上游短暂异常造成封禁状态抖动。
   if (result.state === 'ok') accountStateStore.clear(token);
+  // 本地隔离到期时间，给面板显示「这个号几点重新入池」。
+  // ⚠️ 不是上游给的解封时间：官方 banned 响应体只有 {"status":"banned"}（terminal 状态，
+  // 见 freebuff-session.ts 的 FreebuffSessionResponse），任何时间字段都没有。
+  // 这里的值来自 worker 侧 BANNED_DEFAULT_COOLDOWN_MS 的 24h 兜底。
+  const isolation = accountStateStore.snapshot([token])[token];
+  result.isolatedUntil = isolation && isolation.until != null ? isolation.until : null;
   return result;
 }
 
