@@ -60,3 +60,6 @@ data/**
 
 # 本地额度验证脚本，仅本地使用
 freebuff_tools/test_extract_freebuff_quota.py
+
+# Claude Code 的临时工作树，仅本地
+.claude/worktrees/
