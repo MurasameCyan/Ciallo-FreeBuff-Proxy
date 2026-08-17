@@ -148,11 +148,12 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
   display: flex; flex-direction: column;
   gap: 20px; min-width: 0;
 }
-/* 两列高度差交给左列末卡吸收,底边就能齐平。多出来的高度进「模型映射」表格和
-   「可用模型」列表(两者都是滚动区,越高越有用),不会变成空洞。 */
-.col-main > .runtime-card { flex: none; }  /* 账号池按内容高,不参与高度差分配(它 overflow:hidden,被压缩会切内容) */
+/* 两列高度差交给左列吸收,底边就能齐平。左列比右列矮时多出来的高度进「模型映射」表格和
+   「可用模型」列表;左列比右列高时(账号多),差额从账号表里扣,扣掉的行走内联滚动。 */
+.col-main > .runtime-card { flex: 0 1 auto; min-height: 0; }  /* 账号池吸收高度差:表格内联滚动,不再硬撑整列 */
 .col-main > .model-workspace-card {
-  flex: 1 1 auto;
+  flex: 1 0 auto;   /* 只涨不缩:高度差先从账号表扣,模型卡保持自然高 */
+  min-height: 0;
   display: flex; flex-direction: column;
 }
 .col-main > .model-workspace-card > .model-workspace-grid { flex: 1 1 auto; }
@@ -207,7 +208,8 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
 }
 .hint { color: var(--fg-2); font-size: 12px; line-height: 1.5; }
 .card-head .hint { margin-left: auto; text-align: right; }
-.account-card { min-height: 0; padding: 0; overflow: hidden; }
+/* 账号池卡:纵向 flex,概况与标题固定,表格是唯一的伸缩区(内联滚动、无滚动条) */
+.account-card { min-height: 0; padding: 0; overflow: hidden; display: flex; flex-direction: column; }
 .account-summary {
   padding: 16px 20px;
   border-bottom: 1px solid var(--line);
@@ -261,8 +263,20 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
 .access-actions .btn {
   padding: 6px 8px; font-size: 11px; text-align: center; white-space: nowrap;
 }
-.account-card > .card-head { padding: 20px 20px 0; margin-bottom: 16px; }
-.account-card > .pane { padding: 0 20px 20px; }
+.account-card > .account-summary { flex: none; }
+.account-card > .card-head { padding: 20px 20px 0; margin-bottom: 16px; flex: none; }
+.account-card > .pane { padding: 0 20px 20px; min-height: 0; display: flex; flex-direction: column; }
+/* 账号表内联滚动:纵向吃掉两列高度差,横向仍可滑;滚动条两处都关
+   (Firefox 认 scrollbar-width,WebKit/Blink 认伪元素)。留 132px 底线,
+   再挤就宁可让整列略高于右列,也不把表压成一条缝。 */
+.account-card .table-scroll {
+  flex: 1 1 auto; min-height: 132px; overflow: auto;
+  scrollbar-width: none; -ms-overflow-style: none;
+}
+.account-card .table-scroll::-webkit-scrollbar { display: none; }
+/* 「添加」分页里是两段表单,卡被压矮时同样内联滚动,免得被 overflow:hidden 切掉 */
+.account-card > .pane.add-pane { overflow-y: auto; scrollbar-width: none; -ms-overflow-style: none; }
+.account-card > .pane.add-pane::-webkit-scrollbar { display: none; }
 [hidden] { display: none !important; }
 
 /* 分段切换(管理 | 添加) */
@@ -399,12 +413,17 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
 .pill.warn   { color: var(--amber); border-color: color-mix(in oklab, var(--amber) 35%, var(--line)); }
 .pill.danger { color: var(--rose); border-color: color-mix(in oklab, var(--rose) 35%, var(--line)); }
 
-/* 模型列表里的 free 胶囊（比模型名再小一号，保持从属关系） */
-.pill.free {
+/* 模型列表里的分组胶囊（比模型名再小一号，保持从属关系）。
+   配色只区分「能用」三档：免费=mint、需要美/新出口=violet、限定解锁=amber。
+   9px 字号下中性灰（--fg-2）在深色底上几乎看不见，所以 US/SG 也用调色板里的
+   强调色，边框比另外两档再实一点（45% 而非 30%）。 */
+.pill.tier {
   font-size: 9px; padding: 1px 6px; border-radius: 999px;
-  color: var(--mint); border-color: color-mix(in oklab, var(--mint) 30%, transparent);
   background: transparent; vertical-align: 1px;
 }
+.pill.tier-free    { color: var(--mint);   border-color: color-mix(in oklab, var(--mint) 30%, transparent); }
+.pill.tier-us_sg   { color: var(--violet); border-color: color-mix(in oklab, var(--violet) 45%, transparent); }
+.pill.tier-limited { color: var(--amber);  border-color: color-mix(in oklab, var(--amber) 30%, transparent); }
 /* 模型列表：纯文本清单，不再给每个模型名套卡片(边框+底色)——一屏九行卡片噪音大过信息，
    去掉包裹后行距收紧到 3px、字号降到 10px，列表宽度也跟着按最长模型名收窄。 */
 .models {
@@ -527,8 +546,10 @@ select:disabled { opacity: .5; cursor: not-allowed; }
 .model-workspace-card .table-scroll::-webkit-scrollbar { display: none; }
 .model-workspace-card .table-scroll { scrollbar-width: none; -ms-overflow-style: none; }
 .alias-editor .table-scroll {
-  height: var(--model-list-height);  /* 作为 flex-basis：默认高度，也是最小高度 */
-  flex: 1 0 auto;                    /* 卡片被可用模型拉高时表格吸收多余高度，把添加行顶到底边，消除下方留白 */
+  height: var(--model-list-height);  /* 作为 flex-basis：默认高度 */
+  flex: 1 1 auto;                    /* 卡片被可用模型拉高时表格吸收多余高度，把添加行顶到底边，消除下方留白；
+                                        映射条数多、卡片又被压矮时反过来收缩，多出来的行走内联滚动 */
+  min-height: 96px;                  /* 至少露出表头 + 一行，再挤就不缩了 */
   overflow: auto;
 }
 .alias-editor .alias-add { margin-top: 20px; }  /* 添加行与表格之间留白 20px（下方由 .alias-message + 卡片内边距共 20px 对称） */

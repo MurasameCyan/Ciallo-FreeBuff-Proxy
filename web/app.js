@@ -261,9 +261,19 @@ function accountUsage(probe) {
 
 // 可用模型列：只列真正有额度（limit>0）的模型，每个模型独占一行；0/0 未解锁模型
 // （如 glm-5.2）直接隐藏。用量已上移到账号名后，重置时间上移到列标题。
+// 被封禁/隔离的号没有额度表，这一格改显示本地隔离到期时间（= 几点重新进轮询）。
+// 措辞是「隔离至」而不是「解封」：上游 banned 响应只有 {"status":"banned"}，
+// 不带任何解封时间，这个点是本地 24h 兜底猜的。
 function modelsCellHtml(probe) {
   const rows = usableQuota(probe);
-  if (!rows.length) return '<span class="quota">—</span>';
+  if (!rows.length) {
+    const until = Number(probe && probe.isolatedUntil);
+    if (Number.isFinite(until) && until > 0) {
+      const when = formatResetAt(new Date(until).toISOString());
+      return `<span class="quota" title="上游封禁响应不含解封时间，这是本地 24h 兜底隔离到期时间，到点后该号重新进入轮询">隔离至 ${when}</span>`;
+    }
+    return '<span class="quota">—</span>';
+  }
   const items = rows.map((q) => `<li><b>${esc(q.model)}</b></li>`).join('');
   return `<ul class="quota quota-models">${items}</ul>`;
 }
@@ -393,6 +403,10 @@ async function saveAliases(next) {
   }
 }
 
+// 模型分组 tag：键与顺序由 worker 的 MODEL_TIERS 决定（/v1/models 的 tier 字段），
+// 这里只负责文案。排序已经在 worker 侧做过，前端不再二次排序。
+const MODEL_TIER_LABELS = { free: '免费', us_sg: 'US / SG', limited: '限定' };
+
 function renderModels() {
   const ul = $('models');
   const list = Array.isArray(S.models) ? S.models : [];
@@ -403,8 +417,8 @@ function renderModels() {
     const li = document.createElement('li');
     li.textContent = m.id;
     li.title = li.textContent;
-    // 只有免费账号实测可用的模型打“免费”胶囊；其余模型不带任何 tag
-    if (m.free) li.append(' ', tag('pill free', '免费'));
+    // 未分组的模型不带任何 tag
+    if (MODEL_TIER_LABELS[m.tier]) li.append(' ', tag(`pill tier tier-${m.tier}`, MODEL_TIER_LABELS[m.tier]));
     return li;
   }));
   // 溢出项给键盘可达
@@ -714,9 +728,39 @@ async function refresh() {
     const models = await rawApi('/v1/models', { headers: { 'Authorization': 'Bearer ' + S.apiKey } }).catch(() => null);
     if (models) S.models = models.data || [];
     renderStats(); renderAccounts(); renderAliases(); renderModels(); renderProxy(); renderUsageOverview(); renderCallLog();
+    syncColumnBottoms();
   } catch (e) {
     if (e.message !== '未登录') toast('加载失败:' + e.message, 'err');
   }
+}
+
+// ── 两列底边对齐 ────────────────────────────────────────
+// 右列(概况 + 出口代理)的高度由自己的内容决定,左列的账号表与映射表都是内联滚动区,
+// 所以把左列的高度上限钉在「出口代理卡底边」:模型配置卡底边就和它齐平,左列多出来的
+// 账号行走滚动,不再把整列顶出去一两百像素。
+// 为什么不是纯 CSS:grid 行高想按 min-content 收,得让左列的 min-content 塌下来,
+// 但 Chrome 里纵向 flex 容器的 min-content 高度等于 max-content(求最小高度时不压缩
+// 子项),给 .col-main 加 min-height:0 也没用 —— 实测行高照旧 1399,只有显式的
+// max-height 才收得住。
+function syncColumnBottoms() {
+  const main = document.querySelector('.col-main');
+  const side = document.querySelector('.col-side');
+  const anchor = $('proxyCard');            // 右列末卡,它的底边就是对齐基准
+  if (!main || !side || !anchor) return;
+  main.style.maxHeight = '';                // 先还原,量的是自然高度而不是上一次的上限
+  // ≤1200px 时两列变成上下两段(见 style.css 的媒体查询),这时候限高只会白白裁掉内容
+  if (Math.abs(side.getBoundingClientRect().top - main.getBoundingClientRect().top) > 1) return;
+  const cap = Math.round(anchor.getBoundingClientRect().bottom - main.getBoundingClientRect().top);
+  if (cap > 320) main.style.maxHeight = cap + 'px';  // 320 兜底:量出离谱小值就不设上限
+}
+
+// 右列自己长高/变矮(节点数、订阅地址换行)或窗口尺寸变化时重算。只观察右列两张卡:
+// 它们的高度与上限无关,不会和 maxHeight 互相触发。
+function watchColumnBottoms() {
+  window.addEventListener('resize', syncColumnBottoms);
+  if (typeof ResizeObserver !== 'function') return;
+  const ro = new ResizeObserver(() => syncColumnBottoms());
+  for (const el of [$('usageCard'), $('proxyCard')]) if (el) ro.observe(el);
 }
 
 /**
@@ -1078,6 +1122,7 @@ function pollOauth(fingerprintId) {
 }
 
 wire();
+watchColumnBottoms();
 refresh();
 setInterval(refresh, POLL_MS);
 setInterval(refreshCallLogLive, LOG_POLL_MS);
