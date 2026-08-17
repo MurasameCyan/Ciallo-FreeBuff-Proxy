@@ -359,6 +359,27 @@ const FREE_AVAILABLE_MODELS = new Set([
   "mimo/mimo-v2.5",
 ]);
 
+// /v1/models 的分组键，数组顺序 = 面板「模型列表」的展示顺序（组内保持模型表原序）：
+//   free    免费号实测能建会话的两个（= FREE_AVAILABLE_MODELS）
+//   us_sg   要 full accessTier（美/新出口 IP）才能建会话的 premium 模型
+//   limited 额度池独立、要 referral / 白名单解锁的模型（glm-5.2 独立池、fable-5 白名单）
+// 未列入的模型不带 tag、排在最后。这里只给分组键，标签文案和配色由 web/app.js 决定
+// —— 别把中文文案塞进 /v1/models，那是给客户端读的协议字段。
+const MODEL_TIERS = [
+  ["free", FREE_AVAILABLE_MODELS],
+  ["us_sg", new Set([
+    "minimax/minimax-m3",
+    "deepseek/deepseek-v4-pro",
+    "openai/gpt-5.6-luna",
+    "crof/kimi-k3-eco",
+    "meta/muse-spark-1.2-contributor",
+  ])],
+  ["limited", new Set([
+    "z-ai/glm-5.2",
+    "anthropic/claude-fable-5",
+  ])],
+];
+
 // ---------------------------------------------------------------------------
 // 额度池说明（逆向自官方源码 freebuff-models.ts，2026-08-10 实证）
 //
@@ -1894,14 +1915,29 @@ function namedEffort(value) {
 
 // 官方 per-model efforts（2026-08-13 源码 freebuff-models.ts，同步 DEEPSEEK_V4_REASONING_EFFORTS）：
 //   - deepseek-v4-flash / deepseek-v4-pro: [low, high, max]（GA 后两模型同表，无 medium）
-//   - gpt-5.6-luna:      EFFORTS_THROUGH_MAX（low..max 含 xhigh）
 //   - meta/muse-spark:   EFFORTS_THROUGH_XHIGH（minimal..xhigh，ALWAYS reasons，none=400）
+//   - gpt-5.6-luna:      见 MODEL_PINNED_EFFORT —— 目录里写的是 EFFORTS_THROUGH_MAX，
+//                        但那是 OpenRouter 广告的档位，实际链路只收 high
 //   - minimax-m3 / mimo / glm / fable：无 effort 档位或不接受 effort → 不在表中，原样透传
 const MODEL_EFFORTS = {
   "deepseek/deepseek-v4-flash": ["low", "high", "max"],
   "deepseek/deepseek-v4-pro": ["low", "high", "max"],
-  "openai/gpt-5.6-luna": ["low", "medium", "high", "xhigh", "max"],
   "meta/muse-spark-1.2-contributor": ["minimal", "low", "medium", "high", "xhigh"],
+};
+
+// 服务端钉死思考强度的模型：这里的值不是「上限」而是「唯一可发的值」。
+// gpt-5.6-luna 走 OpenRouter 的 openai 直连路由，Freebuff 的
+// applyFreebuffReasoningDefaults 会给这条路由注入 reasoning.effort='high'
+// （FREEBUFF_GPT_5_6_LUNA_REASONING_EFFORT）。它只看请求里有没有 reasoning 对象，
+// 不看我们发的扁平 reasoning_effort，于是两个字段同时存在；取值不一致时
+// OpenRouter 直接 400：
+//   "reasoning_effort" and "reasoning.effort" are both provided with conflicting values
+// 实测 2026-08-17（容器内打点抓上游原文）：xhigh / max / low 全部 400，
+// 只有 high 因为和注入值相同而不冲突。
+// 所以 luna 不能走 MODEL_EFFORTS 的 clamp-down —— clamp 只保证「不超上限」，
+// low/none/auto 这类值仍会原样发出去继续 400。必须无条件改写成 high。
+const MODEL_PINNED_EFFORT = {
+  "openai/gpt-5.6-luna": "high",
 };
 
 function clampReasoningEffort(requested, allowed) {
@@ -1923,6 +1959,8 @@ function clampReasoningEffort(requested, allowed) {
 
 function normalizeReasoningEffort(model, effort) {
   if (effort === undefined || effort === null) return effort;
+  const pinned = MODEL_PINNED_EFFORT[model];
+  if (pinned) return pinned; // 钉死档位：任何值（含 none/auto 这种不在 ladder 上的）都改写
   const allowed = MODEL_EFFORTS[model];
   if (!allowed) return effort; // 模型未列 → 不干预
   const clamped = clampReasoningEffort(String(effort), allowed);
@@ -2239,6 +2277,14 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode, requestSig
         if (resp.status === 429) {
           const ra = parseCooldown(text, 429, resp.headers);
           cooldown(token, ra, { reason: "quota", retryAfterMs: ra });
+        } else if (resp.status === 400) {
+          // 与 executeChat 同口径：400 是「请求本身不合法」，和账号无关。
+          // 冷却+换号只会把整池冷掉（连别的模型一起打不通），换号也是同一个 400，
+          // 最后还把上游原文换成"当前没有可用账号"。先收尾 run，再原文回传。
+          if (reviewerRunId) await finishRun(token, reviewerRunId, 1).catch(() => {});
+          if (rootRunId) await finishRun(token, rootRunId, 1).catch(() => {});
+          recordRequest(mc && mc.id ? mc.id : "", null, false);
+          return jsonResponse({ error: { message: lastErrMsg, type: "invalid_request_error" } }, 400);
         } else {
           cooldown(token, parseCooldown(text, resp.status, resp.headers));
         }
@@ -2437,7 +2483,10 @@ async function executeChat(env, chatParams, mc, isStream, mode, requestSignal = 
         if (resp.status === 429) {
           const ra = parseCooldown(errText, 429, resp.headers);
           cooldown(token, ra, { reason: "quota", retryAfterMs: ra });
-        } else {
+        } else if (resp.status !== 400) {
+          // 400 是「请求本身不合法」，和账号无关：冷却这个号毫无意义，
+          // 换号重试只会把整池 60s 全冷掉（连别的模型一起打不通），
+          // 最后还把上游原文换成"当前没有可用账号"，真实原因彻底看不见。
           cooldown(token, parseCooldown(errText, resp.status, resp.headers));
         }
         break;
@@ -2447,6 +2496,11 @@ async function executeChat(env, chatParams, mc, isStream, mode, requestSignal = 
         if (resp.status === 429) callTotals.rateLimited++;
         else callTotals.upstreamError++;
         lastErrMsg = "upstream error: " + (errText || "").slice(0, 300);
+        // 400 换号也是同一个 400，直接把上游原文回给客户端，别再试剩下的号。
+        if (resp.status === 400) {
+          recordRequest(mc && mc.id ? mc.id : "", null, false);
+          return jsonResponse({ error: { message: lastErrMsg, type: "invalid_request_error" } }, 400);
+        }
         if (debug) console.log(`[acct ${acctTry + 1}] failed ${resp.status}, switch account`);
         continue;
       }
@@ -3361,15 +3415,15 @@ async function handleModels() {
     .map((m) => {
       // 实测（2026-08-15）：免费账号只有 Flash / MiMo 2.5 两个模型能建会话
       // （上游 409 session_model_mismatch / 403 free_mode_invalid_agent_model 拒绝其余模型）。
-      // 只给这两个打 free 标记，其余模型不带任何 tag。
-      const free = FREE_AVAILABLE_MODELS.has(m.id);
+      // 分组键与排序都取自 MODEL_TIERS：免费 → US/SG → 限定 → 未分组。
+      const rank = MODEL_TIERS.findIndex(([, ids]) => ids.has(m.id));
       return {
         id: m.id,
         object: "model",
         created: Math.floor(Date.now() / 1000),
         owned_by: "freebuff",
-        // free 优先排序：可用模型排最前，其余按原顺序（排序后移除内部字段）
-        ...(free ? { free: true, _sort: 0 } : { _sort: 1 }),
+        ...(rank >= 0 ? { tier: MODEL_TIERS[rank][0] } : {}),
+        _sort: rank < 0 ? MODEL_TIERS.length : rank,
       };
     })
     .sort((a, b) => a._sort - b._sort)
