@@ -104,13 +104,26 @@ Freebuff 把免费账号分成两个**访问层**（`accessTier`）：出口 IP 
 | `z-ai/glm-5.2` | GLM 5.2 | 否，但要邀请解锁 | 路由忽略 `reasoning_effort` | ⚠️ 额度 `0/0`，未解锁 |
 | `minimax/minimax-m3` | MiniMax M3 | **是** | 无档位（adaptive / 关） | ✅ full 层实测可用 |
 | `deepseek/deepseek-v4-pro` | DeepSeek V4 Pro 08/13 | **是** | `low` `high` `max` | ✅ full 层实测可用 |
-| `openai/gpt-5.6-luna` | GPT-5.6 Luna | **是** | `low` `medium` `high` `xhigh` `max` | ✅ full 层实测可用 |
+| `openai/gpt-5.6-luna` | GPT-5.6 Luna | **是** | 服务端钉死 `high`（见下） | ✅ full 层实测可用 |
 | `crof/kimi-k3-eco` | Kimi K3（Eco 量化版） | **是** | 路由忽略 `reasoning_effort` | ✅ full 层实测可用 |
 | `meta/muse-spark-1.2-contributor` | Muse Spark 1.2 | **是** | `minimal`→`xhigh`（**不吃 `max`**） | ❌ 上游回 `invalid_api_key`，调不通 |
 | `anthropic/claude-fable-5` | Claude Fable 5 | **是** | `low` `medium` `high` `xhigh` `max` | ❌ 409 `session_model_mismatch`，账号未授权 |
 
 「无档位」「路由忽略」的模型不代表不思考 —— 官方 `efforts` 字段缺省的含义是「不提供档位选择」，
 M3 与 MiMo 照样会思考，只是没有深浅可调。给这些模型发 `reasoning_effort` 是无害的空操作。
+
+**Luna 的档位是假的**：官方目录里 Luna 写着 `EFFORTS_THROUGH_MAX`（`low`…`max`），那是 OpenRouter
+广告的元数据。实际链路上 Freebuff 的 `applyFreebuffReasoningDefaults` 会给这条 OpenRouter 路由注入
+`reasoning.effort='high'`，而它只检查有没有 `reasoning` 对象、不看我们发的扁平 `reasoning_effort`，
+于是两个字段并存；取值不一致时 OpenRouter 直接 400：
+
+```
+"reasoning_effort" and "reasoning.effort" are both provided with conflicting values
+```
+
+实测 2026-08-17：`xhigh` / `max` / `low` 全部 400，只有 `high` 因为与注入值相同而不冲突。所以本代理对
+Luna 是**钉死**而不是 clamp —— 任何档位（含 `low` / `none` / `auto`）都改写成 `high`，面板「强度」列
+因此对 Luna 恒显示 `high`。
 
 ### 怎么判断自己在哪一层
 
