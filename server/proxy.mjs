@@ -58,6 +58,23 @@ const MAX_HEALTH_INTERVAL = 86400;
 const MIN_UPDATE_INTERVAL = 3600;
 const MAX_UPDATE_INTERVAL = 86400;
 
+// 自动选点优先的地区。免费额度能用哪些模型由出口 IP 的 accessTier 决定，
+// 美国/新加坡出口拿到 full 的概率明显更高，选错地区比慢几十毫秒代价大得多。
+// US 和 SG 同属一档，档内仍按延迟排序；测活没通过的节点永远排在后面。
+// ponytail: 机场节点名没有统一格式，这里只能按名字猜地区。猜不出就算「其他地区」，
+// 只影响自动选点的排序，不会把节点从池子里摘掉。要更准只能靠出口 IP 实测。
+const AUTO_PREFERRED_REGION = new RegExp([
+  '🇺🇸', '🇸🇬',
+  '\\bUS\\b', '\\bUSA\\b', 'United States', '美国', '美國',
+  '洛杉[矶磯]', '圣何塞', '聖何塞', '西雅[图圖]', '硅谷', '[纽紐]约', '[达達]拉斯',
+  '[凤鳳]凰城', '芝加哥', '[迈邁]阿密', '[dD]allas', '[lL]os ?[aA]ngeles', '[sS]an ?[jJ]ose',
+  '\\bSG\\b', 'Singapore', '新加坡', '[狮獅]城',
+].join('|'), 'i');
+
+function autoRegionRank(name) {
+  return AUTO_PREFERRED_REGION.test(String(name || '')) ? 0 : 1;
+}
+
 let logger = (level, msg) => console.log(`[${level}] ${msg}`);
 
 export function setLogger(fn) { logger = fn || logger; }
@@ -419,6 +436,26 @@ export function createProxyService({
     serviceLogger('warn', `[proxy] 出站被上游拒绝(${lastReject.state}): ${currentNode}`);
   }
 
+  // 自动选点的分档键：先看测活是否通过，再看地区偏好。同档内才比延迟。
+  // 测活没过的节点（delay 为 null）永远在后面 —— 再对的地区，节点是死的也没用。
+  function autoTierKey(name) {
+    const delay = healthMap.get(name) ?? null;
+    return `${delay == null ? 1 : 0}:${autoRegionRank(name)}`;
+  }
+
+  // 自动选点排序：先分档，档内按延迟，最后保持订阅原顺序（让结果稳定可复现）。
+  function autoNodeOrder() {
+    return [...nodeNames].sort((a, b) => {
+      const ka = autoTierKey(a);
+      const kb = autoTierKey(b);
+      if (ka !== kb) return ka < kb ? -1 : 1;
+      const da = healthMap.get(a) ?? null;
+      const db = healthMap.get(b) ?? null;
+      if (da != null && db != null && da !== db) return da - db;
+      return nodeNames.indexOf(a) - nodeNames.indexOf(b);
+    });
+  }
+
   async function applyNodeMode() {
     if (!nodeNames.length) return;
     if (cfg.nodeMode === 'manual' && cfg.selectedNode && nodeNames.includes(cfg.selectedNode)) {
@@ -430,17 +467,19 @@ export function createProxyService({
       cfg.selectedNode = '';
       save();
     }
+    const best = autoNodeOrder()[0] || '';
     let target = '';
+    // mihomo 的 url-test 组自己有测速数据，比我们的周期测活新；但它只看延迟。
+    // 所以只在它选中的节点跟我们的首选同档（一样活着、地区偏好一样）时才采纳它的延迟判断，
+    // 否则按自己的排序来 —— 不然它会拿一个死掉的或地区不对的节点顶掉正确的选择。
     try {
       const automatic = await controller.request(`/proxies/${encodeURIComponent('freebuff-auto')}`);
-      if (automatic?.now && nodeNames.includes(String(automatic.now))) target = String(automatic.now);
+      const picked = automatic?.now ? String(automatic.now) : '';
+      if (picked && nodeNames.includes(picked) && best && autoTierKey(picked) === autoTierKey(best)) {
+        target = picked;
+      }
     } catch {}
-    if (!target) {
-      const healthy = nodeNames
-        .filter((name) => healthMap.get(name) != null)
-        .sort((a, b) => healthMap.get(a) - healthMap.get(b));
-      target = healthy[0] || nodeNames[0];
-    }
+    if (!target) target = best || nodeNames[0];
     await switchPoolNode(target);
   }
 

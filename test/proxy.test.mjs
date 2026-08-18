@@ -254,6 +254,57 @@ test('关闭自动测活时，保存订阅仍会测活一次以完成延迟排�
   assert.equal(status.nodes[0].delay, 60);
 });
 
+test('自动选点优先 US/SG，同档内仍按延迟排序', async () => {
+  const nodes = ['🇯🇵 日本 东京 01', '🇸🇬 新加坡 02', '🇺🇸 美国 洛杉矶 03', 'HK-Premium'];
+  const { service } = fakeService({
+    controller: {
+      async request(path) {
+        if (path.includes('/proxies/freebuff-pool')) return { all: nodes, now: nodes[0] };
+        // mihomo 只看延迟，会选到日本；地区不对就不能采纳它的结果。
+        if (path.includes('/proxies/freebuff-auto')) return { now: nodes[0], all: nodes };
+        if (path.includes('/group/freebuff-pool/delay')) {
+          return { [nodes[0]]: 30, [nodes[1]]: 90, [nodes[2]]: 150, 'HK-Premium': 40 };
+        }
+        return {};
+      },
+    },
+  });
+  const status = await service.setSubscription('https://sub.example.com/list');
+  assert.equal(status.currentNode, nodes[1], '偏好档里应挑延迟最低的新加坡，而不是更快的日本');
+});
+
+test('偏好地区的节点测活没通过时不选它，宁可用别的地区活节点', async () => {
+  const nodes = ['🇺🇸 美国 洛杉矶 01', '🇯🇵 日本 东京 02'];
+  const { service } = fakeService({
+    controller: {
+      async request(path) {
+        if (path.includes('/proxies/freebuff-pool')) return { all: nodes, now: nodes[1] };
+        if (path.includes('/proxies/freebuff-auto')) return { now: nodes[0], all: nodes };
+        if (path.includes('/group/freebuff-pool/delay')) return { [nodes[0]]: 0, [nodes[1]]: 70 };
+        return {};
+      },
+    },
+  });
+  const status = await service.setSubscription('https://sub.example.com/list');
+  assert.equal(status.currentNode, nodes[1], '死掉的美国节点不能因为地区对就被选中');
+});
+
+test('订阅里没有 US/SG 节点时沿用 mihomo 的延迟选点', async () => {
+  const nodes = ['🇯🇵 日本 01', '🇭🇰 香港 02'];
+  const { service } = fakeService({
+    controller: {
+      async request(path) {
+        if (path.includes('/proxies/freebuff-pool')) return { all: nodes, now: nodes[0] };
+        if (path.includes('/proxies/freebuff-auto')) return { now: nodes[1], all: nodes };
+        if (path.includes('/group/freebuff-pool/delay')) return { [nodes[0]]: 200, [nodes[1]]: 60 };
+        return {};
+      },
+    },
+  });
+  const status = await service.setSubscription('https://sub.example.com/list');
+  assert.equal(status.currentNode, nodes[1], '没有偏好地区可选时不应改变原有行为');
+});
+
 test('管理 API 暴露订阅、刷新、节点、测活与更新设置路由', () => {
   const server = readFileSync(new URL('../server.js', import.meta.url), 'utf8');
   for (const marker of ["sub === 'subscription'", "sub === 'refresh'", "sub === 'node'", "sub === 'health'", "sub === 'update'"]) {
