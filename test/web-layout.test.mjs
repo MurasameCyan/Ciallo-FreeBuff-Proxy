@@ -159,16 +159,18 @@ assert.ok(app.includes('`可用模型 (重置 ${formatResetAt(reset)})`'),
   '列标题必须渲染成“可用模型 (重置 YYYY-MM-DD HH:mm)”');
 assert.ok(app.includes('renderQuotaHead()'), 'renderAccounts 必须刷新额度列标题');
 assert.ok(!app.includes('quota-reset'), '重置时间已上移列标题，行内不应再有 quota-reset');
-assert.ok(!app.includes('esc(a.tokenShort || \'\')'),
-  'token 短哈希不再无条件占一行，仅在既无备注名也无邮箱时兜底');
+assert.ok(!app.includes('tokenShort'),
+  '账号面板不得展示或依赖 token 短哈希');
 assert.ok(app.includes('esc(usage.used') && app.includes('esc(usage.limit'),
   '账号用量必须移动到账号名之后（池级共享，视作账号通用）呈现 (已用/总量)');
 assert.match(app, /class="acct-usage"/, '账号名后必须有 acct-usage 承载用量');
 assert.match(app, /class="quota quota-models"/, '可用模型列必须列出账号可用模型');
-assert.match(app, /probe && probe\.isolatedUntil/,
-  '无额度表的封禁账号必须在可用模型列显示本地隔离到期时间，而不是一个光秃秃的 —');
-assert.ok(!/解封 \$\{|解封至/.test(app),
-  '不能把本地 24h 兜底说成「解封」：上游 banned 响应不含解封时间，措辞必须是「隔离至」');
+assert.match(app, /probe\?\.isolatedPermanent/,
+  '无额度表的终态账号必须显式显示永久隔离');
+assert.match(app, /永久隔离/,
+  '面板必须把 banned/token_invalid 的永久状态与临时隔离区分开');
+assert.ok(!/24h 兜底|解封 \$\{|解封至/.test(app),
+  '面板不得把官方 terminal 状态描述成本地 24h 解封倒计时');
 assert.match(app, /function usableQuota/, '必须提供 usableQuota 以过滤未解锁模型');
 assert.match(app, /Number\(q\.limit\)\s*>\s*0/,
   '可用模型与账号用量必须只取 limit>0 的池，隐藏 0/0 未解锁模型（如 glm-5.2）');

@@ -1,11 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtemp, rm, readFile } from 'node:fs/promises';
+import { mkdtemp, rm, readFile, mkdir, writeFile } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer as createNetServer } from 'node:net';
+import { createServer as createHttpServer } from 'node:http';
 import { fileURLToPath } from 'node:url';
 
 const SERVER = fileURLToPath(new URL('../server.js', import.meta.url));
@@ -22,18 +23,26 @@ function freePort() {
   });
 }
 
-async function startServer() {
+async function startServer(extraEnv = {}, prepare = null) {
   const dir = await mkdtemp(join(tmpdir(), 'fbp-server-api-'));
+  if (prepare) await prepare(dir);
   const port = await freePort();
+  const childEnv = { ...process.env };
+  for (const name of [
+    'FREEBUFF_TOKEN', 'FREEBUFF_API_KEY', 'FREEBUFF_CREDENTIALS_FILE', 'FREEBUFF_ACCOUNT_STATE_FILE', 'CODEBUFF_API',
+    'SUBSCRIPTION_URL', 'MIHOMO_BIN', 'MIHOMO_DATA_DIR', 'MIHOMO_HEALTH_URL',
+    'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY', 'NODE_USE_ENV_PROXY',
+  ]) delete childEnv[name];
   const child = spawn(process.execPath, [SERVER], {
     env: {
-      ...process.env,
+      ...childEnv,
       FREEBUFF_DATA_DIR: dir,
       PORT: String(port),
       HOST: '127.0.0.1',
       ADMIN_PASSWORD: '',
       FREEBUFF_TOKEN: '',
       API_KEY: '',
+      ...extraEnv,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -57,6 +66,62 @@ async function startServer() {
     throw new Error('server 未在期限内就绪: ' + (lastErr?.message || '') + '\n' + logs);
   }
   return { child, dir, base, port };
+}
+
+async function startFakeProbeUpstream(getMode) {
+  const upstream = createHttpServer((req, res) => {
+    if (req.url !== '/api/v1/freebuff/session') {
+      res.writeHead(404, { 'content-type': 'application/json' });
+      res.end('{}');
+      return;
+    }
+    const mode = getMode();
+    if (mode === 'banned') {
+      res.writeHead(403, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ status: 'banned' }));
+      return;
+    }
+    if (mode === 'nested-banned') {
+      res.writeHead(403, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { status: 'banned' } }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ status: 'active', uid: 'local-probe-user' }));
+  });
+  await new Promise((resolve, reject) => {
+    upstream.once('error', reject);
+    upstream.listen(0, '127.0.0.1', resolve);
+  });
+  const { port } = upstream.address();
+  return { upstream, url: `http://127.0.0.1:${port}` };
+}
+
+async function startFakeOauthUpstream(user) {
+  const upstream = createHttpServer((req, res) => {
+    if (req.method === 'POST' && req.url === '/api/auth/cli/code') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        loginUrl: 'http://127.0.0.1/oauth-complete',
+        fingerprintHash: 'local-fingerprint-hash',
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      }));
+      return;
+    }
+    if (req.method === 'GET' && req.url.startsWith('/api/auth/cli/status?')) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ user }));
+      return;
+    }
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end('{}');
+  });
+  await new Promise((resolve, reject) => {
+    upstream.once('error', reject);
+    upstream.listen(0, '127.0.0.1', resolve);
+  });
+  const { port } = upstream.address();
+  return { upstream, url: `http://127.0.0.1:${port}` };
 }
 
 async function stopServer(s) {
@@ -119,4 +184,121 @@ test('API 契约静态标记（服务端路由已注册）', () => {
   for (const marker of ["seg === 'usage-persistence'", "createUsagePersistence(dataFile('usage-stats.json'))", "configureUsagePersistence"]) {
     assert.ok(src.includes(marker), `server.js 缺少持久化接线: ${marker}`);
   }
+});
+
+test('管理员探测将 banned 持久化为永久状态，并由成功探测清除', async (t) => {
+  let mode = 'banned';
+  const fake = await startFakeProbeUpstream(() => mode);
+  const s = await startServer({ CODEBUFF_API: fake.url });
+  t.after(async () => {
+    await stopServer(s);
+    await new Promise((resolve) => fake.upstream.close(resolve));
+  });
+
+  const token = 'server-probe-terminal-token-123456';
+  const add = await fetch(s.base + '/_api/accounts', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ authToken: token, email: 'probe@example.test' }),
+  });
+  assert.equal(add.status, 200);
+  const stateFile = join(s.dir, 'credentials', 'account-state.json');
+  const bannedRaw = await readFile(stateFile, 'utf8');
+  assert.match(bannedRaw, /"state":\s*"banned"/);
+  assert.match(bannedRaw, /"until":\s*null/);
+  assert.doesNotMatch(bannedRaw, new RegExp(token));
+  assert.deepEqual((await add.json()).probe, {
+    state: 'banned',
+    label: '已被封禁',
+    quota: null,
+    retryAfterMs: null,
+    uid: null,
+    accessTier: null,
+    model: null,
+    statusCode: 403,
+    isolatedUntil: null,
+    isolatedPermanent: true,
+  });
+
+  const accounts = await fetch(s.base + '/_api/accounts');
+  assert.equal(accounts.status, 200);
+  const account = (await accounts.json()).accounts[0];
+  for (const forbidden of ['token', 'authToken', 'tokenShort']) {
+    assert.equal(Object.hasOwn(account, forbidden), false, `账号列表不得返回 ${forbidden}`);
+  }
+
+  mode = 'ok';
+  const probe = await fetch(s.base + '/_api/accounts/probe%40example.test');
+  assert.equal(probe.status, 200);
+  const probeBody = await probe.json();
+  assert.equal(probeBody.state, 'ok');
+  assert.equal(probeBody.isolatedPermanent, false);
+  const clearedRaw = await readFile(stateFile, 'utf8');
+  assert.doesNotMatch(clearedRaw, /"state":\s*"banned"/);
+
+  mode = 'nested-banned';
+  const nested = await fetch(s.base + '/_api/accounts/probe%40example.test');
+  assert.equal(nested.status, 200);
+  const nestedBody = await nested.json();
+  assert.equal(nestedBody.state, 'banned');
+  assert.equal(nestedBody.isolatedPermanent, true);
+  assert.equal(Object.hasOwn(nestedBody, 'raw'), false, 'probe 不得回传上游原始响应');
+  const nestedRaw = await readFile(stateFile, 'utf8');
+  assert.match(nestedRaw, /"state":\s*"banned"/);
+});
+
+test('OAuth poll 不返回 authToken，token-only 账号使用 opaque key', async (t) => {
+  const token = 'oauth-token-only-account-1234567890';
+  const fake = await startFakeOauthUpstream({ authToken: token, name: 'OAuth Only' });
+  const s = await startServer({ CODEBUFF_API: fake.url });
+  t.after(async () => {
+    await stopServer(s);
+    await new Promise((resolve) => fake.upstream.close(resolve));
+  });
+
+  const started = await fetch(s.base + '/_api/login/start', { method: 'POST' });
+  assert.equal(started.status, 200);
+  const { fingerprintId } = await started.json();
+  const poll = await fetch(s.base + '/_api/login/poll?fingerprintId=' + encodeURIComponent(fingerprintId));
+  assert.equal(poll.status, 200);
+  const pollBody = await poll.json();
+  assert.equal(pollBody.state, 'done');
+  assert.equal(Object.hasOwn(pollBody.user, 'authToken'), false, 'OAuth 响应不得把凭据发到浏览器');
+
+  const accounts = await fetch(s.base + '/_api/accounts');
+  assert.equal(accounts.status, 200);
+  const account = (await accounts.json()).accounts[0];
+  assert.match(account.key, /^acct-[0-9a-f-]+$/i);
+  assert.equal(account.key.includes(token.slice(0, 12)), false);
+  const stored = JSON.parse(await readFile(join(s.dir, 'credentials', 'freebuff_credentials.json'), 'utf8'));
+  assert.deepEqual(Object.keys(stored.accounts), [account.key], 'opaque key 必须持久化');
+});
+
+test('历史 token 前缀账号 key 会迁移为持久 opaque key', async (t) => {
+  const token = 'legacy-token-only-account-1234567890';
+  const legacyKey = 'token-' + token.slice(0, 12);
+  const fake = await startFakeProbeUpstream(() => 'ok');
+  const s = await startServer({ CODEBUFF_API: fake.url }, async (dir) => {
+    const credentialsDir = join(dir, 'credentials');
+    await mkdir(credentialsDir, { recursive: true });
+    await writeFile(join(credentialsDir, 'freebuff_credentials.json'), JSON.stringify({
+      accounts: {
+        [legacyKey]: { id: legacyKey, name: '', email: '', authToken: token },
+      },
+    }, null, 2));
+  });
+  t.after(async () => {
+    await stopServer(s);
+    await new Promise((resolve) => fake.upstream.close(resolve));
+  });
+
+  const response = await fetch(s.base + '/_api/accounts');
+  assert.equal(response.status, 200);
+  const account = (await response.json()).accounts[0];
+  assert.match(account.key, /^acct-[0-9a-f-]+$/i);
+  assert.notEqual(account.key, legacyKey);
+  assert.equal(account.id, account.key, '泄露 token 前缀的旧 id 也必须同步迁移');
+  const stored = JSON.parse(await readFile(join(s.dir, 'credentials', 'freebuff_credentials.json'), 'utf8'));
+  assert.deepEqual(Object.keys(stored.accounts), [account.key]);
+  assert.equal(JSON.stringify(stored).includes(legacyKey), false);
 });

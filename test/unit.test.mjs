@@ -8,7 +8,7 @@ const src = readFileSync(new URL('../worker.js', import.meta.url), 'utf-8');
 // 使内部函数在沙箱全局可见，供单测直接调用。
 const wrapper = src.replace('export default {', 'const __workerDefault__ = {') +
   '\n\nglobalThis.__workerDefault__ = __workerDefault__;\n' +
-  'globalThis.__unitTestApi__ = { normalizeChatThinking, anthropicThinkingToEffort, namedEffort, normalizeReasoningEffort, collectReasoningTexts, anthropicStopReason, anthropicModelToOpenAI, parseModelAliases, resolveModelAlias, resolveModelConfig, findModelConfig, setTestAliases: (raw) => { currentAliases = parseModelAliases(raw); }, cooldown, cooldownInfo, inCooldown, parseCooldown, nextPacificMidnight: typeof nextPacificMidnight === "function" ? nextPacificMidnight : null, pickToken, releaseToken: typeof releaseToken === "function" ? releaseToken : null, accountPoolExhaustion: typeof accountPoolExhaustion === "function" ? accountPoolExhaustion : null, waitingRoomResponse: typeof waitingRoomResponse === "function" ? waitingRoomResponse : null, pipeUpstreamToClient, pipeUpstreamToResponsesStream, anthropicStream, streamToNonStream, anthropicFromChat, responsesToNonStream, markSessionInvalidated, wasRecentlyInvalidated, singleFlight, sessionRemainingMs, INVALIDATION_WINDOW_MS, SESSION_REUSE_SAFE_MS, SESSION_VERIFY_WINDOW_MS, executeChat, readCallUsage, accountLabel, logCall, callLogSnapshot, readUsageFull, recordRequest, blankUsageTotals, recordAccountObservation, configureUsagePersistence, restoreUsageSnapshot, usageSnapshot, setTestEgressReject: (fn) => { onEgressReject = fn; }, MODEL_TIERS, handleModels };\n';
+  'globalThis.__unitTestApi__ = { normalizeChatThinking, anthropicThinkingToEffort, namedEffort, normalizeReasoningEffort, collectReasoningTexts, anthropicStopReason, anthropicModelToOpenAI, parseModelAliases, resolveModelAlias, resolveModelConfig, findModelConfig, setTestAliases: (raw) => { currentAliases = parseModelAliases(raw); }, cooldown, cooldownInfo, inCooldown, parseCooldown, nextPacificMidnight: typeof nextPacificMidnight === "function" ? nextPacificMidnight : null, pickToken, releaseToken: typeof releaseToken === "function" ? releaseToken : null, accountPoolExhaustion: typeof accountPoolExhaustion === "function" ? accountPoolExhaustion : null, waitingRoomResponse: typeof waitingRoomResponse === "function" ? waitingRoomResponse : null, pipeUpstreamToClient, pipeUpstreamToResponsesStream, anthropicStream, streamToNonStream, anthropicFromChat, responsesToNonStream, markSessionInvalidated, wasRecentlyInvalidated, singleFlight, sessionRemainingMs, INVALIDATION_WINDOW_MS, SESSION_REUSE_SAFE_MS, SESSION_VERIFY_WINDOW_MS, executeChat, readCallUsage, accountLabel, summarizeAccountHealth, logCall, callLogSnapshot, readUsageFull, recordRequest, blankUsageTotals, recordAccountObservation, configureUsagePersistence, restoreUsageSnapshot, usageSnapshot, setTestEgressReject: (fn) => { onEgressReject = fn; }, MODEL_TIERS, handleModels };\n';
 
 // 可编程 fetch mock：测试里可替换 sandbox.fetch，返回可定制的 Response 形状
 // （worker 里用的是 { status, ok, headers, text() } 简化形状）。
@@ -30,7 +30,7 @@ sandbox.globalThis = sandbox;
 vm.createContext(sandbox);
 vm.runInContext(wrapper, sandbox);
 
-const { normalizeChatThinking, anthropicThinkingToEffort, namedEffort, normalizeReasoningEffort, collectReasoningTexts, anthropicStopReason, anthropicModelToOpenAI, parseModelAliases, resolveModelAlias, resolveModelConfig, findModelConfig, setTestAliases, cooldown, cooldownInfo, inCooldown, parseCooldown, nextPacificMidnight, pickToken, releaseToken, accountPoolExhaustion, waitingRoomResponse, pipeUpstreamToClient, pipeUpstreamToResponsesStream, anthropicStream, streamToNonStream, anthropicFromChat, responsesToNonStream, markSessionInvalidated, wasRecentlyInvalidated, singleFlight, sessionRemainingMs, INVALIDATION_WINDOW_MS, SESSION_REUSE_SAFE_MS, SESSION_VERIFY_WINDOW_MS, executeChat, readCallUsage, accountLabel, logCall, callLogSnapshot, readUsageFull, recordRequest, blankUsageTotals, recordAccountObservation, configureUsagePersistence, restoreUsageSnapshot, usageSnapshot, setTestEgressReject, MODEL_TIERS, handleModels } = sandbox.__unitTestApi__;
+const { normalizeChatThinking, anthropicThinkingToEffort, namedEffort, normalizeReasoningEffort, collectReasoningTexts, anthropicStopReason, anthropicModelToOpenAI, parseModelAliases, resolveModelAlias, resolveModelConfig, findModelConfig, setTestAliases, cooldown, cooldownInfo, inCooldown, parseCooldown, nextPacificMidnight, pickToken, releaseToken, accountPoolExhaustion, waitingRoomResponse, pipeUpstreamToClient, pipeUpstreamToResponsesStream, anthropicStream, streamToNonStream, anthropicFromChat, responsesToNonStream, markSessionInvalidated, wasRecentlyInvalidated, singleFlight, sessionRemainingMs, INVALIDATION_WINDOW_MS, SESSION_REUSE_SAFE_MS, SESSION_VERIFY_WINDOW_MS, executeChat, readCallUsage, accountLabel, summarizeAccountHealth, logCall, callLogSnapshot, readUsageFull, recordRequest, blankUsageTotals, recordAccountObservation, configureUsagePersistence, restoreUsageSnapshot, usageSnapshot, setTestEgressReject, MODEL_TIERS, handleModels } = sandbox.__unitTestApi__;
 
 let pass = 0, fail = 0;
 function t(name, fn) {
@@ -540,14 +540,14 @@ await tAsync('首次明确 banned 当次返回 403', async () => {
   }
 });
 
-await tAsync('首次 401 凭据失效当次返回 503', async () => {
+await tAsync('业务 endpoint 首次 401 经 session 确认仍存活时不永久隔离', async () => {
   const chatCalls = installSingleChatFailure(401, { status: 'unauthorized' });
   const env = { FREEBUFF_TOKEN: 'first-upstream-invalid-123456', FREEBUFF_DEBUG: 'false', FREEBUFF_ACCOUNT_STATE: {} };
   const response = await executeChat(env, integrationChat, integrationModel, false, 'chat');
   const body = await response.json();
   if (chatCalls() !== 1) throw new Error(`上游 chat 调用 ${chatCalls()} 次`);
-  if (response.status !== 503 || body.error?.type !== 'account_pool_unavailable') {
-    throw new Error(`首次 401 被误分类: ${response.status} ${JSON.stringify(body)}`);
+  if (response.status !== 503 || body.error?.type !== 'upstream_session_unavailable') {
+    throw new Error(`瞬时 401 被误分类: ${response.status} ${JSON.stringify(body)}`);
   }
 });
 
@@ -736,12 +736,23 @@ t('readCallUsage 非对象 → null；缺字段 → 0', () => {
   const c = readCallUsage({});
   if (c.in !== 0 || c.out !== 0 || c.reasoning !== 0) throw new Error('缺字段应归零');
 });
-t('accountLabel：命中映射→展示名，未命中→token 前 6 位，空 token→空串', () => {
+t('accountLabel：命中映射→展示名，未命中不泄露 token，空 token→空串', () => {
   const env = { FREEBUFF_ACCOUNT_LABELS: { 'tok-abcdef123': '小明' } };
   if (accountLabel(env, 'tok-abcdef123') !== '小明') throw new Error('命中应返回展示名');
-  if (accountLabel(env, 'zzzzzzzz9999') !== 'zzzzzz…') throw new Error('未命中应回落短哈希: ' + accountLabel(env, 'zzzzzzzz9999'));
-  if (accountLabel({}, 'abcdefgh') !== 'abcdef…') throw new Error('无映射也应回落短哈希');
+  if (accountLabel(env, 'zzzzzzzz9999') !== '未命名账号') throw new Error('未命中不得回落 token 前缀');
+  if (accountLabel({}, 'abcdefgh') !== '未命名账号') throw new Error('无映射不得回落 token 前缀');
   if (accountLabel(env, '') !== '') throw new Error('空 token 应返回空串');
+});
+t('健康快照明细只返回 alive/state，不泄露 token 或 uid 前缀', () => {
+  const summary = summarizeAccountHealth(
+    [{ token: 'health-secret-token-123456' }],
+    new Map([['health-secret-token-123456', { alive: true, state: 'ok', uid: 'private-user-id' }]]),
+  );
+  const detail = summary.account_details[0];
+  if (detail.alive !== true || detail.state !== 'ok') throw new Error('健康状态字段不正确');
+  for (const forbidden of ['token', 'uid']) {
+    if (Object.hasOwn(detail, forbidden)) throw new Error(`健康快照泄露 ${forbidden}`);
+  }
 });
 t('logCall：ttfb≤0 记 null，ms 取整，字段落库正确', () => {
   logCall({ account: 'A', model: 'm', effort: 'max', ttfb: 0, ms: 12.7, in: 1, out: 2, reasoning: 0 });
@@ -849,7 +860,7 @@ for (const [name, status, body, expect] of [
 setTestEgressReject(null);
 
 console.log('\n--- 账号隔离与严格选号（新契约）---');
-t('banned resumes_at 支持 RFC3339、Unix 秒、Unix 毫秒', () => {
+t('banned resumes_at 仍按终态处理', () => {
   if (typeof parseCooldown !== 'function') throw new Error('parseCooldown 未导出');
   const now = Date.UTC(2030, 0, 1);
   const target = now + 2 * 3600 * 1000;
@@ -859,14 +870,14 @@ t('banned resumes_at 支持 RFC3339、Unix 秒、Unix 毫秒', () => {
     String(target),
   ]) {
     const got = parseCooldown(JSON.stringify({ status: 'banned', resumes_at: value }), 403, {}, now);
-    if (Math.abs(got - 2 * 3600 * 1000) > 1000) throw new Error(`${value} -> ${got}`);
+    if (got !== 0) throw new Error(`${value} -> ${got}`);
   }
 });
-t('banned 缺少 resumes_at 时至少隔离 24 小时', () => {
+t('banned 缺少 resumes_at 仍按终态处理', () => {
   const got = parseCooldown('{"status":"banned"}', 403, {}, Date.UTC(2030, 0, 1));
-  if (got < 24 * 3600 * 1000) throw new Error('got ' + got);
+  if (got !== 0) throw new Error('got ' + got);
 });
-t('429 按 retryAfterMs、resetAt、Retry-After、太平洋午夜排序', () => {
+t('429 按 retryAfterMs、resetAt、Retry-After、短退避排序', () => {
   const now = Date.UTC(2030, 0, 1, 16, 0, 0);
   const direct = parseCooldown('{"retryAfterMs":123456}', 429, {}, now);
   if (direct !== 123456) throw new Error('retryAfterMs 未优先: ' + direct);
@@ -876,8 +887,8 @@ t('429 按 retryAfterMs、resetAt、Retry-After、太平洋午夜排序', () => 
   if (header !== 17000) throw new Error('Retry-After 未生效: ' + header);
   const human = parseCooldown('rate limited; try again in 5m', 429, {}, now);
   if (human !== 300000) throw new Error('文本冷却未保留兼容: ' + human);
-  const midnight = parseCooldown('{}', 429, {}, now);
-  if (!(midnight > 0 && midnight < 24 * 3600 * 1000)) throw new Error('太平洋午夜兜底异常: ' + midnight);
+  const generic = parseCooldown('{}', 429, {}, now);
+  if (generic !== 60 * 1000) throw new Error('generic 429 短退避异常: ' + generic);
 });
 await tAsync('waiting-room 返回结构化 503 和 Retry-After', async () => {
   if (typeof waitingRoomResponse !== 'function') throw new Error('waitingRoomResponse 未导出');
@@ -1003,6 +1014,19 @@ t('池耗尽分类为 403/429/503', () => {
   if (quota.status !== 429 || quota.retryAfterMs < 221000 || quota.retryAfterMs > 222000) throw new Error('全限流应 429: ' + JSON.stringify(quota));
   const mixed = accountPoolExhaustion({ FREEBUFF_TOKEN: 'busy-mixed-123456' });
   if (mixed.status !== 503) throw new Error('混合/忙应 503: ' + JSON.stringify(mixed));
+});
+t('全凭据终态池耗尽应返回 403 而不是 account_pool_unavailable', () => {
+  const env = {
+    FREEBUFF_TOKEN: 'terminal-invalid-123456,terminal-manual-123456',
+    FREEBUFF_ACCOUNT_STATE: {
+      'terminal-invalid-123456': { state: 'token_invalid', until: null },
+      'terminal-manual-123456': { state: 'manual_disabled', until: null },
+    },
+  };
+  const result = accountPoolExhaustion(env);
+  if (result.status !== 403 || result.type !== 'account_terminal') {
+    throw new Error('全终态池应 403/account_terminal: ' + JSON.stringify(result));
+  }
 });
 t('429 观测与额度冷却组合仍返回 429', () => {
   const token = 'observed-quota-123456';
