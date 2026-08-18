@@ -14,6 +14,8 @@ const LOG_POLL_MS = 3000;
 const S = {
   accounts: [], health: {}, aliases: {},
   models: [], proxy: null, usage: null,
+  // 分享 key：keys 是配置，keyStats 是 worker 进程内的归账（按备注名 join）
+  keys: [], keyStats: {}, ownerName: '主 Key', keysLocked: false,
   build: '', buildUrl: '', repoUrl: '', trackRef: '', latest: '',
 };
 
@@ -152,6 +154,8 @@ function callLog(calls) {
       at: n('at'),
       // 详情里的「节点」在本项目改为调度的账号名（见 worker.js accountLabel）
       account: String(c.account ?? '').trim(),
+      // 发这条的客户端 key（备注名，不是明文）。'' = 加多 key 之前的历史行
+      key: String(c.key ?? '').trim(),
       model: String(c.model ?? '').trim(),
       // '' 保留原样 —— 前端显示 '—'，表示没发这个字段（随上游默认）
       effort: String(c.effort ?? '').trim(),
@@ -436,6 +440,174 @@ async function saveAliases(next) {
   }
 }
 
+// ── 分享 Key ────────────────────────────────────────────
+// 「模型与 Key」卡的第二页。一个表单管新建与编辑：keyEditing 有值就是编辑那把
+// （PATCH），空就是发新的（POST）—— 省掉第二套 DOM 和第二条提交路径。
+let keyEditing = null;
+
+function keyMask(key) {
+  return key.length > 14 ? `${key.slice(0, 8)}…${key.slice(-4)}` : key;
+}
+
+/** 可用模型多选框的选项。已存的白名单模型即使当前模型表里没有也保留，
+    否则编辑一把限了「暂时拉不到的模型」的 key，一保存就把白名单清空了。 */
+function fillKeyModelSelect(selected = []) {
+  const sel = $('newKeyModels');
+  const ids = (Array.isArray(S.models) ? S.models.map((m) => m.id) : []).slice();
+  for (const id of selected) if (!ids.includes(id)) ids.push(id);
+  sel.replaceChildren(...ids.map((id) => {
+    const opt = document.createElement('option');
+    opt.value = id;
+    opt.textContent = id;
+    opt.selected = selected.includes(id);
+    return opt;
+  }));
+}
+
+function resetKeyForm() {
+  keyEditing = null;
+  $('newKeyName').value = '';
+  $('newKeyConcurrency').value = '1';   // 并发默认 1：免费通道同号并发 >1 就出问题
+  $('newKeyDaily').value = '0';
+  fillKeyModelSelect([]);
+  $('keyAdd').textContent = '发一把新 Key';
+  $('keyCancel').hidden = true;
+}
+
+function fillKeyForm(k) {
+  keyEditing = k.key;
+  $('newKeyName').value = k.name || '';
+  $('newKeyConcurrency').value = String(k.concurrency ?? 1);
+  $('newKeyDaily').value = String(k.dailyLimit ?? 0);
+  fillKeyModelSelect(Array.isArray(k.models) ? k.models : []);
+  $('keyAdd').textContent = '保存修改';
+  $('keyCancel').hidden = false;
+  $('newKeyName').focus();
+}
+
+function renderKeys() {
+  const list = Array.isArray(S.keys) ? S.keys : [];
+  $('keyCount').textContent = `${list.length} 把`;
+  const body = $('keyBody');
+  if (!list.length) {
+    body.innerHTML = '<tr><td colspan="7" class="empty">'
+      + (S.keysLocked
+        ? '未设置 ADMIN_PASSWORD,不能发分享 Key —— 拿到面板地址的人都能进来发 Key'
+        : '还没有分享 Key。下面填个备注名就能发一把,默认并发 1、不限模型。')
+      + '</td></tr>';
+  } else {
+    body.innerHTML = list.map((k) => {
+      const st = S.keyStats[k.name] || {};
+      const models = Array.isArray(k.models) && k.models.length ? k.models.join(', ') : '不限';
+      const running = st.inFlight > 0 ? ` · 在跑 ${st.inFlight}` : '';
+      return `<tr class="${k.disabled ? 'key-off' : ''}">
+        <td><span class="nm">${esc(k.name)}</span>${k.disabled ? ' <span class="pill">已停用</span>' : ''}</td>
+        <td><code title="${esc(k.key)}">${esc(keyMask(k.key))}</code></td>
+        <td>${esc(String(k.concurrency))}</td>
+        <td>${k.dailyLimit > 0 ? esc(String(k.dailyLimit)) : '不限'}</td>
+        <td class="key-models-cell mono" title="${esc(models)}">${esc(models)}</td>
+        <td class="mono">${fmtCount(st.dayCount || 0)} / ${fmtCount(st.total || 0)}${running}</td>
+        <td class="action-col">
+          <button class="btn tiny" data-kcopy="${esc(k.key)}">复制</button>
+          <button class="btn tiny" data-kedit="${esc(k.key)}">编辑</button>
+          <button class="btn tiny" data-ktoggle="${esc(k.key)}">${k.disabled ? '启用' : '停用'}</button>
+          <button class="btn tiny danger" data-kdel="${esc(k.key)}">删除</button>
+        </td></tr>`;
+    }).join('');
+  }
+
+  body.querySelectorAll('[data-kcopy]').forEach((b) => b.addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(b.dataset.kcopy);
+      toast('已复制 Key', 'ok');
+    } catch { toast('复制失败', 'err'); }
+  }));
+  body.querySelectorAll('[data-kedit]').forEach((b) => b.addEventListener('click', () => {
+    const k = list.find((x) => x.key === b.dataset.kedit);
+    if (k) fillKeyForm(k);
+  }));
+  body.querySelectorAll('[data-ktoggle]').forEach((b) => b.addEventListener('click', async () => {
+    const k = list.find((x) => x.key === b.dataset.ktoggle);
+    if (!k) return;
+    await patchKey(k.key, { disabled: !k.disabled }, k.disabled ? '已启用' : '已停用');
+  }));
+  body.querySelectorAll('[data-kdel]').forEach((b) => b.addEventListener('click', async () => {
+    const k = list.find((x) => x.key === b.dataset.kdel);
+    if (!k) return;
+    if (!await confirmBox({
+      title: '删除分享 Key',
+      text: `删除「${k.name}」后这把 Key 立即失效，正在用它的人会收到 401。继续？`,
+      ok: '删除',
+    })) return;
+    try {
+      await api('/keys/' + encodeURIComponent(k.key), { method: 'DELETE' });
+      if (keyEditing === k.key) resetKeyForm();
+      toast('已删除', 'ok');
+      await loadKeys();
+    } catch (e) { toast('删除失败:' + e.message, 'err'); }
+  }));
+
+  // 模型表是异步来的（/v1/models 比这张表晚），到了就补进多选框，
+  // 顺手保留用户已经勾上的项 —— 1 小时那拍自动刷新不该把选择清掉。
+  fillKeyModelSelect([...$('newKeyModels').selectedOptions].map((o) => o.value));
+}
+
+// 返回是否成功：改名撞重名会被 400 挡回来，那时表单必须留着用户填的内容。
+async function patchKey(key, patch, okMsg) {
+  try {
+    await api('/keys/' + encodeURIComponent(key), { method: 'PATCH', body: JSON.stringify(patch) });
+    $('keyMsg').textContent = okMsg + '，立即生效（无需重启）';
+    toast(okMsg, 'ok');
+    await loadKeys();
+    return true;
+  } catch (e) {
+    $('keyMsg').textContent = '保存失败:' + e.message;
+    toast('保存失败:' + e.message, 'err');
+    return false;
+  }
+}
+
+async function loadKeys() {
+  const r = await api('/keys').catch(() => null);
+  if (!r) return;
+  S.keys = r.keys || [];
+  S.keyStats = r.stats || {};
+  S.ownerName = r.ownerName || S.ownerName;
+  S.keysLocked = r.locked === true;
+  renderKeys();
+}
+
+async function submitKeyForm() {
+  const name = $('newKeyName').value.trim();
+  if (!name) { $('keyMsg').textContent = '请填写备注名（给谁用的）'; return; }
+  const body = {
+    name,
+    concurrency: Number($('newKeyConcurrency').value) || 1,
+    dailyLimit: Number($('newKeyDaily').value) || 0,
+    models: [...$('newKeyModels').selectedOptions].map((o) => o.value),
+  };
+  if (keyEditing) {
+    if (await patchKey(keyEditing, body, '已保存')) resetKeyForm();
+    return;
+  }
+  try {
+    const r = await api('/keys', { method: 'POST', body: JSON.stringify(body) });
+    resetKeyForm();
+    await loadKeys();
+    // 明文只在表里显示掩码，这里把整把 key 直接放进剪贴板：发出去就是要用的那一刻。
+    try {
+      await navigator.clipboard.writeText(r.key.key);
+      $('keyMsg').textContent = `已发出「${name}」，Key 已复制到剪贴板`;
+    } catch {
+      $('keyMsg').textContent = `已发出「${name}」，点行里的「复制」拿完整 Key`;
+    }
+    toast('已发出新 Key', 'ok');
+  } catch (e) {
+    $('keyMsg').textContent = '创建失败:' + e.message;
+    toast('创建失败:' + e.message, 'err');
+  }
+}
+
 // 模型分组 tag：键与顺序由 worker 的 MODEL_TIERS 决定（/v1/models 的 tier 字段），
 // 这里只负责文案。排序已经在 worker 侧做过，前端不再二次排序。
 const MODEL_TIER_LABELS = { free: '免费', us_sg: 'US / SG', limited: '限定' };
@@ -656,6 +828,9 @@ function renderCallLog() {
     // 多少」是判断强度有没有生效最直接的一个数
     sub.textContent = `Token ${fmtTokens(r.total)} · 入 ${fmtTokens(r.in)}`
       + ` · 出 ${fmtTokens(r.out)} · 推理 ${fmtTokens(r.reasoning)}`;
+    // 哪把 key 发的。只在多 key 场景有意义：主 Key 自己用时这行是噪音，
+    // 空值（加多 key 之前的历史行）也不显示。
+    if (r.key && r.key !== S.ownerName) sub.textContent += ` · Key ${r.key}`;
 
     li.append(main, sub);
     return li;
@@ -741,6 +916,7 @@ async function refresh() {
     const proxy = await api('/proxy').catch(() => null);
     const usage = await api('/usage').catch(() => null);
     const usagePersistence = await api('/usage-persistence').catch(() => null);
+    const keys = await api('/keys').catch(() => null);
     if (cfg) {
       S.aliases = cfg.aliases || {};
       S.apiKey = cfg.apiKey || 'freebuff-default-key';
@@ -757,10 +933,16 @@ async function refresh() {
       const toggle = $('usagePersistence');
       if (toggle) toggle.checked = usagePersistence.enabled === true;
     }
+    if (keys) {
+      S.keys = keys.keys || [];
+      S.keyStats = keys.stats || {};
+      S.ownerName = keys.ownerName || S.ownerName;
+      S.keysLocked = keys.locked === true;
+    }
     // /v1/models 是 worker 路由,带 key 头直连
     const models = await rawApi('/v1/models', { headers: { 'Authorization': 'Bearer ' + S.apiKey } }).catch(() => null);
     if (models) S.models = models.data || [];
-    renderStats(); renderAccounts(); renderAliases(); renderModels(); renderProxy(); renderUsageOverview(); renderCallLog();
+    renderStats(); renderAccounts(); renderAliases(); renderKeys(); renderModels(); renderProxy(); renderUsageOverview(); renderCallLog();
     syncColumnBottoms();
   } catch (e) {
     if (e.message !== '未登录') toast('加载失败:' + e.message, 'err');
@@ -818,30 +1000,35 @@ async function refreshCallLogLive() {
 // ── 交互 ────────────────────────────────────────────────
 
 function wire() {
-  // 账号池分段切换:管理 | 添加
-  const segBtns = document.querySelectorAll('.seg-btn[data-pane]');
-  const panes = document.querySelectorAll('.pane[data-pane]');
-  const activatePane = (btn, focus = false) => {
-    const pane = btn.dataset.pane;
-    segBtns.forEach(b => {
-      const active = b === btn;
-      b.classList.toggle('active', active);
-      b.setAttribute('aria-selected', active);
-      b.tabIndex = active ? 0 : -1;
-    });
-    panes.forEach(p => p.hidden = p.dataset.pane !== pane);
-    if (focus) btn.focus();
-  };
-  segBtns.forEach(btn => {
-    btn.addEventListener('click', () => activatePane(btn));
-    btn.addEventListener('keydown', (event) => {
-      if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
-      event.preventDefault();
-      const current = [...segBtns].indexOf(btn);
-      const next = event.key === 'Home' ? 0
-        : event.key === 'End' ? segBtns.length - 1
-        : (current + (event.key === 'ArrowRight' ? 1 : -1) + segBtns.length) % segBtns.length;
-      activatePane(segBtns[next], true);
+  // 分段切换。每个 tablist 各自成组:同页现在有两组(账号池 管理|添加、
+  // 模型与 Key 模型与映射|Key 管理),按 .card 划范围,不然点一组会把另一组的
+  // 分页一起藏掉。.proxy-mode 是 role="group" 且按钮没有 data-pane,不在此列。
+  document.querySelectorAll('.seg[role="tablist"]').forEach((nav) => {
+    const segBtns = nav.querySelectorAll('.seg-btn[data-pane]');
+    const scope = nav.closest('.card') || document;
+    const panes = scope.querySelectorAll(':scope > .pane[data-pane]');
+    const activatePane = (btn, focus = false) => {
+      const pane = btn.dataset.pane;
+      segBtns.forEach(b => {
+        const active = b === btn;
+        b.classList.toggle('active', active);
+        b.setAttribute('aria-selected', active);
+        b.tabIndex = active ? 0 : -1;
+      });
+      panes.forEach(p => p.hidden = p.dataset.pane !== pane);
+      if (focus) btn.focus();
+    };
+    segBtns.forEach(btn => {
+      btn.addEventListener('click', () => activatePane(btn));
+      btn.addEventListener('keydown', (event) => {
+        if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+        event.preventDefault();
+        const current = [...segBtns].indexOf(btn);
+        const next = event.key === 'Home' ? 0
+          : event.key === 'End' ? segBtns.length - 1
+          : (current + (event.key === 'ArrowRight' ? 1 : -1) + segBtns.length) % segBtns.length;
+        activatePane(segBtns[next], true);
+      });
     });
   });
 
@@ -1118,6 +1305,10 @@ function wire() {
   });
   $('newAlias').addEventListener('keydown', e => { if (e.key === 'Enter') $('aliasAdd').click(); });
   $('newAliasTarget').addEventListener('keydown', e => { if (e.key === 'Enter') $('aliasAdd').click(); });
+
+  // 分享 Key：同一个表单管新建与编辑（submit 而不是 click，回车也能提交）
+  $('keyForm').addEventListener('submit', (e) => { e.preventDefault(); submitKeyForm(); });
+  $('keyCancel').addEventListener('click', () => { resetKeyForm(); $('keyMsg').textContent = ''; });
 }
 
 // ── OAuth 轮询 ──────────────────────────────────────────

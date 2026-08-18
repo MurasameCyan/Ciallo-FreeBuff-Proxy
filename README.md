@@ -29,6 +29,7 @@ data/
 ├─ credentials/
 │  ├─ freebuff_credentials.json   # 账号池（token）
 │  ├─ server-key.txt              # 面板 API Key
+│  ├─ api-keys.json               # 分享给别人的 Key（各自限并发/模型/每日）
 │  └─ account-state.json           # 封禁/凭据失效状态（只含 token 哈希）
 └─ aliases.json                   # 自定义模型别名
 ```
@@ -72,6 +73,22 @@ docker compose up -d
 | `FREEBUFF_DATA_DIR` | 否 | 数据目录（账号池/Key/模型映射/内核缓存），容器默认 `/data`，本地默认 `./data` |
 | `FREEBUFF_ACCOUNT_STATE_FILE` | 否 | 封禁/凭据失效状态文件，默认位于数据目录 `credentials/account-state.json` |
 | `FREEBUFF_SESSION_WAIT_MS` | 否 | 同一账号的 session 正忙时最多等它多久（默认 `120000`）。免费额度按账号计且只有个位数，等待比换号省额度；设 `0` 则忙时立刻换号 |
+
+### 分享 Key（发给朋友用）
+
+面板「模型与 Key → Key 管理」可以发额外的 Key，每把各自限：
+
+| 限制 | 默认 | 说明 |
+|---|---|---|
+| 并发 | `1` | 同时在跑的请求数。超了立刻回 `429 key_concurrency_exceeded`，不排队（排队只会让客户端自己超时） |
+| 可用模型 | 不限 | 白名单。这把 Key 拉 `/v1/models` 只看得见白名单里的模型；选了白名单外的回 `403 model_not_allowed` |
+| 每日请求 | 不限 | 按上游额度的重置边界（America/Los_Angeles 日历日）翻页，超了回 `429 key_daily_limit_exceeded` |
+
+- **主 Key**（右上「接入信息」那把）三项全不限，行为与加多 Key 之前完全一致，也不在这张表里。
+- 归账口径是**准入的客户端请求数**，不是上游额度消耗：一次 code review 请求会打两趟上游，失败的请求也算一次。面板按备注名显示「今日 / 累计」，调用日志每行标发起它的 Key。
+- **发 Key 要求先设 `ADMIN_PASSWORD`**：Key 发出去等于把面板地址也发出去了，没设密码时任何拿到地址的人都能进面板加删账号、重置你的 Key。未设置时面板只读，`POST /_api/keys` 直接回 403。
+- 发/改/停用/删除都对下一个请求立刻生效，不用重启。
+- 额度是**账号池共享**的（免费账号每天只有个位数），并发和省额度本质冲突：一个号同一时间只允许一个会话，多人同时用必然占用多个账号。想控成本就把每日上限调低，而不是靠并发。
 
 ## 出口代理（订阅）
 

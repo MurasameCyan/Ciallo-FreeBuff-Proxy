@@ -1,6 +1,9 @@
 const CODEBUFF_API = "https://www.codebuff.com";
 const DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
 const DEFAULT_API_KEY = "freebuff-default-key";
+// 主 Key（部署自带那把）在调用日志/面板里的显示名。server/api-keys.mjs 里有同一个
+// 字面量（worker 得能单文件跑 Cloudflare，不能 import 服务端模块），改这里一起改。
+const OWNER_KEY_NAME = "主 Key";
 const VERSION = "1.9.1";
 const CONTEXT_PRUNER_AGENT = "context-pruner";
 
@@ -479,8 +482,9 @@ export default {
       }, 200);
     }
 
-    const key = getApiKey(request, env);
-    if (!key) {
+    // client = 这把 key 的身份与限额（主 Key 全不限）。往下一路传，闸门与归账都看它。
+    const client = resolveClient(request, env);
+    if (!client) {
       if (url.pathname === "/v1/messages" || url.pathname === "/messages" || url.pathname === "/v1/messages/count_tokens" || url.pathname === "/messages/count_tokens") {
         return anthropicError("Invalid API key", "authentication_error", 401);
       }
@@ -493,19 +497,19 @@ export default {
     cleanCache();
 
     if (request.method === "GET" && (url.pathname === "/v1/models" || url.pathname === "/models")) {
-      return await handleModels();
+      return await handleModels(client);
     }
     if (request.method === "POST" && (url.pathname === "/v1/chat/completions" || url.pathname === "/chat/completions")) {
-      return handleChat(request, env);
+      return handleChat(request, env, client);
     }
     if (request.method === "POST" && (url.pathname === "/v1/responses" || url.pathname === "/responses")) {
-      return handleResponses(request, env);
+      return handleResponses(request, env, client);
     }
     if (request.method === "POST" && (url.pathname === "/v1/messages/count_tokens" || url.pathname === "/messages/count_tokens")) {
       return handleAnthropicCountTokens(request, env);
     }
     if (request.method === "POST" && (url.pathname === "/v1/messages" || url.pathname === "/messages")) {
-      return handleAnthropicMessages(request, env);
+      return handleAnthropicMessages(request, env, client);
     }
     return jsonResponse({ error: { message: "Not found", type: "not_found" } }, 404);
   },
@@ -955,6 +959,9 @@ function logCall(entry) {
   callLogBuf.push({
     at: Date.now(),
     account: String(entry.account ?? "").trim(),
+    // 哪把 key 发的（存备注名，不存明文 key —— 这份数组会整份回给面板）。
+    // "" = 加多 key 之前的历史行/无 key 上下文的内部调用。
+    key: String(entry.key ?? "").trim(),
     model: String(entry.model ?? "").trim(),
     // "" = 没发 reasoning_effort（随上游默认），和"发了 high"是两回事
     effort: String(entry.effort ?? "").trim(),
@@ -1047,10 +1054,11 @@ function restoreUsageSnapshot(src) {
 }
 
 // 记录一次成功调用。firstTokenAt 为空（非流式）时首字记 null。
-function recordChatCall(env, token, mc, effort, t0, firstTokenAt, usage) {
+function recordChatCall(env, token, mc, effort, t0, firstTokenAt, usage, client = null) {
   const u = readCallUsage(usage);
   logCall({
     account: accountLabel(env, token),
+    key: client && client.name ? client.name : "",
     model: mc && mc.id ? mc.id : "",
     effort,
     ttfb: firstTokenAt ? firstTokenAt - t0 : null,
@@ -1063,6 +1071,145 @@ function recordChatCall(env, token, mc, effort, t0, firstTokenAt, usage) {
   recordRequest(mc && mc.id ? mc.id : "", usage, true);
 }
 
+// ---------------------------------------------------------------------------
+// 客户端 key 闸门与归账（多 key）。
+// 每把共享 key 各自限：可用模型白名单、并发请求数（默认 1）、每日请求数。
+// 主 Key 三项全不限，走同一条代码路径。
+//
+// 归账口径：**准入的客户端请求**，不是上游 session 创建数，也不是成功数。
+// ponytail: 请求数与真实额度消耗不是 1:1 —— code review 一次请求打两趟上游、失败
+// 的请求也算一次。选准入而不是成功计数是刻意的：否则一个疯狂重试的客户端可以绕开
+// 每日上限。要精确到额度就得把 client 一路穿到 createSession/startRun，收益不值。
+// ---------------------------------------------------------------------------
+const clientStats = new Map(); // key(明文，只在进程内) -> { name, owner, live[], day, dayCount, total, lastAt }
+// 槽位兜底回收窗口：任何一条释放路径漏了，槽位也不会把 key 永久卡死。
+// ponytail: 这是泄漏兜底，不是超时策略 —— 正常释放走 finally / 流 flush-cancel。
+// 真有超过这个时长的长流，它占的槽位会被下一个请求提前回收，最坏情况是并发短暂超 1。
+const CLIENT_SLOT_STALE_MS = 30 * 60 * 1000;
+
+// 上游额度按 America/Los_Angeles 日历日重置（见 MODELS.md 的额度池说明），每日上限
+// 跟着同一个边界翻页，否则「今日」在我们这边翻了、上游没翻，等于白送一轮预算。
+function quotaDay(now = Date.now()) {
+  try {
+    return new Date(now).toLocaleDateString("en-CA", { timeZone: "America/Los_Angeles" });
+  } catch {
+    return new Date(now).toISOString().slice(0, 10); // 没有完整 ICU 的运行时回落 UTC 日
+  }
+}
+
+function clientStat(client, now = Date.now()) {
+  const id = client.key;
+  let st = clientStats.get(id);
+  if (!st) {
+    st = { name: client.name, owner: client.owner === true, live: [], day: quotaDay(now), dayCount: 0, total: 0, lastAt: null };
+    clientStats.set(id, st);
+  }
+  st.name = client.name;              // 面板改了备注名，历史归账跟着改名，不另起一行
+  const today = quotaDay(now);
+  if (st.day !== today) { st.day = today; st.dayCount = 0; }
+  // 兜底回收：只在这里做，不额外挂定时器
+  if (st.live.length) st.live = st.live.filter((at) => now - at < CLIENT_SLOT_STALE_MS);
+  return st;
+}
+
+// 白名单比对解析后的真实模型 id：客户端只要能自己配别名就能绕开按别名写的白名单。
+function clientModelAllowed(client, mc) {
+  if (!client || !Array.isArray(client.models) || client.models.length === 0) return true;
+  return client.models.includes(mc && mc.id);
+}
+
+// 准入闸门。返回 { error } = 直接回给客户端；否则 { release } 已占用一个槽位。
+function openClientGate(client, mc) {
+  if (!client) return { release: () => {} };   // 没有 key 上下文（内部调用）不设限
+  if (!clientModelAllowed(client, mc)) {
+    return {
+      error: jsonResponse({
+        error: {
+          message: `当前 Key 无权使用模型 ${(mc && mc.id) || ""}；可用模型：${client.models.join(", ")}`,
+          type: "model_not_allowed",
+        },
+      }, 403),
+    };
+  }
+  const now = Date.now();
+  const st = clientStat(client, now);
+  if (client.dailyLimit > 0 && st.dayCount >= client.dailyLimit) {
+    // 到下一个上游重置点的秒数：上游额度和这里的预算同一个边界翻页。
+    const retryAfterSec = secondsToNextQuotaDay(now);
+    return {
+      error: jsonResponse({
+        error: {
+          message: `当前 Key 今日请求已达上限 ${client.dailyLimit} 次,${Math.ceil(retryAfterSec / 3600)} 小时后重置`,
+          type: "key_daily_limit_exceeded",
+        },
+      }, 429, { "Retry-After": String(retryAfterSec), "X-RateLimit-Scope": "api-key" }),
+    };
+  }
+  if (client.concurrency > 0 && st.live.length >= client.concurrency) {
+    // 不排队：排队只会让客户端自己超时，还看不出是被自己的并发限住了。
+    return {
+      error: jsonResponse({
+        error: {
+          message: `当前 Key 并发上限 ${client.concurrency},请等上一个请求结束后重试`,
+          type: "key_concurrency_exceeded",
+        },
+      }, 429, { "Retry-After": "5", "X-RateLimit-Scope": "api-key" }),
+    };
+  }
+  st.live.push(now);
+  st.dayCount++;
+  st.total++;
+  st.lastAt = now;
+  let released = false;
+  return {
+    release: () => {
+      if (released) return;           // flush 与 cancel 都可能来，只放一次
+      released = true;
+      const idx = st.live.indexOf(now);
+      if (idx >= 0) st.live.splice(idx, 1);
+      else if (st.live.length) st.live.shift();   // 时间戳被兜底回收清掉了，扣一个避免负计数
+    },
+  };
+}
+
+function secondsToNextQuotaDay(now = Date.now()) {
+  const today = quotaDay(now);
+  // 从 now 起按小时探到日期翻页；最多 26 小时（覆盖 DST 前后的 23/25 小时日）。
+  for (let h = 1; h <= 26; h++) {
+    const t = now + h * 3600 * 1000;
+    if (quotaDay(t) !== today) return Math.max(60, Math.round((t - now) / 1000));
+  }
+  return 3600;
+}
+
+// 流式响应：Response 已经交出去了，body 还在写。槽位要等 body 到终态才放 ——
+// 正常收尾走 flush，客户端断开/上游出错走 cancel，三条路都覆盖到。
+function releaseOnStreamEnd(release) {
+  return new TransformStream({
+    transform(chunk, ctrl) { ctrl.enqueue(chunk); },
+    flush() { release(); },
+    cancel() { release(); },
+  });
+}
+
+// 面板用的按 key 归账快照。只出备注名，绝不出明文 key（GET /_api/usage 会整份返回）。
+function clientStatsSnapshot() {
+  const now = Date.now();
+  const out = [];
+  for (const st of clientStats.values()) {
+    const today = quotaDay(now);
+    out.push({
+      name: st.name,
+      owner: st.owner,
+      inFlight: st.live.filter((at) => now - at < CLIENT_SLOT_STALE_MS).length,
+      dayCount: st.day === today ? st.dayCount : 0,
+      total: st.total,
+      lastAt: st.lastAt,
+    });
+  }
+  return out.sort((a, b) => b.total - a.total);
+}
+
 // 面板读取用的快照（数组/计数/概况都深拷一层，避免外部改到内部状态）。
 function callLogSnapshot() {
   const usage = usageSnapshot();
@@ -1072,6 +1219,8 @@ function callLogSnapshot() {
     // total（单数）= 客户端请求口径的累计；totals（复数）= 逐次尝试的失败计数。
     total: usage.total,
     byModel: usage.byModel,
+    // byKey = 按客户端 key 归账（多 key 分享给别人时看谁用了多少）。
+    byKey: clientStatsSnapshot(),
     startTime: usage.startTime,
     lastRequest: usage.lastRequest,
   };
@@ -2634,7 +2783,7 @@ async function resolveModelConfig(modelId) {
   return findModelConfig(target);
 }
 
-async function handleChat(request, env) {
+async function handleChat(request, env, client = null) {
   let params;
   try { params = await request.json(); } catch { return jsonResponse({ error: { message: "Invalid JSON", type: "parse_error" } }, 400); }
   const isStream = !!params.stream;
@@ -2643,18 +2792,18 @@ async function handleChat(request, env) {
   if (!mc) return jsonResponse({ error: { message: "Model not available: " + requestedModel, type: "unsupported_model" } }, 400);
   // 顶层 thinking 参数 → reasoning_effort 归一化（新 OpenAI SDK 兼容）
   params = normalizeChatThinking(params);
-  return executeChat(env, params, mc, isStream, "chat", request.signal);
+  return executeChat(env, params, mc, isStream, "chat", request.signal, client);
 }
 
 // OpenAI Responses API（/v1/responses）入口：把 Responses 请求翻译成 chat completions 上游调用
-async function handleResponses(request, env) {
+async function handleResponses(request, env, client = null) {
   let params;
   try { params = await request.json(); } catch { return jsonResponse({ error: { message: "Invalid JSON", type: "parse_error" } }, 400); }
   const isStream = !!params.stream;
   const requestedModel = params.model || DEFAULT_MODEL;
   const mc = await resolveModelConfig(requestedModel);
   if (!mc) return jsonResponse({ error: { message: "Model not available: " + requestedModel, type: "unsupported_model" } }, 400);
-  return executeChat(env, responsesToChatParams(params, mc), mc, isStream, "responses", request.signal);
+  return executeChat(env, responsesToChatParams(params, mc), mc, isStream, "responses", request.signal, client);
 }
 
 // Responses API 请求 → chat completions 参数（字段名/结构翻译）
@@ -2919,8 +3068,34 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode, requestSig
   return jsonResponse({ error: { message: lastErrMsg || "code reviewer failed", type: "api_error" } }, 502);
 }
 
+// 客户端 key 闸门 + 上游执行。闸门只此一处：chat / responses / anthropic / code review
+// 四条入口全都收口到这里，不必在十几个 return 分支上各贴一遍限额判断。
+async function executeChat(env, chatParams, mc, isStream, mode, requestSignal = null, client = null) {
+  const gate = openClientGate(client, mc);
+  if (gate.error) return gate.error;
+  let resp;
+  try {
+    resp = await executeChatPooled(env, chatParams, mc, isStream, mode, requestSignal, client);
+  } catch (e) {
+    gate.release();
+    throw e;
+  }
+  // 流式成功：Response 已经能返回了，body 还在写 —— 槽位得等 body 到终态才放，
+  // 否则 concurrency:1 的 key 能同时挂着无限条流。错误响应 body 是完整 JSON，立即放。
+  if (isStream && resp && resp.body && resp.status < 400) {
+    return new Response(resp.body.pipeThrough(releaseOnStreamEnd(gate.release)), {
+      status: resp.status,
+      statusText: resp.statusText,
+      headers: resp.headers,
+    });
+  }
+  gate.release();
+  return resp;
+}
+
 // chat completions 与 responses 共用的上游执行：多号重试 + session/run 生命周期 + 流式/非流式出口
-async function executeChat(env, chatParams, mc, isStream, mode, requestSignal = null) {
+// client 只用于调用日志归账（限额已在 executeChat 闸门里判完）。
+async function executeChatPooled(env, chatParams, mc, isStream, mode, requestSignal = null, client = null) {
   if (isCodeReviewRequest(chatParams)) return executeCodeReview(env, chatParams, mc, isStream, mode, requestSignal);
   syncAccountState(env);
   const debug = env.FREEBUFF_DEBUG === "true";
@@ -3095,7 +3270,7 @@ async function executeChat(env, chatParams, mc, isStream, mode, requestSignal = 
         // 流式：首字延迟与 usage 只有管道跑完才知道，用 onComplete 收尾记一行。
         const onDone = async (info) => {
           try {
-            recordChatCall(env, token, mc, effort, t0, info && info.firstTokenAt, info && info.usage);
+            recordChatCall(env, token, mc, effort, t0, info && info.firstTokenAt, info && info.usage, client);
           } finally {
             releaseToken(token);
           }
@@ -3108,12 +3283,12 @@ async function executeChat(env, chatParams, mc, isStream, mode, requestSignal = 
 
       if (mode === "responses") {
         const out = await responsesToNonStream(resp.body, mc);
-        recordChatCall(env, token, mc, effort, t0, null, out && out.usage);
+        recordChatCall(env, token, mc, effort, t0, null, out && out.usage, client);
         return jsonResponse(out, 200);
       }
 
       const agg = await streamToNonStream(resp.body, mc.upstream);
-      recordChatCall(env, token, mc, effort, t0, null, agg && agg.usage);
+      recordChatCall(env, token, mc, effort, t0, null, agg && agg.usage, client);
       return jsonResponse(agg, 200);
     } catch (e) {
       if (requestSignal?.aborted) throw e;
@@ -3528,7 +3703,7 @@ function anthropicStream(mc, opts = {}) {
   });
 }
 
-async function handleAnthropicMessages(request, env) {
+async function handleAnthropicMessages(request, env, client = null) {
   let body;
   try { body = await request.json(); } catch { return anthropicError("Invalid JSON", "invalid_request_error", 400); }
   const openaiModel = anthropicModelToOpenAI(body.model);
@@ -3537,7 +3712,7 @@ async function handleAnthropicMessages(request, env) {
   const mc = await resolveModelConfig(openaiModel);
   if (!mc) return anthropicError("Model not available: " + (body.model || ""), "invalid_request_error", 400);
   const chat = anthropicToChat(body, mc);
-  const response = await executeChat(env, chat, mc, !!chat.stream, "chat", request.signal);
+  const response = await executeChat(env, chat, mc, !!chat.stream, "chat", request.signal, client);
   if (response.status >= 400) {
     let msg = "Upstream error"; try { const data = await response.json(); msg = data?.error?.message || msg; } catch {}
     const types = { 400: "invalid_request_error", 401: "authentication_error", 403: "permission_error", 429: "rate_limit_error", 503: "overloaded_error" };
@@ -4012,7 +4187,7 @@ function cleanCache() {
 // 该接口会占用账号 session，而 Freebuff 一个号同一时间只能一个客户端在线，
 // 查询会干扰/顶掉正在进行的 chat 会话（428 waiting_room_required）。
 // 自定义别名不在此展示（面板单独管理），避免污染客户端模型列表。
-async function handleModels() {
+async function handleModels(client = null) {
   let modelList = MODELS;
   try {
     const dyn = await refreshDynamicModelsIfStale();
@@ -4020,6 +4195,11 @@ async function handleModels() {
       modelList = mergeModelTables(MODELS, dyn.models);
     }
   } catch {}
+  // 有白名单的 key 只看得见白名单里的模型：客户端拉不到的模型不会被它选中，
+  // 少一轮「选了→403」的往返。白名单为空 = 不限，主 Key 同理。
+  if (client && Array.isArray(client.models) && client.models.length) {
+    modelList = modelList.filter((m) => client.models.includes(m.id));
+  }
   const data = modelList
     .map((m) => {
       // 实测（2026-08-15）：免费账号只有 Flash / MiMo 2.5 两个模型能建会话
@@ -4040,12 +4220,37 @@ async function handleModels() {
   return jsonResponse({ object: "list", data }, 200, { "X-Freebuff2api-Version": VERSION });
 }
 
-function getApiKey(request, env) {
-  const expected = (env.API_KEY || env.FREEBUFF_API_KEY || DEFAULT_API_KEY).trim();
-  if (!expected) return null;
+// 请求带的 key。Bearer 优先，其次 x-api-key。
+function presentedApiKey(request) {
   const auth = request.headers.get("Authorization") || "";
-  if (auth.startsWith("Bearer ")) return auth.slice(7) === expected ? expected : null;
-  return request.headers.get("x-api-key") === expected ? expected : null;
+  if (auth.startsWith("Bearer ")) return auth.slice(7);
+  return request.headers.get("x-api-key") || "";
+}
+
+// 鉴权：主 Key（部署自带，不设限）或共享 key（env.FREEBUFF_API_KEYS，各自限
+// 并发/模型/每日上限）。返回客户端描述符，null = 无效 key。
+// 主 Key 的 limits 全为不限，所以下游闸门一律按同一条路径走，不必到处判"是不是主 Key"。
+function resolveClient(request, env) {
+  const presented = presentedApiKey(request).trim();
+  if (!presented) return null;
+  const owner = (env.API_KEY || env.FREEBUFF_API_KEY || DEFAULT_API_KEY).trim();
+  if (owner && presented === owner) {
+    return { key: presented, name: OWNER_KEY_NAME, concurrency: 0, models: [], dailyLimit: 0, owner: true };
+  }
+  const shared = Array.isArray(env.FREEBUFF_API_KEYS) ? env.FREEBUFF_API_KEYS : [];
+  for (const k of shared) {
+    if (!k || typeof k !== "object" || String(k.key || "") !== presented) continue;
+    if (k.disabled === true) return null;   // 停用的 key 当无效 key，不泄露"这把存在但被停了"
+    return {
+      key: presented,
+      name: String(k.name || "").trim() || presented.slice(0, 10),
+      concurrency: Number.isFinite(Number(k.concurrency)) ? Math.max(1, Math.floor(Number(k.concurrency))) : 1,
+      models: Array.isArray(k.models) ? k.models.map((m) => String(m || "").trim()).filter(Boolean) : [],
+      dailyLimit: Number.isFinite(Number(k.dailyLimit)) ? Math.max(0, Math.floor(Number(k.dailyLimit))) : 0,
+      owner: false,
+    };
+  }
+  return null;
 }
 
 function jsonResponse(obj, status, extraHeaders = {}) {

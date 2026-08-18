@@ -141,14 +141,21 @@
       </div>
     </section>
 
-    <!-- ── 模型配置：模型映射 + 模型列表 ─────────────────── -->
+    <!-- ── 模型配置：模型映射 + 模型列表 + 分享 Key（同卡分页） ─── -->
     <section class="card model-workspace-card alias-card models-card" id="modelWorkspace" aria-labelledby="h-model-workspace">
       <div class="card-head model-workspace-head">
         <div class="card-title">
-          <p class="eyebrow">模型配置</p>
-          <h2 id="h-model-workspace">模型与映射</h2>
+          <p class="eyebrow">接入配置</p>
+          <h2 id="h-model-workspace">模型与 Key</h2>
         </div>
+        <nav class="seg" role="tablist" aria-label="模型与 Key 视图">
+          <button type="button" class="seg-btn active" id="tab-models" data-pane="models" role="tab"
+                  aria-selected="true" aria-controls="pane-models" tabindex="0">模型与映射</button>
+          <button type="button" class="seg-btn" id="tab-keys" data-pane="keys" role="tab"
+                  aria-selected="false" aria-controls="pane-keys" tabindex="-1">Key 管理</button>
+        </nav>
       </div>
+      <div class="pane" id="pane-models" data-pane="models" role="tabpanel" aria-labelledby="tab-models">
       <div class="model-workspace-grid">
         <section class="alias-editor" id="aliasEditor" aria-labelledby="h-alias">
           <div class="subcard-head">
@@ -180,6 +187,50 @@
           </div>
           <ul class="models" id="models"></ul>
           <p class="empty" id="models-empty" hidden>加载中…</p>
+        </section>
+      </div>
+      </div>
+
+      <!-- 分享给别人的 key。主 Key（右上「接入信息」那把）不在这张表里：它不限并发、
+           不限模型、不计每日上限，行为与加多 key 之前一致，也不能在这里删掉。 -->
+      <div class="pane key-pane" id="pane-keys" data-pane="keys" role="tabpanel" aria-labelledby="tab-keys" hidden>
+        <section class="key-editor" id="keyEditor" aria-labelledby="h-keys">
+          <div class="subcard-head">
+            <div>
+              <h3 id="h-keys">分享 Key</h3>
+              <p class="hint">每把 key 各自限并发、可用模型与每日请求数。</p>
+            </div>
+            <span class="count" id="keyCount"></span>
+          </div>
+          <div class="table-scroll" role="region" tabindex="0" aria-label="分享 Key 列表，可横向滚动">
+            <table class="tbl key-table">
+              <thead><tr><th>备注</th><th>Key</th><th>并发</th><th>每日</th><th>可用模型</th><th>今日 / 累计</th><th class="action-col">操作</th></tr></thead>
+              <tbody id="keyBody"><tr><td colspan="7" class="empty">加载中…</td></tr></tbody>
+            </table>
+          </div>
+
+          <!-- 同一个表单管新建与编辑：点行里的「编辑」就填进来、按钮改成保存。
+               省掉第二套 DOM 与第二条提交路径。 -->
+          <form class="key-add" id="keyForm">
+            <div class="key-add-row">
+              <input type="text" id="newKeyName" placeholder="备注名，如 小明" autocomplete="off" spellcheck="false" maxlength="40" aria-label="Key 备注名">
+              <label class="key-num"><span class="lbl">并发</span>
+                <input type="number" id="newKeyConcurrency" min="1" max="32" step="1" value="1" aria-label="并发上限，默认 1">
+              </label>
+              <label class="key-num"><span class="lbl">每日</span>
+                <input type="number" id="newKeyDaily" min="0" max="100000" step="1" value="0" aria-label="每日请求上限，0 表示不限">
+              </label>
+            </div>
+            <label class="key-models">
+              <span class="lbl">可用模型<span class="hint">（不选 = 不限；按住 Ctrl/⌘ 多选）</span></span>
+              <select id="newKeyModels" multiple size="4" aria-describedby="keyMsg"></select>
+            </label>
+            <div class="key-form-actions">
+              <button type="submit" class="btn primary" id="keyAdd">发一把新 Key</button>
+              <button type="button" class="btn ghost" id="keyCancel" hidden>取消编辑</button>
+            </div>
+          </form>
+          <p class="hint key-message" id="keyMsg" aria-live="polite"></p>
         </section>
       </div>
     </section>

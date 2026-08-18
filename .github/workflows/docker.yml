@@ -45,9 +45,11 @@ jobs:
       - run: node --check worker.js
       - run: node --check server.js
       - run: node --check server/account-state.mjs
+      - run: node --check server/api-keys.mjs
       - run: node test/unit.test.mjs
       - run: node --test test/account-state.test.mjs
       - run: node --test test/account-safety-worker.test.mjs
+      - run: node --test test/api-keys.test.mjs
       - run: node --test test/server-api.test.mjs
       - run: node test/proxy.test.mjs
       - run: node --test test/usage-persistence.test.mjs

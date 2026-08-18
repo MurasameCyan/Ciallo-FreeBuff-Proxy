@@ -23,6 +23,7 @@ import {
   noteEgressReject,
 } from './server/proxy.mjs';
 import { createUsagePersistence } from './server/usage-persistence.mjs';
+import { createApiKeyStore, OWNER_KEY_NAME } from './server/api-keys.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -83,6 +84,9 @@ const CFG = {
 };
 
 const accountStateStore = createAccountStateStore(CFG.accountStateFile);
+
+// 分享给别人的 key（主 Key 不在里面，见 server/api-keys.mjs 顶部说明）
+const apiKeyStore = createApiKeyStore(dataFile('credentials', 'api-keys.json'));
 
 // === API Key 持久化（面板「重置 Key」生成的随机 key 存这里，env 未设时生效） ===
 const KEY_FILE = dataFile('credentials', 'server-key.txt');
@@ -567,8 +571,10 @@ function buildWorkerEnv() {
     API_KEY: env.API_KEY || '',
     FREEBUFF_DEBUG: env.FREEBUFF_DEBUG || 'false',
     CODEBUFF_API: env.CODEBUFF_API || '',
-    RELAY_KEY: env.RELAY_KEY || '',
     MODEL_ALIASES: aliasStr,
+    // 分享给别人的那些 key（主 Key 走 FREEBUFF_API_KEY，不在这份表里）。
+    // 每条各自限并发/模型/每日上限，worker 只读。
+    FREEBUFF_API_KEYS: apiKeyStore.descriptors(),
     // 调用日志的"调度的账号名"：token→展示名映射，worker 记录时解析。
     FREEBUFF_ACCOUNT_LABELS: accountLabels(),
     // 出口代理注入（有订阅且 mihomo 就绪时返回走代理的 fetch；否则 undefined → worker 直连）
@@ -932,7 +938,61 @@ async function handleWebApi(req, res, url) {
     return err(res, 405, 'method not allowed');
   }
 
+  // ---------- 分享 Key 管理（写入 credentials/api-keys.json，热生效） ----------
+  // GET    /_api/keys            → { keys, stats, ownerName, locked }
+  // POST   /_api/keys            { name, concurrency, models, dailyLimit } → 新发一把
+  // PATCH  /_api/keys/:key       同上字段，传哪个改哪个（含 disabled）
+  // DELETE /_api/keys/:key
+  // 热生效同 aliases.json：buildWorkerEnv() 每次请求重读文件，改完立刻作用于下一个请求。
+  if (seg === 'keys') {
+    if (method === 'GET') {
+      // 归账按备注名 join（worker 侧不外传明文 key）。
+      const byKey = (typeof handler.getCallLog === 'function' ? handler.getCallLog().byKey : null) || [];
+      const stats = {};
+      for (const row of byKey) if (row && row.name) stats[row.name] = row;
+      return json(res, 200, {
+        keys: apiKeyStore.list(),
+        stats,
+        ownerName: OWNER_KEY_NAME,
+        // 没设面板密码时不许发新 key：分享出去就等于把「能发 key 的面板」也分享了。
+        locked: !CFG.adminPassword,
+        file: apiKeyStore.file,
+      });
+    }
+    if (method === 'POST' && !sub) {
+      if (!CFG.adminPassword) {
+        return err(res, 403, '请先设置 ADMIN_PASSWORD 再发新 Key —— 否则拿到地址的人都能打开面板发 Key', 'admin_password_required');
+      }
+      let body;
+      try { body = await readJsonObject(req); } catch (e) { return err(res, 400, e.message); }
+      try {
+        return json(res, 200, { ok: true, key: apiKeyStore.add(body) });
+      } catch (e) { return keyStoreError(res, e); }
+    }
+    if (method === 'PATCH' && sub) {
+      let body;
+      try { body = await readJsonObject(req); } catch (e) { return err(res, 400, e.message); }
+      try {
+        return json(res, 200, { ok: true, key: apiKeyStore.update(decodeURIComponent(sub), body) });
+      } catch (e) { return keyStoreError(res, e); }
+    }
+    if (method === 'DELETE' && sub) {
+      try {
+        apiKeyStore.remove(decodeURIComponent(sub));
+        return json(res, 200, { ok: true });
+      } catch (e) { return keyStoreError(res, e); }
+    }
+    return err(res, 405, 'method not allowed');
+  }
+
   return err(res, 404, 'not found');
+}
+
+// key 存储的错误 → HTTP：配置不合法 400，key 不存在 404，其余（写盘失败）500。
+function keyStoreError(res, e) {
+  if (e.code === 'INVALID_KEY_CONFIG') return err(res, 400, e.message, 'invalid_key_config');
+  if (e.code === 'KEY_NOT_FOUND') return err(res, 404, e.message, 'not_found');
+  return err(res, 500, '写入 api-keys.json 失败: ' + e.message, 'io_error');
 }
 
 function sanitizeUser(user) {

@@ -156,7 +156,15 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
   min-height: 0;
   display: flex; flex-direction: column;
 }
-.col-main > .model-workspace-card > .model-workspace-grid { flex: 1 1 auto; }
+/* 分页后网格多了一层 .pane：高度得穿过它传下去，否则左列的高度差没人吸收，
+   两列底边又会错开（.workspace-col 的对齐契约见上面那段注释）。 */
+.col-main > .model-workspace-card > .pane {
+  flex: 1 1 auto; min-height: 0;
+  display: flex; flex-direction: column;
+}
+.col-main > .model-workspace-card > .pane[hidden] { display: none; }
+.col-main > .model-workspace-card > .pane > .model-workspace-grid,
+.col-main > .model-workspace-card > .pane > .key-editor { flex: 1 1 auto; }
 .col-side > .usage-card { display: flex; flex-direction: column; min-height: 360px; }
 /* 概况 360 起:让内部 2×2 吃满卡高,四格均分不留空洞。 */
 .col-side > .usage-card .usage-grid { flex: 1 1 auto; grid-auto-rows: 1fr; }
@@ -553,6 +561,39 @@ select:disabled { opacity: .5; cursor: not-allowed; }
   overflow: auto;
 }
 .alias-editor .alias-add { margin-top: 20px; }  /* 添加行与表格之间留白 20px（下方由 .alias-message + 卡片内边距共 20px 对称） */
+
+/* ── 分享 Key 分页 ─────────────────────────────────────
+   与 .alias-editor 同一套内衬（同卡的另一页，视觉要一致），只是表格列多。 */
+.key-editor {
+  min-width: 0; padding: 16px;
+  border: 1px solid var(--line); border-radius: var(--r-sm);
+  background: color-mix(in oklab, var(--card-2) 72%, transparent);
+  display: flex; flex-direction: column;
+}
+.key-editor .table-scroll {
+  height: var(--model-list-height, 240px);
+  flex: 1 1 auto; min-height: 96px; overflow: auto;
+}
+.key-table code { font-size: 11px; }
+.key-table .key-off { opacity: .55; }          /* 停用的行整行压暗，一眼分得出 */
+.key-table .key-models-cell { max-width: 220px; }
+.key-add { display: grid; gap: 10px; margin-top: 20px; }
+.key-add-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 8px; align-items: end; }
+.key-add-row input[type="text"] { margin: 0; }
+.key-num { display: grid; gap: 4px; }
+.key-num .lbl { margin: 0; }
+.key-num input { margin: 0; width: 84px; }
+.key-models { display: grid; gap: 4px; }
+.key-models .lbl { margin: 0; }
+.key-models .hint { font-weight: 400; }
+.key-models select { margin: 0; }
+.key-form-actions { display: flex; gap: 8px; }
+.key-form-actions .btn { margin: 0; }
+.key-message { margin-top: 10px; }
+@media (max-width: 660px) {
+  .key-add-row { grid-template-columns: minmax(0, 1fr); }
+  .key-num input { width: 100%; }
+}
 
 /* ── 代理订阅卡 ───────────────────────────────────────── */
 .proxy-card {

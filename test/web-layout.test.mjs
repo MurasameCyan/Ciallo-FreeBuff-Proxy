@@ -229,8 +229,8 @@ assert.ok(html.indexOf('data-copy-key') > html.indexOf('id="usageCard"'),
 assert.match(html,
   /class="model-workspace-grid"[\s\S]*class="alias-editor"[\s\S]*class="model-catalog"/s,
   '模型配置内部顺序必须为模型映射 | 模型列表');
-assert.match(html, /id="h-model-workspace">模型与映射<\/h2>/,
-  '模型卡标题必须简化为“模型与映射”');
+assert.match(html, /id="h-model-workspace">模型与 Key<\/h2>/,
+  '模型卡标题必须是“模型与 Key”（同卡两页：模型与映射 | Key 管理）');
 assert.match(html, /<h3 id="h-models">模型列表<\/h3>/,
   '右侧子卡标题必须是“模型列表”（原“可用模型”）');
 assert.ok(!/^\.models li\s*\{[^}]*(?:border:|background:)/m.test(css),
@@ -513,7 +513,43 @@ assert.ok(delFlow.lastIndexOf('refresh()') > delFlow.indexOf('renderAccounts()')
 assert.ok(!/await\s+refresh\(\)/.test(delFlow),
   'refresh() 不得 await：它会在服务端逐个探号，await 就把等待又搬回到手感上');
 
-// 所有 id 必须唯一，避免重排后 renderStats/renderModels 写入错误节点。
+// ── 分享 Key：「模型与 Key」卡的第二页 ────────────────────
+// 刻意不新开一张卡：工作区的底边对齐契约（上面那段收缩链）是按四张卡算的，
+// 多一张左列就得重新分配收缩顺序。分页只在卡内换内容，两列高度关系不变。
+for (const id of ['tab-models', 'tab-keys', 'pane-models', 'pane-keys', 'keyBody', 'keyForm',
+  'newKeyName', 'newKeyConcurrency', 'newKeyDaily', 'newKeyModels', 'keyAdd', 'keyCancel', 'keyMsg', 'keyCount']) {
+  assert.match(html, new RegExp(`id=["']${id}["']`), `分享 Key 分页丢失 DOM 绑定 #${id}`);
+}
+assert.match(html, /id="tab-models"[^>]*aria-controls="pane-models"/s, '模型与映射标签必须关联面板');
+assert.match(html, /id="tab-keys"[^>]*aria-controls="pane-keys"/s, 'Key 管理标签必须关联面板');
+assert.match(html, /id="tab-models"[^>]*aria-selected="true"/s,
+  '默认页必须还是「模型与映射」：加 Key 管理不该改变打开面板时看到的东西');
+assert.match(html, /id="pane-keys"[^>]*hidden/s, 'Key 页默认收起');
+assert.match(html, /class="pane"[^>]*id="pane-models"[\s\S]*class="model-workspace-grid"/s,
+  '模型与映射整块必须整体搬进 pane-models，内部结构不动');
+// 同页现在有两组 tablist（账号池 管理|添加、模型与 Key 模型与映射|Key 管理）。
+// 全局 querySelectorAll 会让点一组把另一组的页一起藏掉。
+assert.match(app, /querySelectorAll\('\.seg\[role="tablist"\]'\)[\s\S]*?nav\.closest\('\.card'\)[\s\S]*?querySelectorAll\(':scope > \.pane\[data-pane\]'\)/s,
+  '分页切换必须按 .card 划范围，且只认卡的直接子 pane');
+assert.match(css, /\.col-main\s*>\s*\.model-workspace-card\s*>\s*\.pane\s*\{[^}]*flex:\s*1\s+1\s+auto[^}]*min-height:\s*0/s,
+  '多出的 .pane 层必须把高度继续往下传，否则左列的高度差没人吸收，两列底边又会错开');
+assert.match(css, /\.col-main\s*>\s*\.model-workspace-card\s*>\s*\.pane\[hidden\]\s*\{[^}]*display:\s*none/s,
+  '收起的页必须显式 display:none —— .pane 设了 display:flex 会盖掉 hidden 属性的默认样式');
+assert.match(html, /id="newKeyConcurrency"[^>]*value="1"/s,
+  '并发默认必须是 1（免费通道同号并发 >1 就出问题）');
+assert.match(app, /\$\('newKeyConcurrency'\)\.value = '1'/,
+  '重置表单也要回到并发 1，不能沿用上一把 key 的值');
+// 一个表单管新建与编辑：keyEditing 有值 → PATCH，空 → POST。
+assert.match(app, /if \(keyEditing\)\s*\{[\s\S]*?patchKey\(/s, '编辑走 PATCH');
+assert.match(app, /if \(await patchKey\(keyEditing, body, '已保存'\)\) resetKeyForm\(\)/,
+  '保存失败（改名撞重名回 400）时表单必须留着用户填的内容，不能清空');
+assert.match(app, /api\('\/keys',\s*\{\s*method:\s*'POST'/, '新建走 POST');
+assert.ok(app.includes('function keyMask('), '表里只显示掩码，完整 key 走「复制」按钮');
+assert.match(app, /if \(r\.key && r\.key !== S\.ownerName\)/,
+  '调用日志只在共享 key 上标 Key 名：主 Key 自己用时那行是噪音，历史空值也不显示');
+assert.ok(app.includes("api('/keys')"), '面板必须读取分享 Key 列表与归账');
+
+
 const ids = [...html.matchAll(/\bid=["']([^"']+)["']/g)].map((m) => m[1]);
 const duplicates = ids.filter((id, i) => ids.indexOf(id) !== i);
 assert.deepEqual([...new Set(duplicates)], [], `页面存在重复 id: ${[...new Set(duplicates)].join(', ')}`);

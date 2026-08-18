@@ -184,6 +184,93 @@ test('API 契约静态标记（服务端路由已注册）', () => {
   for (const marker of ["seg === 'usage-persistence'", "createUsagePersistence(dataFile('usage-stats.json'))", "configureUsagePersistence"]) {
     assert.ok(src.includes(marker), `server.js 缺少持久化接线: ${marker}`);
   }
+  for (const marker of ["seg === 'keys'", "createApiKeyStore(dataFile('credentials', 'api-keys.json'))", 'FREEBUFF_API_KEYS: apiKeyStore.descriptors()']) {
+    assert.ok(src.includes(marker), `server.js 缺少分享 Key 接线: ${marker}`);
+  }
+  assert.equal(src.includes('RELAY_KEY'), false, '死配置 RELAY_KEY 已移除（worker.js 从来没读它）');
+});
+
+// 分享 Key 的两条硬约束：没设面板密码不许发 key（发出去等于把面板也发出去了），
+// 以及发/改/删必须对下一个客户端请求立刻生效（不重启）。
+test('分享 Key：未设 ADMIN_PASSWORD 时锁定发放', async (t) => {
+  const s = await startServer();
+  t.after(() => stopServer(s));
+
+  const r = await fetch(s.base + '/_api/keys');
+  assert.equal(r.status, 200);
+  const body = await r.json();
+  assert.deepEqual(body.keys, []);
+  assert.deepEqual(body.stats, {});
+  assert.equal(body.ownerName, '主 Key');
+  assert.equal(body.locked, true, '没设密码必须自报锁定，面板据此提示');
+
+  const post = await fetch(s.base + '/_api/keys', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name: '小明' }),
+  });
+  assert.equal(post.status, 403);
+  assert.equal((await post.json()).error.type, 'admin_password_required');
+});
+
+test('分享 Key：发/改/删对下一个客户端请求立刻生效', async (t) => {
+  const s = await startServer({ ADMIN_PASSWORD: 'panel-pw', API_KEY: 'owner-key-for-server-test' });
+  t.after(() => stopServer(s));
+  const admin = { 'content-type': 'application/json', Authorization: 'Basic ' + Buffer.from('x:panel-pw').toString('base64') };
+  // 鉴权只看 key 能不能过：随便挑一条 worker 认得 key 但没有的路由，
+  // 有效 key → 404，无效 key → 401。不碰模型/上游，测试全程离线。
+  const authProbe = (key) => fetch(s.base + '/v1/no-such-route', { headers: { Authorization: 'Bearer ' + key } });
+
+  assert.equal((await fetch(s.base + '/_api/keys')).status, 401, '设了密码后管理接口必须鉴权');
+  assert.equal((await authProbe('owner-key-for-server-test')).status, 404, '主 Key 照常可用');
+  assert.equal((await authProbe('fbk-never-issued')).status, 401);
+
+  const post = await fetch(s.base + '/_api/keys', {
+    method: 'POST', headers: admin,
+    body: JSON.stringify({ name: '小明', concurrency: 2, dailyLimit: 6, models: ['mimo/mimo-v2.5'] }),
+  });
+  assert.equal(post.status, 200);
+  const issued = (await post.json()).key;
+  assert.match(issued.key, /^fbk-/);
+  assert.equal(issued.concurrency, 2);
+  assert.equal((await authProbe(issued.key)).status, 404, '新发的 key 必须立刻能用（无需重启）');
+
+  const stored = JSON.parse(await readFile(join(s.dir, 'credentials', 'api-keys.json'), 'utf8'));
+  assert.deepEqual(stored.keys.map((k) => k.name), ['小明']);
+
+  const dup = await fetch(s.base + '/_api/keys', {
+    method: 'POST', headers: admin, body: JSON.stringify({ name: '小明' }),
+  });
+  assert.equal(dup.status, 400);
+  assert.equal((await dup.json()).error.type, 'invalid_key_config');
+
+  const off = await fetch(s.base + '/_api/keys/' + encodeURIComponent(issued.key), {
+    method: 'PATCH', headers: admin, body: JSON.stringify({ disabled: true }),
+  });
+  assert.equal(off.status, 200);
+  assert.equal((await authProbe(issued.key)).status, 401, '停用必须立刻失效');
+
+  const on = await fetch(s.base + '/_api/keys/' + encodeURIComponent(issued.key), {
+    method: 'PATCH', headers: admin, body: JSON.stringify({ disabled: false, concurrency: 5 }),
+  });
+  assert.equal(on.status, 200);
+  assert.equal((await on.json()).key.concurrency, 5);
+  assert.equal((await authProbe(issued.key)).status, 404, '重新启用后立刻可用');
+
+  const missing = await fetch(s.base + '/_api/keys/fbk-nope', {
+    method: 'PATCH', headers: admin, body: JSON.stringify({ name: 'x' }),
+  });
+  assert.equal(missing.status, 404);
+  assert.equal((await missing.json()).error.type, 'not_found');
+
+  const del = await fetch(s.base + '/_api/keys/' + encodeURIComponent(issued.key), { method: 'DELETE', headers: admin });
+  assert.equal(del.status, 200);
+  assert.equal((await authProbe(issued.key)).status, 401, '删除必须立刻失效');
+
+  const list = await fetch(s.base + '/_api/keys', { headers: admin });
+  const body = await list.json();
+  assert.deepEqual(body.keys, []);
+  assert.equal(body.locked, false);
 });
 
 test('管理员探测将 banned 持久化为永久状态，并由成功探测清除', async (t) => {
