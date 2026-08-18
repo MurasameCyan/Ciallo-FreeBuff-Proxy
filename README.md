@@ -71,6 +71,7 @@ docker compose up -d
 | `FREEBUFF_READONLY` | 否 | `true` 时禁止面板修改账号池 |
 | `FREEBUFF_DATA_DIR` | 否 | 数据目录（账号池/Key/模型映射/内核缓存），容器默认 `/data`，本地默认 `./data` |
 | `FREEBUFF_ACCOUNT_STATE_FILE` | 否 | 封禁/凭据失效状态文件，默认位于数据目录 `credentials/account-state.json` |
+| `FREEBUFF_SESSION_WAIT_MS` | 否 | 同一账号的 session 正忙时最多等它多久（默认 `120000`）。免费额度按账号计且只有个位数，等待比换号省额度；设 `0` 则忙时立刻换号 |
 
 ## 出口代理（订阅）
 

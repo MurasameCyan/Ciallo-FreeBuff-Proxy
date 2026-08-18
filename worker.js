@@ -571,8 +571,14 @@ const dirtyAccountStates = new Set(); // 本请求刚写入，不能被旧 env �
 const accountStateRevisions = new Map(); // token -> 最近已应用/本地写入的 store revision
 const accountLeases = new Map(); // token -> inFlight count (最多 1)
 const accountLeaseWaiters = new Map(); // token -> settle[]，active session 忙时等待释放
-// 短请求优先等待原 active session；长流超过此窗口后仍允许回退其他账号。
-const ACTIVE_SESSION_LEASE_WAIT_MS = 10 * 1000;
+// 等待原账号释放租约的上限。默认远大于一次普通请求，让同一对话尽量钉在同一个
+// 号上：换号=在新账号上再建一个 session，而免费额度按账号计（每天个位数）。
+// ponytail: 这个上限只是租约泄漏的兜底，不是调度策略。客户端断开会立即结束等待；
+// 想彻底禁止回退就把 FREEBUFF_SESSION_WAIT_MS 设成一个足够大的值。
+const ACTIVE_SESSION_LEASE_WAIT_MS = 120 * 1000;
+// 上游抖动（session/run 5xx、超时）不是账号自身的问题，换号只会白扣一份新账号的
+// 创建额度，所以先重试同一个号；用尽后才换号，保留跨账号故障转移。
+const SAME_ACCOUNT_TRANSIENT_RETRIES = 1;
 const TERMINAL_ACCOUNT_STATES = new Set(["banned", "token_invalid", "manual_disabled"]);
 let accountStateSet = null;
 let accountStateClear = null;
@@ -1071,8 +1077,8 @@ function callLogSnapshot() {
   };
 }
 
-// 第一次选号若已有同模型 active session，只短暂等待它的单并发租约；
-// 超时或真正失败后的重试仍走原 picker，保留跨账号故障转移。
+// 第一次选号若已有同模型 active session，等待它的单并发租约释放而不是立刻换号；
+// 只有等待超时（租约泄漏兜底）或真正失败后的重试才走原 picker，保留故障转移。
 async function pickTokenWithSessionWait(
   env,
   sessionModel,
@@ -1092,6 +1098,41 @@ async function pickTokenWithSessionWait(
     }
   }
   return pickToken(env, sessionModel, attempted);
+}
+
+function sessionLeaseWaitMs(env) {
+  // 注意空串：docker-compose 里写 `FREEBUFF_SESSION_WAIT_MS=` 会传进来一个空值，
+  // 而 Number("") 是 0 —— 那会静默关掉等待，等于悄悄退回「忙就换号」。
+  const raw = String((env && env.FREEBUFF_SESSION_WAIT_MS) ?? "").trim();
+  const ms = Number(raw);
+  return raw !== "" && Number.isFinite(ms) && ms >= 0 ? ms : ACTIVE_SESSION_LEASE_WAIT_MS;
+}
+
+// 上游抖动后重新拿回同一个号：它此刻已释放租约，且没有被隔离或冷却。
+// 拿不回来（被隔离/冷却/又被别的请求占住）就返回 null，交给外层正常换号。
+function retakeToken(env, token, sessionModel) {
+  if (!token) return null;
+  syncAccountState(env);
+  if (accountIsBlocked(token) || inScopedCooldown(token, sessionModel)) return null;
+  if (!acquireToken(token)) return null;
+  const acct = parseAccounts(env).find((item) => item.token === token);
+  if (!acct) releaseToken(token);
+  return acct || null;
+}
+
+// 只有这些形状算「上游抖动」，值得重试同一个号：session/run 创建的非 429 失败、
+// 超时、连接被掐断。账号自身的问题（终态、额度耗尽、401 复核、排队）不在其中——
+// 那些情况重试同号没有意义，必须换号。
+function isTransientUpstreamError(error) {
+  if (error instanceof TerminalAccountStateError
+    || error instanceof QuotaExhaustedError
+    || error instanceof TransientAccountAuthError
+    || error instanceof EgressRejectedError
+    || error instanceof WaitingRoomError
+    || error instanceof EmptyUpstreamStreamError) return false;
+  const msg = String((error && error.message) || error);
+  if (/\b429\b/.test(msg) || /stayed queued|waiting.room/i.test(msg)) return false;
+  return /create session failed|start_run failed|timeout|timed out|terminated|abort|fetch failed|ECONNRESET|socket hang up/i.test(msg);
 }
 
 function pickToken(env, sessionModel, attempted = new Set()) {
@@ -2718,12 +2759,19 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode, requestSig
   let lastErrMsg = "";
   let lastWaitingRetryAfter = null;
   const attempted = new Set();
-  for (let acctTry = 0; acctTry < pool.length; acctTry++) {
+  let pinnedToken = null; // 上游抖动后待重试的同一个号
+  let sameAccountRetries = 0;
+  for (let acctTry = 0; acctTry < pool.length + SAME_ACCOUNT_TRANSIENT_RETRIES; acctTry++) {
     throwIfRequestAborted(requestSignal);
-    const acct = await pickTokenWithSessionWait(
-      env, mc.session, attempted, requestSignal,
-      attempted.size === 0 ? ACTIVE_SESSION_LEASE_WAIT_MS : 0,
-    );
+    // 上游抖动过的号优先原地重试；拿不回来（被隔离/冷却/占用）才正常选号。
+    let acct = pinnedToken ? retakeToken(env, pinnedToken, mc.session) : null;
+    pinnedToken = null;
+    if (!acct) {
+      acct = await pickTokenWithSessionWait(
+        env, mc.session, attempted, requestSignal,
+        attempted.size === 0 ? sessionLeaseWaitMs(env) : 0,
+      );
+    }
     const token = acct ? acct.token : null;
     if (!token) {
       recordRequest(mc && mc.id ? mc.id : "", null, false);
@@ -2835,6 +2883,14 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode, requestSig
         lastWaitingRetryAfter = e.retryAfterMs || 30 * 1000;
       } else lastWaitingRetryAfter = null;
       const terminal = e instanceof TerminalAccountStateError;
+      // 上游抖动不是这个号的问题：原地重试，别换号白扣新账号的 session 创建额度。
+      const retrySameAccount = isTransientUpstreamError(e)
+        && sameAccountRetries < SAME_ACCOUNT_TRANSIENT_RETRIES
+        && !accountIsBlocked(token);
+      if (retrySameAccount) {
+        pinnedToken = token;
+        sameAccountRetries += 1;
+      }
       if (!terminal && reviewerRunId) await finishRun(token, reviewerRunId, 1).catch(() => {});
       if (!terminal && rootRunId) await finishRun(token, rootRunId, 1).catch(() => {});
       if (e instanceof QuotaExhaustedError) {
@@ -2845,7 +2901,7 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode, requestSig
           model: mc.session,
           scope: e.scope || quotaScopeForModel(mc.session),
         });
-      } else if (!terminal && !(e instanceof WaitingRoomError) && !scopedCooldownInfo(token, mc.session)
+      } else if (!terminal && !retrySameAccount && !(e instanceof WaitingRoomError) && !scopedCooldownInfo(token, mc.session)
         && (e instanceof TransientAccountAuthError
           || /start_run failed|timeout|timed out|abort|reviewer upstream/i.test(lastErrMsg))) {
         cooldown(token, lastWaitingRetryAfter || 60 * 1000, { model: mc.session });
@@ -2876,12 +2932,19 @@ async function executeChat(env, chatParams, mc, isStream, mode, requestSignal = 
   let lastErrMsg = "";
   let lastWaitingRetryAfter = null;
   const attempted = new Set();
-  for (let acctTry = 0; acctTry < pool.length; acctTry++) {
+  let pinnedToken = null; // 上游抖动后待重试的同一个号
+  let sameAccountRetries = 0;
+  for (let acctTry = 0; acctTry < pool.length + SAME_ACCOUNT_TRANSIENT_RETRIES; acctTry++) {
     throwIfRequestAborted(requestSignal);
-    const acct = await pickTokenWithSessionWait(
-      env, mc.session, attempted, requestSignal,
-      attempted.size === 0 ? ACTIVE_SESSION_LEASE_WAIT_MS : 0,
-    );
+    // 上游抖动过的号优先原地重试；拿不回来（被隔离/冷却/占用）才正常选号。
+    let acct = pinnedToken ? retakeToken(env, pinnedToken, mc.session) : null;
+    pinnedToken = null;
+    if (!acct) {
+      acct = await pickTokenWithSessionWait(
+        env, mc.session, attempted, requestSignal,
+        attempted.size === 0 ? sessionLeaseWaitMs(env) : 0,
+      );
+    }
     const token = acct ? acct.token : null;
     if (!token) {
       recordRequest(mc && mc.id ? mc.id : "", null, false);
@@ -3081,6 +3144,14 @@ async function executeChat(env, chatParams, mc, isStream, mode, requestSignal = 
       if (e instanceof EmptyUpstreamStreamError) {
         cooldown(token, 60 * 1000, { model: mc.session });
       }
+      // 上游抖动不是这个号的问题：原地重试，别换号白扣新账号的 session 创建额度。
+      const retrySameAccount = isTransientUpstreamError(e)
+        && sameAccountRetries < SAME_ACCOUNT_TRANSIENT_RETRIES
+        && !accountIsBlocked(token);
+      if (retrySameAccount) {
+        pinnedToken = token;
+        sameAccountRetries += 1;
+      }
       // 其他上游交互失败/超时继续沿用原有冷却逻辑；流式 chat 不再因固定 20s abort 进入这里。
       // createSession 429（额度耗尽）按 retryAfterMs/文本冷却，不能固定 60s。
       if (!(e instanceof WaitingRoomError) && /create session failed|stayed queued|start_run failed|session_model_mismatch|abort|timeout|timed out|terminated/i.test(msg)) {
@@ -3093,12 +3164,16 @@ async function executeChat(env, chatParams, mc, isStream, mode, requestSignal = 
             model: mc.session,
             scope: "model:" + String(mc.session),
           });
-        } else {
+        } else if (!retrySameAccount) {
+          // 冷却会让 retakeToken 拿不回这个号，所以原地重试期间不写冷却。
           cooldown(token, 60 * 1000, { model: mc.session });
         }
       }
       lastErrMsg = msg;
-      if (debug) console.log(`[acct ${acctTry + 1}] exception: ${msg.slice(0, 120)}, switch account`);
+      if (debug) {
+        console.log(`[acct ${acctTry + 1}] exception: ${msg.slice(0, 120)}, `
+          + (retrySameAccount ? "retry same account" : "switch account"));
+      }
     } finally {
       if (!leaseTransferred) releaseToken(token);
     }

@@ -10,7 +10,7 @@ import { createAccountStateStore } from '../server/account-state.mjs';
 const workerSource = readFileSync(new URL('../worker.js', import.meta.url), 'utf8');
 const workerWrapper = workerSource.replace('export default {', 'const __workerDefault__ = {')
   + '\n\nglobalThis.__workerDefault__ = __workerDefault__;\n'
-  + 'globalThis.__accountSafetyTestApi__ = { pickToken, pickTokenWithSessionWait, releaseToken, recordAccountObservation, cooldown, parseCooldown, accountPoolExhaustion, classifyRateLimit, quotaScopeForModel, freshQuotaProbe, startRun, executeChat, executeCodeReview, createSession };\n';
+  + 'globalThis.__accountSafetyTestApi__ = { pickToken, pickTokenWithSessionWait, sessionLeaseWaitMs, releaseToken, recordAccountObservation, cooldown, parseCooldown, accountPoolExhaustion, classifyRateLimit, quotaScopeForModel, freshQuotaProbe, startRun, executeChat, executeCodeReview, createSession };\n';
 
 const TOKEN = 'permanent-banned-account-token-123456';
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -1129,4 +1129,104 @@ test('生产 createSession 复用 singleFlight，失败后允许下一次重试'
   const retried = await workerVm.api.createSession(retryToken, model);
   assert.equal(retried.instanceId, 'singleflight-2');
   assert.equal(postCalls, 2, '失败 promise 必须从 singleFlight 清理，下一次可重试');
+});
+
+// 换号会在新账号上再建一个 session，而免费额度按账号每天只有几次创建机会。
+// 因此「上游抖动」必须重试同一个号，只有账号自身出问题（额度耗尽/终态/
+// 复核失败）才允许换号。以下三个用例锁定这条边界。
+function flakySessionFetch({ failToken, failStatus = 500, failTimes = Infinity, posts = [] }) {
+  const start = Date.UTC(2030, 0, 1);
+  let failed = 0;
+  return async (url, init = {}) => {
+    const path = new URL(String(url)).pathname;
+    const method = String(init.method || 'GET').toUpperCase();
+    const auth = String(init.headers?.Authorization || init.headers?.authorization || '');
+    const isFailing = auth.endsWith(failToken);
+    if (path.includes('/api/v1/ads') || path.includes('/api/v1/usage')) return upstreamResponse(200, {});
+    if (path === '/api/v1/freebuff/session' && method === 'GET') return upstreamResponse(404, {});
+    if (path === '/api/v1/freebuff/session' && method === 'POST') {
+      posts.push(auth.slice(-12));
+      if (isFailing && failed < failTimes) {
+        failed += 1;
+        return upstreamResponse(failStatus, failStatus === 429
+          ? { status: 'rate_limited', retryAfterMs: 60000 }
+          : { error: 'temporary sdk failure' });
+      }
+      return upstreamResponse(200, {
+        status: 'active',
+        instanceId: 'flaky-' + auth.slice(-6),
+        model: terminalModel.session,
+        expiresAt: new Date(start + 3600 * 1000).toISOString(),
+      });
+    }
+    if (path === '/api/v1/agent-runs') return upstreamResponse(200, { runId: 'flaky-run' });
+    if (path === '/api/v1/chat/completions') {
+      return new Response(
+        `data: ${JSON.stringify({ choices: [{ delta: { content: 'ok' }, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`,
+        { status: 200, headers: { 'content-type': 'text/event-stream' } },
+      );
+    }
+    return upstreamResponse(200, {});
+  };
+}
+
+test('session 创建遇上游 5xx 抖动时重试同一账号，不在其他账号建 session', async () => {
+  const tokenA = 'flaky-session-retry-same-a-123456';
+  const tokenB = 'flaky-session-retry-same-b-123456';
+  const posts = [];
+  const workerVm = createWorkerVm({
+    now: Date.UTC(2030, 0, 1),
+    fetchImpl: flakySessionFetch({ failToken: tokenA, failTimes: 1, posts }),
+  });
+  const response = await workerVm.api.executeChat(
+    terminalEnv(`${tokenA},${tokenB}`), terminalChatParams, terminalModel, false, 'chat',
+  );
+  assert.equal(response.status, 200);
+  assert.equal(posts.length, 2, 'A 应被重试一次');
+  assert.ok(posts.every((slot) => tokenA.endsWith(slot)), `session POST 不应落到 B：${JSON.stringify(posts)}`);
+  assert.equal(
+    workerVm.upstreamCalls.some(({ init }) =>
+      String(init.headers?.Authorization || '').endsWith(tokenB)), false, 'B 完全不应被使用');
+});
+
+test('同账号重试用尽后仍换号，保留跨账号故障转移', async () => {
+  const tokenA = 'flaky-session-failover-a-123456';
+  const tokenB = 'flaky-session-failover-b-123456';
+  const posts = [];
+  const workerVm = createWorkerVm({
+    now: Date.UTC(2030, 0, 1),
+    fetchImpl: flakySessionFetch({ failToken: tokenA, posts }),
+  });
+  const response = await workerVm.api.executeChat(
+    terminalEnv(`${tokenA},${tokenB}`), terminalChatParams, terminalModel, false, 'chat',
+  );
+  assert.equal(response.status, 200);
+  assert.ok(posts.length >= 3, `A 重试用尽后应换到 B：${JSON.stringify(posts)}`);
+  assert.ok(tokenB.endsWith(posts[posts.length - 1]), '最后一次 session POST 应在 B');
+});
+
+test('额度耗尽属账号自身问题，立即换号且不重试同账号', async () => {
+  const tokenA = 'flaky-session-quota-a-123456';
+  const tokenB = 'flaky-session-quota-b-123456';
+  const posts = [];
+  const workerVm = createWorkerVm({
+    now: Date.UTC(2030, 0, 1),
+    fetchImpl: flakySessionFetch({ failToken: tokenA, failStatus: 429, posts }),
+  });
+  const response = await workerVm.api.executeChat(
+    terminalEnv(`${tokenA},${tokenB}`), terminalChatParams, terminalModel, false, 'chat',
+  );
+  assert.equal(response.status, 200);
+  assert.equal(posts.length, 2, `429 不应重试同号：${JSON.stringify(posts)}`);
+  assert.ok(tokenA.endsWith(posts[0]) && tokenB.endsWith(posts[1]));
+});
+
+test('FREEBUFF_SESSION_WAIT_MS 可调等待上限，非法值回落默认', () => {
+  const { api } = createWorkerVm();
+  assert.equal(api.sessionLeaseWaitMs({}), 120 * 1000);
+  assert.equal(api.sessionLeaseWaitMs({ FREEBUFF_SESSION_WAIT_MS: '0' }), 0, '设 0 应表示忙时立刻换号');
+  assert.equal(api.sessionLeaseWaitMs({ FREEBUFF_SESSION_WAIT_MS: '600000' }), 600 * 1000);
+  for (const bad of ['', 'abc', '-1', null]) {
+    assert.equal(api.sessionLeaseWaitMs({ FREEBUFF_SESSION_WAIT_MS: bad }), 120 * 1000, `非法值 ${bad} 应回落默认`);
+  }
 });
