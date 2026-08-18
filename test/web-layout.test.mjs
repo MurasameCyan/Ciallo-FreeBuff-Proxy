@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 const html = readFileSync(new URL('../web/index.html', import.meta.url), 'utf8');
 const css = readFileSync(new URL('../web/style.css', import.meta.url), 'utf8');
 const app = readFileSync(new URL('../web/app.js', import.meta.url), 'utf8');
+const login = readFileSync(new URL('../web/login.js', import.meta.url), 'utf8');
 
 const requiredLayout = [
   'class="dashboard"',
@@ -479,6 +480,38 @@ const persistFlow = app.slice(app.indexOf("$('usagePersistence')?.addEventListen
 assert.ok(persistFlow.includes("api('/usage-persistence'"), '持久化开关切换必须调用自己的 API');
 assert.ok(!persistFlow.includes('refresh()'),
   '持久化开关切换不应触发全量 refresh()，也不应打任何上游接口');
+
+// ── 页内确认框（取代浏览器原生弹窗） ────────────────────
+for (const id of ['confirmDialog', 'confirmTitle', 'confirmText', 'confirmOk']) {
+  assert.match(html, new RegExp(`id=["']${id}["']`), `确认框丢失 DOM 绑定 #${id}`);
+}
+assert.match(html, /<dialog class="modal" id="confirmDialog"[\s\S]*?<form method="dialog"/s,
+  '确认框必须是原生 <dialog> + method="dialog" 的表单（Esc/焦点圈定/遮罩交给浏览器）');
+const confirmBox = html.slice(html.indexOf('<dialog class="modal"'), html.indexOf('</dialog>'));
+assert.match(confirmBox, /value=""[^>]*>取消[\s\S]*value="ok"[\s\S]*id="confirmOk"/s,
+  '「取消」必须排在「确认」之前：dialog 自动聚焦第一个可聚焦元素，危险操作默认落在取消上');
+assert.match(css, /\.modal\s*\{[^}]*padding:\s*0[^}]*border:\s*0/s,
+  'dialog 自身不能有边框内衬，否则点遮罩判定（event.target === dlg）会连边缘一起吃掉');
+assert.match(css, /\.modal::backdrop/, '确认框必须有遮罩样式');
+for (const [name, src] of [['app.js', app], ['login.js', login]]) {
+  assert.ok(!/\b(?:window\.)?(?:confirm|alert|prompt)\s*\(/.test(src),
+    `${name} 不得使用浏览器原生弹窗，改用页内 confirmBox()`);
+}
+assert.match(app, /function confirmBox\([\s\S]*?dlg\.returnValue === 'ok'/s,
+  'confirmBox 必须以 returnValue 判定结果：Esc 关闭时 returnValue 是空串，等于取消');
+assert.match(app, /\$\('confirmText'\)\.textContent =/,
+  '确认文案必须用 textContent 写入（内容里带账号名/邮箱，不能当 HTML 插）');
+
+// 删除账号：本地先摘行再渲染。等 refresh() 会先把剩下的账号逐个探上游，
+// 几秒后行才消失，用户看着像点了没反应。
+const delFlow = app.slice(app.indexOf("querySelectorAll('[data-del]')"), app.indexOf('function renderAliases'));
+assert.ok(delFlow.includes("method: 'DELETE'"), '删除账号必须调用 DELETE 接口');
+assert.match(delFlow, /S\.accounts = S\.accounts\.filter\([\s\S]*?renderAccounts\(\)/s,
+  '删除成功后必须先在本地移除该账号并立即重渲染，不能等 refresh() 回来');
+assert.ok(delFlow.lastIndexOf('refresh()') > delFlow.indexOf('renderAccounts()'),
+  'refresh() 只做事后对账，必须排在本地重渲染之后');
+assert.ok(!/await\s+refresh\(\)/.test(delFlow),
+  'refresh() 不得 await：它会在服务端逐个探号，await 就把等待又搬回到手感上');
 
 // 所有 id 必须唯一，避免重排后 renderStats/renderModels 写入错误节点。
 const ids = [...html.matchAll(/\bid=["']([^"']+)["']/g)].map((m) => m[1]);

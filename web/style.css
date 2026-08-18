@@ -784,6 +784,33 @@ select:disabled { opacity: .5; cursor: not-allowed; }
 .toast.ok   { border-color: color-mix(in oklab, var(--mint) 45%, transparent); }
 .toast.err  { border-color: color-mix(in oklab, var(--rose) 50%, transparent); }
 
+/* ── 确认框 ───────────────────────────────────────────── */
+/* 用原生 <dialog>:居中、::backdrop 遮罩、Esc 关闭、焦点圈定、背景 inert
+   全是浏览器给的,自己搭一套 overlay 只会多出这些行为的 bug。 */
+
+.modal {
+  /* 视觉全交给 .modal-box:dialog 自己不留边框和内衬,点到它就等于点在遮罩上 */
+  padding: 0; border: 0; background: none;
+  width: min(400px, calc(100vw - 32px));
+  color: var(--fg);
+}
+.modal::backdrop { background: #05070ba8; }
+.modal[open] { animation: rise .16s cubic-bezier(.2,.8,.3,1); }
+.modal-box {
+  border: 1px solid var(--line-2); border-radius: var(--r);
+  background: color-mix(in oklab, var(--card) 94%, var(--bg));
+  box-shadow: var(--shadow);
+  padding: 20px;
+  display: grid; gap: 11px;
+}
+.modal-box h2 { font-size: 15px; font-weight: 650; }
+.modal-text {
+  color: var(--fg-2); font-size: 13px; line-height: 1.65;
+  /* 账号 key / 邮箱是一长串无空格字符,不给断点会把弹窗顶宽 */
+  overflow-wrap: anywhere;
+}
+.modal-actions { display: flex; gap: 9px; justify-content: flex-end; margin-top: 3px; }
+
 @keyframes rise { from { opacity: 0; transform: translateY(8px); } }
 
 @media (prefers-reduced-motion: reduce) {

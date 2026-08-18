@@ -384,6 +384,20 @@
 
 <div class="toasts" id="toasts" aria-live="polite" aria-atomic="false"></div>
 
+<!-- 页内确认框。method="dialog" 的提交会把按钮 value 写进 returnValue 并关闭;
+     Esc 关闭时 returnValue 是空串,所以「取消」和 Esc 走同一条路。
+     「取消」放在前面:原生 dialog 自动聚焦第一个可聚焦元素,危险操作默认落在取消上。 -->
+<dialog class="modal" id="confirmDialog" aria-labelledby="confirmTitle">
+  <form method="dialog" class="modal-box">
+    <h2 id="confirmTitle">确认</h2>
+    <p class="modal-text" id="confirmText"></p>
+    <div class="modal-actions">
+      <button type="submit" value="" class="btn ghost">取消</button>
+      <button type="submit" value="ok" class="btn danger" id="confirmOk">确认</button>
+    </div>
+  </form>
+</dialog>
+
 <script type="module" src="/static/app.js"></script>
 </body>
 </html>

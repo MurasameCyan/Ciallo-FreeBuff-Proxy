@@ -60,6 +60,28 @@ function toast(msg, kind = 'ok') {
   setTimeout(() => el.remove(), 3200);
 }
 
+/**
+ * 页内确认框,取代浏览器原生弹窗。resolve true 表示确认。
+ * 复用 index.html 里那一个 <dialog>:同时只会弹一个,不必每次建 DOM。
+ */
+function confirmBox({ title = '确认', text = '', ok = '确认', danger = true } = {}) {
+  const dlg = $('confirmDialog');
+  $('confirmTitle').textContent = title;
+  $('confirmText').textContent = text;      // textContent:文案里带账号名/邮箱,不能当 HTML 插
+  const okBtn = $('confirmOk');
+  okBtn.textContent = ok;
+  okBtn.classList.toggle('danger', danger);
+  okBtn.classList.toggle('primary', !danger);
+  dlg.returnValue = '';                     // 上一次的结果不能留到这一次
+  // 点遮罩=取消。dialog 自身没有内衬(见 style.css 的 .modal),所以事件目标是它本人时,
+  // 点的就是 .modal-box 之外的遮罩区域。用 onclick 赋值:重复弹不会摞监听器。
+  dlg.onclick = (event) => { if (event.target === dlg) dlg.close(); };
+  dlg.showModal();
+  return new Promise((resolve) => {
+    dlg.addEventListener('close', () => resolve(dlg.returnValue === 'ok'), { once: true });
+  });
+}
+
 /** 按钮跑异步命令期间禁用,避免连点 */
 async function run(btn, label, fn) {
   const old = btn.textContent;
@@ -358,11 +380,23 @@ function renderAccounts() {
   // 轮询（每小时）和概况区的立即刷新一起更新，手动逐个探测是多余的一层
   $('acctBody').querySelectorAll('[data-del]').forEach(b =>
     b.addEventListener('click', async () => {
-      if (!confirm('确认删除账号 ' + b.dataset.del.slice(0, 20) + '…？')) return;
+      const key = b.dataset.del;
+      const acct = S.accounts.find((a) => a.key === key);
+      const label = acct?.name || acct?.email || key.slice(0, 20) + '…';
+      if (!await confirmBox({
+        title: '删除账号',
+        text: `确认删除「${label}」？账号会从池子里移除，正在进行的请求不受影响。`,
+        ok: '删除',
+      })) return;
       try {
-        await api('/accounts/' + encodeURIComponent(b.dataset.del), { method: 'DELETE' });
+        await api('/accounts/' + encodeURIComponent(key), { method: 'DELETE' });
+        // 删完先在本地摘掉这一行再渲染。不能等 refresh():那一轮会让服务端把剩下的账号
+        // 逐个探上游(GET /_api/accounts 每个号一次请求),几秒后行才消失,看着像点了没反应。
+        S.accounts = S.accounts.filter((a) => a.key !== key);
+        delete S.health[key];
+        renderStats(); renderAccounts(); syncColumnBottoms();
         toast('已删除', 'ok');
-        refresh();
+        refresh();                          // 不 await:后台跟服务端对账,慢也不挡手感
       } catch (e) { toast('删除失败:' + e.message, 'err'); }
     }));
 }
@@ -880,7 +914,11 @@ function wire() {
   if (resetBtn) {
     resetBtn.addEventListener('click', () => run(resetBtn, '重置', async () => {
       if (!S.keyRotatable) throw new Error('当前 Key 由环境变量 FREEBUFF_API_KEY 配置,面板不可重置');
-      if (!confirm('重置后旧 Key 立即失效,正在使用该 Key 的客户端需要更新。继续?')) return '已取消';
+      if (!await confirmBox({
+        title: '重置 API Key',
+        text: '重置后旧 Key 立即失效，正在使用该 Key 的客户端需要更新。继续？',
+        ok: '重置',
+      })) return '已取消';
       const r = await api('/key/rotate', { method: 'POST' });
       S.apiKey = r.apiKey;
       $('key-mask').textContent = S.apiKey.slice(0, 8) + '…';
