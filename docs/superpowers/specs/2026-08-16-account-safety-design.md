@@ -1,5 +1,9 @@
 # 账号隔离与池耗尽安全设计
 
+> **已被取代（superseded）：** 这是 2026-08-16 的历史设计记录。请以
+> [`../plans/2026-08-17-account-safety-p0.md`](../plans/2026-08-17-account-safety-p0.md) 为当前实现依据；
+> `resumes_at`、24 小时 `banned` 兜底、按整账号合并 generic 429 和 Pacific midnight fallback 均已废止。
+
 ## 目标
 
 减少同一账号在上游已经明确拒绝后被重复请求的次数，并让封禁/凭据失效状态在服务重启后继续生效。请求内仍保留现有的多账号故障转移和按模型复用 session 行为。

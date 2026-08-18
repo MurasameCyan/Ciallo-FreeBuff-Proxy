@@ -239,8 +239,8 @@ function statePill(s) {
   return `<span class="pill ${cls}"><span class="dot ${cls}"></span>${label}</span>`;
 }
 
-// 额度是「池级」共享计数：同一池（STANDARD=flash/mimo、PREMIUM 等）下所有模型
-// 共用一份每日次数，因此免费号的可用模型用量完全一致、每日 07:00 UTC 统一重置。
+// 额度展示优先使用上游返回的池/模型快照；Premium 的共池关系已确认，其他分组不因本地
+// 猜测自动合并。重置时间也以每条快照的 resetAt 为准，不硬编码 UTC 时刻。
 // 账号级用量取用量最高的池呈现（免费号只有一个池，等价于账号通用）。
 // 「可用池」= 有真实额度（limit>0）。免费号里 glm-5.2 等未解锁模型上游会以 0/0
 // （limit=0）返回，既非真正可用、又会污染账号用量取值，这里统一滤掉。
@@ -261,16 +261,18 @@ function accountUsage(probe) {
 
 // 可用模型列：只列真正有额度（limit>0）的模型，每个模型独占一行；0/0 未解锁模型
 // （如 glm-5.2）直接隐藏。用量已上移到账号名后，重置时间上移到列标题。
-// 被封禁/隔离的号没有额度表，这一格改显示本地隔离到期时间（= 几点重新进轮询）。
-// 措辞是「隔离至」而不是「解封」：上游 banned 响应只有 {"status":"banned"}，
-// 不带任何解封时间，这个点是本地 24h 兜底猜的。
+// 被封禁/隔离的号没有额度表：永久终态明确显示「永久隔离」；
+// 只有带有本地临时截止时间的非终态才显示「隔离至」。
 function modelsCellHtml(probe) {
   const rows = usableQuota(probe);
   if (!rows.length) {
+    if (probe?.isolatedPermanent) {
+      return '<span class="quota" title="上游终态账号只允许管理员成功探测或清除后恢复">永久隔离</span>';
+    }
     const until = Number(probe && probe.isolatedUntil);
     if (Number.isFinite(until) && until > 0) {
       const when = formatResetAt(new Date(until).toISOString());
-      return `<span class="quota" title="上游封禁响应不含解封时间，这是本地 24h 兜底隔离到期时间，到点后该号重新进入轮询">隔离至 ${when}</span>`;
+      return `<span class="quota" title="该账号暂时隔离至 ${when}">隔离至 ${when}</span>`;
     }
     return '<span class="quota">—</span>';
   }
@@ -278,8 +280,7 @@ function modelsCellHtml(probe) {
   return `<ul class="quota quota-models">${items}</ul>`;
 }
 
-// 重置时间是池级统一的：同一天里所有账号、所有池共用一个 resetAt（上游按太平洋日
-// 07:00 UTC 结算）。逐行重复一遍没有信息量，提到列标题上只显示一次。
+// 重置时间优先取快照中的池级 resetAt；逐行重复一遍没有信息量，提到列标题上只显示一次。
 function poolResetAt() {
   for (const a of S.accounts) {
     const reset = usableQuota(S.health[a.key]).map((q) => q.resetAt).find(Boolean);
@@ -294,9 +295,8 @@ function renderQuotaHead() {
   $('quotaHead').textContent = reset ? `可用模型 (重置 ${formatResetAt(reset)})` : '可用模型(重置时间)';
 }
 
-// ISO 时间戳（2026-08-16T07:00:00.000Z）→ 固定北京时间（UTC+8）YYYY-MM-DD HH:mm。
-// 额度按上游太平洋日 07:00 UTC 每日结算（= 北京 15:00），这里显式折算到东八区，
-// 不依赖浏览器/服务器所在时区，任何环境下都稳定显示北京时间。
+// ISO 时间戳 → 固定北京时间（UTC+8）YYYY-MM-DD HH:mm。这里显式折算到东八区，
+// 不依赖浏览器/服务器所在时区，任何环境下都稳定显示上游给出的 resetAt。
 function formatResetAt(iso) {
   const d = new Date(iso);
   if (isNaN(d.getTime())) return '日期未知';
@@ -336,10 +336,9 @@ function renderAccounts() {
     const usageHtml = usage
       ? ` <span class="acct-usage" title="已用 / 总量（每日额度，池级共享）">( ${esc(usage.used ?? '—')} / ${esc(usage.limit ?? '—')} )</span>`
       : '';
-    // 主行=备注名(或邮箱)+池级用量，次行=邮箱。token 短哈希只在既无备注名也无邮箱时
-    // 兜底顶上：有邮箱的账号里它纯属噪音，8 位哈希既不可读也不用于识别账号。
+    // 主行=备注名(或邮箱)+池级用量，次行=邮箱。
     const label = a.name || a.email || a.key;
-    const secondary = a.email && a.email !== label ? a.email : (!a.email && a.tokenShort ? a.tokenShort : '');
+    const secondary = a.email && a.email !== label ? a.email : '';
     return `<tr>
       <td>
         <div class="nm">${esc(label)}${usageHtml}</div>

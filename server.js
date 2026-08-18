@@ -110,9 +110,14 @@ function loadAccounts() {
     const raw = readFileSync(CFG.credFile, 'utf-8');
     const obj = JSON.parse(raw);
     if (!obj || typeof obj !== 'object') return { accounts: {} };
-    if (obj.accounts && typeof obj.accounts === 'object') return obj;
+    if (obj.accounts && typeof obj.accounts === 'object') return migrateAccountKeys(obj);
     // 兼容单账号顶层格式 {authToken, email, id, name}
-    if (obj.authToken) return { accounts: { [accountKey(obj)]: obj } };
+    if (obj.authToken) {
+      const key = accountKey(obj);
+      const converted = { accounts: { [key]: { ...obj, id: obj.id || key } } };
+      try { if (!CFG.readonlyAccounts) saveAccounts(converted); } catch (e) { console.error('[server] migrate credentials failed:', e.message); }
+      return converted;
+    }
     return { accounts: {} };
   } catch (e) {
     console.error('[server] load credentials failed:', e.message);
@@ -120,12 +125,55 @@ function loadAccounts() {
   }
 }
 
+const opaqueAccountKeys = new Map();
+function opaqueAccountKey(seed = '') {
+  const cacheKey = String(seed || '');
+  if (cacheKey && opaqueAccountKeys.has(cacheKey)) return opaqueAccountKeys.get(cacheKey);
+  const key = 'acct-' + crypto.randomUUID();
+  if (cacheKey) opaqueAccountKeys.set(cacheKey, key);
+  return key;
+}
+
+function migrateAccountKeys(obj) {
+  const accounts = {};
+  let changed = false;
+  for (const [rawKey, rawUser] of Object.entries(obj.accounts || {})) {
+    const key = String(rawKey);
+    const user = rawUser && typeof rawUser === 'object' ? { ...rawUser } : {};
+    const legacy = key.startsWith('token-') || String(user.id || '').startsWith('token-');
+    let nextKey = key;
+    if (legacy) {
+      nextKey = opaqueAccountKey(key || user.authToken);
+      while (accounts[nextKey]) nextKey = opaqueAccountKey(key + ':' + Object.keys(accounts).length);
+      if (!user.id || user.id === key || String(user.id).startsWith('token-')) user.id = nextKey;
+      changed = true;
+    }
+    accounts[nextKey] = user;
+  }
+  if (!changed) return obj;
+  const migrated = { ...obj, accounts };
+  try {
+    if (!CFG.readonlyAccounts) saveAccounts(migrated);
+  } catch (e) {
+    // Read-only or temporarily unwritable stores still get the in-memory opaque DTO.
+    console.error('[server] migrate credentials failed:', e.message);
+  }
+  return migrated;
+}
+
 function accountKey(user) {
   const uid = user?.id || '';
   const email = user?.email || '';
-  if (uid) return String(uid);
+  if (uid && !String(uid).startsWith('token-')) return String(uid);
   if (email) return String(email);
-  return 'token-' + (user?.authToken || '').slice(0, 12);
+  return opaqueAccountKey(user?.authToken ? 'token:' + String(user.authToken) : 'new');
+}
+
+function existingAccountKey(obj, token) {
+  for (const [key, user] of Object.entries(obj.accounts || {})) {
+    if (user && user.authToken === token) return key;
+  }
+  return null;
 }
 
 function saveAccounts(obj) {
@@ -148,6 +196,11 @@ function listAccounts() {
     fingerprintId: u.fingerprintId || '',
     hasToken: Boolean(u.authToken),
   }));
+}
+
+function publicAccountDto(account) {
+  const { token, tokenShort, ...publicAccount } = account;
+  return publicAccount;
 }
 
 // 多账号 token 拼接（喂给 worker.js 的 env.FREEBUFF_TOKEN）
@@ -259,7 +312,7 @@ async function upstreamJson(method, path, token, body, extraHeaders = {}, timeou
     const text = await resp.text();
     let data = null;
     try { data = text ? JSON.parse(text) : null; } catch { data = text; }
-    return { status: resp.status, data, text };
+    return { status: resp.status, data, text, headers: resp.headers };
   } catch (e) {
     return { status: 0, data: null, text: String(e.message || e) };
   } finally {
@@ -269,6 +322,32 @@ async function upstreamJson(method, path, token, body, extraHeaders = {}, timeou
 
 function enqueueUpstream(method, path, token, body, extraHeaders, timeoutMs) {
   return enqueueUp(() => upstreamJson(method, path, token, body, extraHeaders, timeoutMs));
+}
+
+function findProbeState(value, depth = 0) {
+  if (!value || typeof value !== 'object' || depth > 5) return null;
+  let fallback = null;
+  const priority = new Set([
+    'banned', 'token_invalid', 'country_blocked', 'ip_capped',
+    'rate_limited', 'rate_limit_exceeded', 'quota_exceeded', 'spend_limited',
+    'waiting_room_queued', 'waiting_room_required', 'model_locked',
+  ]);
+  for (const name of ['status', 'state', 'code', 'errorCode', 'error_code', 'type']) {
+    const raw = value[name];
+    if (typeof raw !== 'string') continue;
+    const state = raw.trim().toLowerCase().replace(/[- ]+/g, '_');
+    if (!state) continue;
+    if (priority.has(state) || state.startsWith('free_mode_')) return state;
+    fallback ||= state;
+  }
+  for (const child of Object.values(value)) {
+    if (!child || typeof child !== 'object') continue;
+    const nested = findProbeState(child, depth + 1);
+    if (!nested) continue;
+    if (priority.has(nested) || nested.startsWith('free_mode_')) return nested;
+    fallback ||= nested;
+  }
+  return fallback;
 }
 
 // 账号健康探测：GET /api/v1/freebuff/session（0 消耗，不创建 session）
@@ -289,19 +368,29 @@ async function probeAccount(token) {
     }
     return rows.length ? rows : null;
   };
+  const typedState = findProbeState(data);
   if (r.status === 401) { state = 'token_invalid'; label = 'token 失效'; }
   else if (r.status === 403) {
-    if (data.status === 'banned') { state = 'banned'; label = '已被封禁'; }
-    else if (data.status === 'country_blocked') { state = 'country_blocked'; label = '地区受限'; }
+    if (typedState === 'banned') { state = 'banned'; label = '已被封禁'; }
+    else if (typedState === 'country_blocked') { state = 'country_blocked'; label = '地区受限'; }
     else { state = 'blocked'; label = '访问被拒'; }
-  } else if (r.status === 429) { state = 'rate_limited'; label = '额度用完'; quota = fmtQuota(); retryAfterMs = data.retryAfterMs || null; }
+  } else if (r.status === 429) {
+    if (typedState === 'spend_limited') { state = 'spend_limited'; label = '账号消费额度受限'; }
+    else if (typedState === 'ip_capped') { state = 'ip_capped'; label = 'IP 并发上限'; }
+    else if (typedState === 'country_blocked') { state = 'country_blocked'; label = '地区受限'; }
+    else if (typedState === 'waiting_room_queued' || typedState === 'waiting_room_required') { state = 'waiting_room'; label = '等待室排队'; }
+    else { state = 'rate_limited'; label = '模型额度受限'; }
+    quota = fmtQuota();
+    retryAfterMs = data.retryAfterMs || null;
+  }
   else if (r.status === 404) { state = 'ok'; label = '存活（无活跃 session）'; quota = fmtQuota(); }
   else if (r.status === 200) {
-    if (data.status === 'banned') { state = 'banned'; label = '已被封禁'; }
-    else if (data.status === 'country_blocked') { state = 'country_blocked'; label = '地区受限'; }
-    else if (data.status === 'model_locked') { state = 'model_locked'; label = 'session 被锁定'; }
-    else if (data.status === 'rate_limited') { state = 'rate_limited'; label = '额度用完'; quota = fmtQuota(); }
-    else if (data.status === 'ip_capped') { state = 'ip_capped'; label = 'IP 并发上限'; }
+    if (typedState === 'banned') { state = 'banned'; label = '已被封禁'; }
+    else if (typedState === 'country_blocked') { state = 'country_blocked'; label = '地区受限'; }
+    else if (typedState === 'model_locked') { state = 'model_locked'; label = 'session 被锁定'; }
+    else if (typedState === 'rate_limited' || typedState === 'spend_limited') { state = typedState; label = typedState === 'spend_limited' ? '账号消费额度受限' : '模型额度受限'; quota = fmtQuota(); }
+    else if (typedState === 'ip_capped') { state = 'ip_capped'; label = 'IP 并发上限'; }
+    else if (typedState === 'waiting_room_queued' || typedState === 'waiting_room_required') { state = 'waiting_room'; label = '等待室排队'; }
     else { state = 'ok'; label = '存活'; quota = fmtQuota(); }
   } else { state = 'unknown'; label = `HTTP ${r.status}`; }
   const result = {
@@ -310,17 +399,23 @@ async function probeAccount(token) {
     accessTier: data.accessTier || null,
     model: data.model || null,
     statusCode: r.status,
-    raw: String(r.text || '').slice(0, 500),
   };
   // 只有管理员主动探测得到明确存活结果时才清除持久隔离；业务成功响应
   // 不自动清除，避免上游短暂异常造成封禁状态抖动。
+  const existingState = accountStateStore.snapshot([token])[token] || null;
   if (result.state === 'ok') accountStateStore.clear(token);
-  // 本地隔离到期时间，给面板显示「这个号几点重新入池」。
-  // ⚠️ 不是上游给的解封时间：官方 banned 响应体只有 {"status":"banned"}（terminal 状态，
-  // 见 freebuff-session.ts 的 FreebuffSessionResponse），任何时间字段都没有。
-  // 这里的值来自 worker 侧 BANNED_DEFAULT_COOLDOWN_MS 的 24h 兜底。
+  else if (result.state === 'banned' && existingState?.state !== 'banned') {
+    accountStateStore.set(token, { state: 'banned', until: null, reason: 'upstream_banned' });
+  } else if (result.state === 'token_invalid' && existingState?.state !== 'token_invalid') {
+    accountStateStore.set(token, { state: 'token_invalid', until: null, reason: 'upstream_auth_rejected' });
+  }
+  // 官方 banned 没有恢复时间；永久隔离只由管理员成功探测或 clear 解除。
   const isolation = accountStateStore.snapshot([token])[token];
   result.isolatedUntil = isolation && isolation.until != null ? isolation.until : null;
+  result.isolatedPermanent = Boolean(
+    isolation && isolation.until == null
+      && ['banned', 'token_invalid', 'manual_disabled'].includes(isolation.state),
+  );
   return result;
 }
 
@@ -485,6 +580,7 @@ function buildWorkerEnv() {
     FREEBUFF_ACCOUNT_STATE_REVISION: accountStateStore.revision(),
     FREEBUFF_ACCOUNT_STATE_SET: (token, state) => accountStateStore.set(token, state),
     FREEBUFF_ACCOUNT_STATE_CLEAR: (token) => accountStateStore.clear(token),
+    FREEBUFF_ACCOUNT_STATE_GET: (token) => accountStateStore.snapshot([token])[token] || null,
   };
 }
 
@@ -627,7 +723,7 @@ async function handleWebApi(req, res, url) {
       for (const acct of accounts) {
         if (acct.hasToken) health[acct.key] = await probeAccount(acct.token);
       }
-      return json(res, 200, { accounts, health, readonly: CFG.readonlyAccounts });
+      return json(res, 200, { accounts: accounts.map(publicAccountDto), health, readonly: CFG.readonlyAccounts });
     }
     if (method === 'POST' && !sub) {
       if (CFG.readonlyAccounts) return err(res, 403, '账号池为只读模式', 'readonly');
@@ -638,7 +734,8 @@ async function handleWebApi(req, res, url) {
       const name = String(body.name || '').trim();
       if (authToken.length < 20) return err(res, 400, 'authToken 无效（长度不足）', 'invalid_token');
       const obj = loadAccounts();
-      const key = accountKey({ id: body.id, email: email || undefined, authToken });
+      const key = existingAccountKey(obj, authToken)
+        || accountKey({ id: body.id, email: email || undefined, authToken });
       const existing = obj.accounts[key] || {};
       obj.accounts[key] = {
         id: body.id || existing.id || key,
@@ -844,7 +941,6 @@ function sanitizeUser(user) {
     id: user.id || '',
     name: user.name || '',
     email: user.email || '',
-    authToken: user.authToken || '',
     credits: user.credits ?? null,
   };
 }

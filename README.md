@@ -33,10 +33,12 @@ data/
 └─ aliases.json                   # 自定义模型别名
 ```
 
-`account-state.json` 不保存原始 token。上游明确返回 `banned` 或 `401` 后，账号会被隔离；
-管理员在账号池里执行一次成功探测即可清除过期隔离。`country_blocked`、`ip_capped` 和裸
-403 仍归因于当前出口节点，不会写成账号封禁。所有账号都不可用时，服务返回 403（全封禁）、
-429（全是额度冷却，带 `Retry-After`）或 503（忙/混合状态），不会删除冷却记录强行试号。
+`account-state.json` 不保存原始 token。上游明确返回 `banned` 或 `401` 后，账号进入永久终态隔离；
+手动禁用也使用同一永久状态表示，只有管理员成功探测或显式清除才能恢复。`country_blocked`、`ip_capped` 和裸 403 归因于当前
+出口节点，不写成账号封禁，并在当前请求上返回出口不可用。typed 429 只隔离其真实作用域：
+Premium/GLM 使用已确认的池，`spend_limited` 使用账号级，generic 429 只锁当前模型；等待室
+返回结构化 503。所有账号都不可用时，服务返回 403（全终态）、429（当前作用域全是额度冷却，
+带 `Retry-After`）或 503（忙/混合/会话错误），不会删除冷却记录强行试号。
 状态文件先写完整临时副本再替换；Windows 替换边界会保留 `.bak`，启动时可从完整的
 `.tmp`/`.bak` 恢复，避免半写 JSON 被当成空状态。流式请求在响应返回前客户端断开时，
 Node 转发桥会中止 Worker `Request.signal`，同时取消上游 reader 并释放账号租约。
@@ -134,7 +136,9 @@ Luna 是**钉死**而不是 clamp —— 任何档位（含 `low` / `none` / `au
 | 额度表内容 | `deepseek-v4-flash`、`mimo-v2.5`（+ `glm-5.2` 的 `0/0`） | `minimax-m3`、`deepseek-v4-pro`、`gpt-5.6-luna`、`kimi-k3-eco`、`muse-spark` 五个 |
 | 每日额度 | 两个模型各 6 次 session | 五个模型**共享**一份 6 次，按调用加权（`used` 会是 1.3 这种小数） |
 
-两个池都在太平洋日 `07:00 UTC`（北京时间 15:00）重置；GLM 5.2 是独立的邀请解锁池，不占以上任何一份。
+上游额度按 `America/Los_Angeles` 日历日重置；UTC 时刻随夏令时为 `07:00` 或 `08:00`（北京时间
+15:00 或 16:00），面板优先显示上游返回的 `resetAt`。代理对没有 typed 状态或时间提示的 generic
+429 只使用有界的 60 秒退避，不猜测太平洋午夜；GLM 5.2 是独立的邀请解锁池。
 
 ### 关于 US 出口的两个坑（实测）
 
@@ -204,9 +208,12 @@ GitHub Actions 在 push 到 `beta` 分支时自动构建 `linux/amd64,linux/arm6
 以下仓库只作为设计参考；本项目以现有 Node/worker 架构重写，未直接复制其 TLS 伪装、换 IP
 规避、自动注册或养号代码：
 
-- **[trefeon/freebuff-proxy](https://github.com/trefeon/freebuff-proxy)**（MIT）——结构化封禁冷却、`resumes_at` 解析、429 重置时间和太平洋午夜兜底；本地落在 `worker.js` 的 `parseCooldown`、持久隔离和池耗尽响应。
+- **[trefeon/freebuff-proxy](https://github.com/trefeon/freebuff-proxy)**（MIT）——结构化重试提示和池耗尽响应；本地落在 `worker.js` 的 `parseCooldown`、作用域冷却和池耗尽响应。其 `resumes_at`/太平洋午夜兜底属于旧第三方实现观察，不作为当前官方 `banned` 契约。
 - **[yelixir-dev/freebuff-bridge](https://github.com/yelixir-dev/freebuff-bridge)**（MIT）——每账号一次 `inFlight` 租约和请求结束释放；本地落在 `pickToken`/`releaseToken` 及 chat/reviewer 两条执行链。
 - **[yuzu-octopus/freebuff2api](https://github.com/yuzu-octopus/freebuff2api)**（MIT）——忙账号跳过、流式异常/取消先停止上游 reader 再释放租约的生命周期约束；本地落在 SSE 管道完成回调和 Node 转发断流处理。
 - **[akasakaid/Freebuff-router](https://github.com/akasakaid/Freebuff-router)**（MIT）——账号状态与严格池耗尽的持久化思路；本地改为 `server/account-state.mjs` 的 SHA-256 JSON 存储，不引入 SQLite。
 
 精确提交、审查日期、已采用行为和定期复查步骤见 [`docs/PROJECT_MEMORY.md`](docs/PROJECT_MEMORY.md)。
+
+账号安全改造只能保证：观察到 terminal 状态后不再发送该账号的 Bearer 上游请求；没有独立 cohort 数据，
+不能据此宣称降低首次封禁率。

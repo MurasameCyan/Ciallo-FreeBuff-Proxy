@@ -11,7 +11,11 @@ export function tokenHash(token) {
 
 function normalizeRecord(value) {
   if (!value || typeof value !== 'object' || !STATES.has(value.state)) return null;
-  const until = value.until == null ? null : Number(value.until);
+  // All persisted terminal states require an explicit administrator clear.
+  // Keep one unambiguous representation so the worker and panel cannot disagree.
+  const until = STATES.has(value.state)
+    ? null
+    : value.until == null ? null : Number(value.until);
   if (until !== null && (!Number.isFinite(until) || until < 0)) return null;
   return {
     state: value.state,

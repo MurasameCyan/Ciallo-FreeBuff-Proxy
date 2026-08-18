@@ -16,6 +16,23 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # 测试只允许内存 mock 与 127.0.0.1；不要把 runner/宿主的凭据、订阅或代理
+    # 环境带进 server-api 子进程。
+    env:
+      FREEBUFF_TOKEN: ''
+      FREEBUFF_API_KEY: ''
+      FREEBUFF_CREDENTIALS_FILE: ''
+      FREEBUFF_ACCOUNT_STATE_FILE: ''
+      CODEBUFF_API: ''
+      SUBSCRIPTION_URL: ''
+      MIHOMO_BIN: ''
+      MIHOMO_DATA_DIR: ''
+      MIHOMO_HEALTH_URL: ''
+      HTTP_PROXY: ''
+      HTTPS_PROXY: ''
+      ALL_PROXY: ''
+      NO_PROXY: '127.0.0.1,localhost'
+      NODE_USE_ENV_PROXY: '0'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -25,8 +42,15 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: node --check web/app.js
       - run: node --check web/login.js
+      - run: node --check worker.js
+      - run: node --check server.js
+      - run: node --check server/account-state.mjs
       - run: node test/unit.test.mjs
+      - run: node --test test/account-state.test.mjs
+      - run: node --test test/account-safety-worker.test.mjs
+      - run: node --test test/server-api.test.mjs
       - run: node test/proxy.test.mjs
+      - run: node --test test/usage-persistence.test.mjs
       - run: node test/web-layout.test.mjs
 
   build:

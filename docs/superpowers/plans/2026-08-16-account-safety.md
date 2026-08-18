@@ -1,5 +1,9 @@
 # 账号安全改造实现计划
 
+> **已被取代（superseded）：** 本文件记录 2026-08-16 的历史设计。当前契约以
+> [`2026-08-17-account-safety-p0.md`](2026-08-17-account-safety-p0.md) 为准；其中
+> `resumes_at`、24 小时 `banned` 兜底和 generic 429 的 Pacific midnight 语义不再适用。
+
 > **面向 AI 代理的工作者：** 必需子技能：使用 superpowers:subagent-driven-development（推荐）或 superpowers:executing-plans 逐任务实现此计划。步骤使用复选框（`- [ ]`）语法来跟踪进度。
 
 **目标：** 在不改变 Freebuff 当前协议链的前提下，持久隔离明确封禁/失效账号，严格处理账号租约和池耗尽，并采用可审计的上游设计参考。
