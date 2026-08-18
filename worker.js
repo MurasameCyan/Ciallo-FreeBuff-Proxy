@@ -570,6 +570,9 @@ const durableAccountStates = new Map(); // token -> { state, until, reason }
 const dirtyAccountStates = new Set(); // 本请求刚写入，不能被旧 env 快照覆盖
 const accountStateRevisions = new Map(); // token -> 最近已应用/本地写入的 store revision
 const accountLeases = new Map(); // token -> inFlight count (最多 1)
+const accountLeaseWaiters = new Map(); // token -> settle[]，active session 忙时等待释放
+// 短请求优先等待原 active session；长流超过此窗口后仍允许回退其他账号。
+const ACTIVE_SESSION_LEASE_WAIT_MS = 10 * 1000;
 const TERMINAL_ACCOUNT_STATES = new Set(["banned", "token_invalid", "manual_disabled"]);
 let accountStateSet = null;
 let accountStateClear = null;
@@ -682,10 +685,43 @@ function acquireToken(token) {
 function releaseToken(token) {
   if (!token) return;
   accountLeases.delete(token);
+  const waiters = accountLeaseWaiters.get(token);
+  if (!waiters) return;
+  const next = waiters.shift();
+  if (waiters.length) accountLeaseWaiters.set(token, waiters);
+  next?.();
 }
 
 function tokenBusy(token) {
   return accountLeases.get(token) === 1;
+}
+
+function waitForTokenRelease(token, waitMs = ACTIVE_SESSION_LEASE_WAIT_MS, signal = null) {
+  if (!tokenBusy(token) || !(waitMs > 0)) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const waiters = accountLeaseWaiters.get(token) || [];
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      const index = waiters.indexOf(finish);
+      if (index >= 0) waiters.splice(index, 1);
+      if (waiters.length === 0) accountLeaseWaiters.delete(token);
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener("abort", onAbort);
+      if (error) reject(error);
+      else resolve();
+    };
+    const onAbort = () => finish(signal.reason instanceof Error ? signal.reason : new Error("request aborted"));
+    const timer = setTimeout(() => finish(), waitMs);
+    waiters.push(finish);
+    accountLeaseWaiters.set(token, waiters);
+    if (signal) {
+      if (signal.aborted) onAbort();
+      else signal.addEventListener("abort", onAbort, { once: true });
+    }
+    if (!tokenBusy(token)) finish();
+  });
 }
 
 
@@ -1033,6 +1069,29 @@ function callLogSnapshot() {
     startTime: usage.startTime,
     lastRequest: usage.lastRequest,
   };
+}
+
+// 第一次选号若已有同模型 active session，只短暂等待它的单并发租约；
+// 超时或真正失败后的重试仍走原 picker，保留跨账号故障转移。
+async function pickTokenWithSessionWait(
+  env,
+  sessionModel,
+  attempted = new Set(),
+  signal = null,
+  waitMs = ACTIVE_SESSION_LEASE_WAIT_MS,
+) {
+  if (sessionModel && attempted.size === 0) {
+    syncAccountState(env);
+    const preferred = parseAccounts(env).find((acct) =>
+      !accountIsBlocked(acct.token)
+      && !inScopedCooldown(acct.token, sessionModel)
+      && isUsableSession(sessCache.get(acct.token + ":" + sessionModel))
+    );
+    if (preferred && tokenBusy(preferred.token)) {
+      await waitForTokenRelease(preferred.token, waitMs, signal);
+    }
+  }
+  return pickToken(env, sessionModel, attempted);
 }
 
 function pickToken(env, sessionModel, attempted = new Set()) {
@@ -2661,7 +2720,10 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode, requestSig
   const attempted = new Set();
   for (let acctTry = 0; acctTry < pool.length; acctTry++) {
     throwIfRequestAborted(requestSignal);
-    const acct = pickToken(env, mc.session, attempted);
+    const acct = await pickTokenWithSessionWait(
+      env, mc.session, attempted, requestSignal,
+      attempted.size === 0 ? ACTIVE_SESSION_LEASE_WAIT_MS : 0,
+    );
     const token = acct ? acct.token : null;
     if (!token) {
       recordRequest(mc && mc.id ? mc.id : "", null, false);
@@ -2816,7 +2878,10 @@ async function executeChat(env, chatParams, mc, isStream, mode, requestSignal = 
   const attempted = new Set();
   for (let acctTry = 0; acctTry < pool.length; acctTry++) {
     throwIfRequestAborted(requestSignal);
-    const acct = pickToken(env, mc.session, attempted);
+    const acct = await pickTokenWithSessionWait(
+      env, mc.session, attempted, requestSignal,
+      attempted.size === 0 ? ACTIVE_SESSION_LEASE_WAIT_MS : 0,
+    );
     const token = acct ? acct.token : null;
     if (!token) {
       recordRequest(mc && mc.id ? mc.id : "", null, false);

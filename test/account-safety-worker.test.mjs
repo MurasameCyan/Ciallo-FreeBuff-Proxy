@@ -10,7 +10,7 @@ import { createAccountStateStore } from '../server/account-state.mjs';
 const workerSource = readFileSync(new URL('../worker.js', import.meta.url), 'utf8');
 const workerWrapper = workerSource.replace('export default {', 'const __workerDefault__ = {')
   + '\n\nglobalThis.__workerDefault__ = __workerDefault__;\n'
-  + 'globalThis.__accountSafetyTestApi__ = { pickToken, releaseToken, recordAccountObservation, cooldown, parseCooldown, accountPoolExhaustion, classifyRateLimit, quotaScopeForModel, freshQuotaProbe, startRun, executeChat, executeCodeReview, createSession };\n';
+  + 'globalThis.__accountSafetyTestApi__ = { pickToken, pickTokenWithSessionWait, releaseToken, recordAccountObservation, cooldown, parseCooldown, accountPoolExhaustion, classifyRateLimit, quotaScopeForModel, freshQuotaProbe, startRun, executeChat, executeCodeReview, createSession };\n';
 
 const TOKEN = 'permanent-banned-account-token-123456';
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -920,12 +920,180 @@ test('所有账号 session 阶段短暂失败时返回 upstream_session_unavaila
   assert.ok(response.headers.get('Retry-After'));
 });
 
+test('生产 createSession 顺序调用复用一小时缓存且不再请求 session 接口', async () => {
+  const start = Date.UTC(2030, 0, 1);
+  const token = 'create-session-sequential-reuse-account-123456';
+  const model = terminalModel.session;
+  let sessionCalls = 0;
+  const workerVm = createWorkerVm({
+    now: start,
+    fetchImpl: async (url, init = {}) => {
+      const path = new URL(String(url)).pathname;
+      if (path.includes('/api/v1/ads') || path.includes('/api/v1/usage')) return upstreamResponse(200, {});
+      if (path === '/api/v1/freebuff/session') {
+        sessionCalls += 1;
+        if (String(init.method || 'GET').toUpperCase() === 'GET') return upstreamResponse(404, {});
+        return upstreamResponse(200, {
+          status: 'active',
+          instanceId: 'sequential-reuse-instance',
+          model,
+          expiresAt: new Date(start + 3600 * 1000).toISOString(),
+        });
+      }
+      return upstreamResponse(200, {});
+    },
+  });
+
+  const first = await workerVm.api.createSession(token, model);
+  const callsAfterCreate = sessionCalls;
+  const second = await workerVm.api.createSession(token, model);
+
+  assert.equal(first.instanceId, 'sequential-reuse-instance');
+  assert.equal(second.instanceId, first.instanceId);
+  assert.equal(sessionCalls, callsAfterCreate, '缓存命中后不得新增 session GET/POST');
+});
+
+test('同模型 active session 忙时并发请求依次等待原账号，不在其他账号创建新 session', async () => {
+  const start = Date.UTC(2030, 0, 1);
+  const tokenA = 'active-session-wait-account-a-123456';
+  const tokenB = 'active-session-wait-account-b-123456';
+  const model = terminalModel.session;
+  const env = terminalEnv(`${tokenA},${tokenB}`);
+  const sessionPosts = [];
+  let releaseFirstChat;
+  const firstChatGate = new Promise((resolve) => { releaseFirstChat = resolve; });
+  let chatCalls = 0;
+  let firstChatStarted;
+  const firstChatStartedPromise = new Promise((resolve) => { firstChatStarted = resolve; });
+  const successStream = () => new Response(
+    `data: ${JSON.stringify({ choices: [{ delta: { content: 'ok' }, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`,
+    { status: 200, headers: { 'content-type': 'text/event-stream' } },
+  );
+  const workerVm = createWorkerVm({
+    now: start,
+    fetchImpl: async (url, init = {}) => {
+      const path = new URL(String(url)).pathname;
+      const method = String(init.method || 'GET').toUpperCase();
+      const auth = init.headers?.Authorization || init.headers?.authorization || '';
+      const slot = auth.endsWith(tokenA) ? 'A' : auth.endsWith(tokenB) ? 'B' : '?';
+      if (path.includes('/api/v1/ads') || path.includes('/api/v1/usage')) return upstreamResponse(200, {});
+      if (path === '/api/v1/freebuff/session' && method === 'GET') return upstreamResponse(404, {});
+      if (path === '/api/v1/freebuff/session' && method === 'POST') {
+        sessionPosts.push(slot);
+        return upstreamResponse(200, {
+          status: 'active',
+          instanceId: `active-wait-${slot}`,
+          model,
+          expiresAt: new Date(start + 3600 * 1000).toISOString(),
+        });
+      }
+      if (path === '/api/v1/agent-runs') return upstreamResponse(200, { runId: `active-wait-run-${slot}` });
+      if (path === '/api/v1/chat/completions') {
+        chatCalls += 1;
+        if (chatCalls === 1) {
+          firstChatStarted();
+          await firstChatGate;
+        }
+        return successStream();
+      }
+      return upstreamResponse(200, {});
+    },
+  });
+
+  await workerVm.api.createSession(tokenA, model);
+  sessionPosts.length = 0;
+  const first = workerVm.api.executeChat(env, terminalChatParams, terminalModel, false, 'chat');
+  await firstChatStartedPromise;
+  const second = workerVm.api.executeChat(env, terminalChatParams, terminalModel, false, 'chat');
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  assert.deepEqual(sessionPosts, [], 'A 忙时第二个请求不应立即在 B 创建 session');
+  releaseFirstChat();
+  const [firstResponse, secondResponse] = await Promise.all([first, second]);
+  assert.equal(firstResponse.status, 200);
+  assert.equal(secondResponse.status, 200);
+  assert.deepEqual(sessionPosts, [], 'A 释放后第二个请求应复用 A 的 active session');
+});
+
+test('等待 active session 租约时客户端取消会立即停止且不改选其他账号', async () => {
+  const start = Date.UTC(2030, 0, 1);
+  const tokenA = 'active-session-abort-account-a-123456';
+  const tokenB = 'active-session-abort-account-b-123456';
+  const model = terminalModel.session;
+  const workerVm = createWorkerVm({
+    now: start,
+    fetchImpl: async (url, init = {}) => {
+      const path = new URL(String(url)).pathname;
+      if (path.includes('/api/v1/ads') || path.includes('/api/v1/usage')) return upstreamResponse(200, {});
+      if (path === '/api/v1/freebuff/session' && String(init.method || 'GET').toUpperCase() === 'GET') {
+        return upstreamResponse(200, {
+          status: 'active',
+          instanceId: 'active-abort-A',
+          model,
+          expiresAt: new Date(start + 3600 * 1000).toISOString(),
+        });
+      }
+      return upstreamResponse(200, {});
+    },
+  });
+  await workerVm.api.createSession(tokenA, model);
+  const leased = workerVm.api.pickToken(terminalEnv(`${tokenA},${tokenB}`), model, new Set());
+  assert.equal(leased?.token, tokenA);
+  const controller = new AbortController();
+  const waiting = workerVm.api.pickTokenWithSessionWait(
+    terminalEnv(`${tokenA},${tokenB}`), model, new Set(), controller.signal,
+  );
+  controller.abort(new Error('client disconnected'));
+
+  await assert.rejects(waiting, /request aborted/);
+  workerVm.api.releaseToken(tokenA);
+  const recovered = workerVm.api.pickToken(terminalEnv(`${tokenA},${tokenB}`), model, new Set());
+  assert.equal(recovered?.token, tokenA, '取消的 waiter 不得残留或吞掉后续 release');
+  workerVm.api.releaseToken(tokenA);
+  assert.equal(workerVm.upstreamCalls.some(({ init }) =>
+    String(init.headers?.Authorization || '').endsWith(tokenB)), false);
+});
+
+test('active session 等待超时后才回退其他账号', async () => {
+  const start = Date.UTC(2030, 0, 1);
+  const tokenA = 'active-session-timeout-account-a-123456';
+  const tokenB = 'active-session-timeout-account-b-123456';
+  const model = terminalModel.session;
+  const env = terminalEnv(`${tokenA},${tokenB}`);
+  const workerVm = createWorkerVm({
+    now: start,
+    fetchImpl: async (url, init = {}) => {
+      const path = new URL(String(url)).pathname;
+      if (path.includes('/api/v1/ads') || path.includes('/api/v1/usage')) return upstreamResponse(200, {});
+      if (path === '/api/v1/freebuff/session' && String(init.method || 'GET').toUpperCase() === 'GET') {
+        return upstreamResponse(200, {
+          status: 'active',
+          instanceId: 'active-timeout-A',
+          model,
+          expiresAt: new Date(start + 3600 * 1000).toISOString(),
+        });
+      }
+      return upstreamResponse(200, {});
+    },
+  });
+  await workerVm.api.createSession(tokenA, model);
+  const leased = workerVm.api.pickToken(env, model, new Set());
+  assert.equal(leased?.token, tokenA);
+
+  const selected = await workerVm.api.pickTokenWithSessionWait(env, model, new Set(), null, 10);
+  assert.equal(selected?.token, tokenB);
+  workerVm.api.releaseToken(tokenB);
+  workerVm.api.releaseToken(tokenA);
+});
+
 test('生产 createSession 复用 singleFlight，失败后允许下一次重试', async () => {
+  const start = Date.UTC(2030, 0, 1);
   const token = 'create-session-singleflight-account-123456';
   const model = terminalModel.session;
   let postCalls = 0;
   let failFirstPost = false;
   const workerVm = createWorkerVm({
+    now: start,
     fetchImpl: async (url, init = {}) => {
       const path = new URL(String(url)).pathname;
       if (path.includes('/api/v1/ads') || path.includes('/api/v1/usage')) return upstreamResponse(200, {});
@@ -940,7 +1108,7 @@ test('生产 createSession 复用 singleFlight，失败后允许下一次重试'
           status: 'active',
           instanceId: `singleflight-${postCalls}`,
           model,
-          expiresAt: new Date(Date.now() + 3600 * 1000).toISOString(),
+          expiresAt: new Date(start + 3600 * 1000).toISOString(),
         });
       }
       return upstreamResponse(200, {});
