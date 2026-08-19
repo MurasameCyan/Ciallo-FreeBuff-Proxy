@@ -16,6 +16,8 @@ const S = {
   models: [], proxy: null, usage: null,
   // 分享 key：keys 是配置，keyStats 是 worker 进程内的归账（按备注名 join）
   keys: [], keyStats: {}, ownerName: '主 Key', keysLocked: false,
+  // 账号列邮箱去敏：默认开着（截图/投屏不漏），点表头那只眼睛才展开；只影响展示，F5 回到默认
+  maskEmail: true,
   build: '', buildUrl: '', repoUrl: '', trackRef: '', latest: '',
 };
 
@@ -53,6 +55,28 @@ async function rawApi(path, opts) {
 function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
 }
+
+const ICONS = {
+  copy: '<rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
+  edit: '<path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L8 18l-4 1 1-4Z"/>',
+  power: '<path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><path d="M12 2v10"/>',
+  trash: '<path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="m19 6-1 14H6L5 6"/><path d="M10 11v5M14 11v5"/>',
+  // 莫比乌斯环 = 不限。两瓣在正中 (12,12) 交叉；真·扭转带在 16px 上糊成一团，取它的双纽线形。
+  mobius: '<path d="M12 12c-1.8-2.5-3.6-3.8-5.5-3.8a3.8 3.8 0 0 0 0 7.6c1.9 0 3.7-1.3 5.5-3.8"/><path d="M12 12c1.8 2.5 3.6 3.8 5.5 3.8a3.8 3.8 0 0 0 0-7.6c-1.9 0-3.7 1.3-5.5 3.8"/>',
+  eye: '<path d="M1.5 12S5 5.5 12 5.5 22.5 12 22.5 12 19 18.5 12 18.5 1.5 12 1.5 12Z"/><circle cx="12" cy="12" r="3"/>',
+  eyeOff: '<path d="M4 4l16 16"/><path d="M9.9 5.9A9.6 9.6 0 0 1 12 5.5c7 0 10.5 6.5 10.5 6.5a18 18 0 0 1-3.3 4.1"/><path d="M6.4 7.7A17.8 17.8 0 0 0 1.5 12S5 18.5 12 18.5a9.7 9.7 0 0 0 3.6-.66"/><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2"/>',
+};
+
+function iconSvg(icon, size = 15) {
+  return `<svg viewBox="0 0 24 24" width="${size}" height="${size}" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[icon]}</svg>`;
+}
+
+function iconButton(icon, label, attrs = '', tone = '') {
+  return `<button type="button" class="btn tiny icon ${tone}" ${attrs} title="${esc(label)}" aria-label="${esc(label)}">${iconSvg(icon)}</button>`;
+}
+
+// 会话不限：只画环，"不限"二字挪到 title / aria-label，读屏和悬停都还在。
+const UNLIMITED_GLYPH = `<span class="unlimited" title="不限" aria-label="不限" role="img">${iconSvg('mobius', 16)}</span>`;
 
 function toast(msg, kind = 'ok') {
   const el = document.createElement('div');
@@ -254,15 +278,17 @@ function renderBuild() {
     : '构建标识未知(构建时没注入 GIT_COMMIT)';
 }
 
-function statePill(s) {
+function stateDot(s, detail = '') {
   const map = {
     ok: ['ok', '存活'], token_invalid: ['danger', '失效'], banned: ['danger', '封禁'],
-    country_blocked: ['warn', '受限'], rate_limited: ['warn', '额度用完'],
-    model_locked: ['warn', '锁定'], ip_capped: ['warn', 'IP 上限'],
-    blocked: ['warn', '拒绝'], unknown: ['muted', '未知'],
+    country_blocked: ['warn', '地区受限'], rate_limited: ['warn', '模型额度受限'],
+    spend_limited: ['warn', '账号消费额度受限'], waiting_room: ['warn', '等待室排队'],
+    model_locked: ['warn', 'session 被锁定'], ip_capped: ['warn', 'IP 并发上限'],
+    blocked: ['warn', '访问被拒'], unknown: ['muted', '未知'],
   };
-  const [cls, label] = map[s] || ['muted', s];
-  return `<span class="pill ${cls}"><span class="dot ${cls}"></span>${label}</span>`;
+  const [cls, fallback] = map[s] || ['muted', s || '未知'];
+  const label = detail || fallback;
+  return `<span class="account-state-dot dot ${cls}" title="状态：${esc(label)}" aria-label="状态：${esc(label)}" role="img"></span>`;
 }
 
 // 额度展示优先使用上游返回的池/模型快照；Premium 的共池关系已确认，其他分组不因本地
@@ -347,11 +373,34 @@ function renderStats() {
   $('sTotalSub').textContent = `${S.accounts.filter(a => a.hasToken).length} 个含 token`;
 }
 
+// 账号列邮箱去敏：只留本地部分首 1–2 位和一级域名（he***@***.cc），中间几级子域一起抹掉，
+// 星号定长所以连长度都不泄。备注名不含 @ 就原样返回，主行/次行都能无脑套一层。
+function maskEmail(s) {
+  const text = String(s ?? '');
+  if (!S.maskEmail) return text;
+  return text.replace(/([^@\s]+)@([^@\s]+)/g, (_, user, domain) => {
+    const dot = domain.lastIndexOf('.');   // 取最后一段：do-ge.v0n0v.eu.cc 只剩 .cc
+    return `${user.slice(0, user.length > 3 ? 2 : 1)}***@***${dot > 0 ? domain.slice(dot) : ''}`;
+  });
+}
+
+// 表头那只眼睛：一键去敏整列，文字说明只放 title / aria-label
+function renderMaskToggle() {
+  const btn = $('maskEmail');
+  if (!btn) return;
+  const label = S.maskEmail ? '显示完整邮箱' : '隐藏邮箱';
+  btn.innerHTML = iconSvg(S.maskEmail ? 'eyeOff' : 'eye', 14);
+  btn.setAttribute('aria-pressed', String(S.maskEmail));
+  btn.title = label;
+  btn.setAttribute('aria-label', label);
+}
+
 function renderAccounts() {
   const table = document.querySelector('.account-table');
   table.classList.toggle('is-empty', S.accounts.length === 0);
   $('acctCount').textContent = `${S.accounts.length} 个`;
   renderQuotaHead();
+  renderMaskToggle();
   if (!S.accounts.length) {
     $('acctBody').innerHTML = '<tr><td colspan="4" class="empty">暂无账号，请切换到「添加」</td></tr>';
     return;
@@ -367,14 +416,14 @@ function renderAccounts() {
     const secondary = a.email && a.email !== label ? a.email : '';
     return `<tr>
       <td>
-        <div class="nm">${esc(label)}${usageHtml}</div>
-        ${secondary ? `<div class="mono">${esc(secondary)}</div>` : ''}
+        <div class="nm">${esc(maskEmail(label))}${usageHtml}</div>
+        ${secondary ? `<div class="mono">${esc(maskEmail(secondary))}</div>` : ''}
       </td>
-      <td>${h ? statePill(h.state) : '<span class="pill muted">未探测</span>'}</td>
+      <td>${h ? stateDot(h.state, h.label) : stateDot('unknown', '未探测')}</td>
       <td>${modelsCellHtml(h)}</td>
-      <td>
-        <div class="actions">
-          ${S.readonly ? '' : `<button class="btn tiny danger" data-del="${esc(a.key)}">删除</button>`}
+      <td class="action-col">
+        <div class="actions icon-actions">
+          ${S.readonly ? '' : iconButton('trash', '删除账号', `data-del="${esc(a.key)}"`, 'danger')}
         </div>
       </td>
     </tr>`;
@@ -389,7 +438,7 @@ function renderAccounts() {
       const label = acct?.name || acct?.email || key.slice(0, 20) + '…';
       if (!await confirmBox({
         title: '删除账号',
-        text: `确认删除「${label}」？账号会从池子里移除，正在进行的请求不受影响。`,
+        text: `确认删除「${maskEmail(label)}」？账号会从池子里移除，正在进行的请求不受影响。`,
         ok: '删除',
       })) return;
       try {
@@ -414,7 +463,7 @@ function renderAliases() {
   }
   $('aliasBody').innerHTML = keys.map(k =>
     `<tr><td><code>${esc(k)}</code></td><td><code>${esc(S.aliases[k])}</code></td>
-     <td><button class="btn tiny danger" data-adel="${esc(k)}">删除</button></td></tr>`
+     <td class="action-col"><div class="actions icon-actions">${iconButton('trash', '删除模型映射', `data-adel="${esc(k)}"`, 'danger')}</div></td></tr>`
   ).join('');
   $('aliasBody').querySelectorAll('[data-adel]').forEach(b =>
     b.addEventListener('click', async () => {
@@ -449,18 +498,42 @@ function keyMask(key) {
   return key.length > 14 ? `${key.slice(0, 8)}…${key.slice(-4)}` : key;
 }
 
-/** 可用模型多选框的选项。已存的白名单模型即使当前模型表里没有也保留，
+/** 已存的白名单模型即使当前模型表里没有也保留，
     否则编辑一把限了「暂时拉不到的模型」的 key，一保存就把白名单清空了。 */
-function fillKeyModelSelect(selected = []) {
-  const sel = $('newKeyModels');
-  const ids = (Array.isArray(S.models) ? S.models.map((m) => m.id) : []).slice();
-  for (const id of selected) if (!ids.includes(id)) ids.push(id);
-  sel.replaceChildren(...ids.map((id) => {
-    const opt = document.createElement('option');
-    opt.value = id;
-    opt.textContent = id;
-    opt.selected = selected.includes(id);
-    return opt;
+function selectedKeyModels() {
+  return [...$('newKeyModels').querySelectorAll('[data-key-model][aria-pressed="true"]')]
+    .map((button) => button.dataset.keyModel)
+    .filter(Boolean);
+}
+
+function setKeyModelSelection(selected = []) {
+  const wanted = new Set(selected);
+  const hasSpecific = wanted.size > 0;
+  $('newKeyModels').querySelectorAll('[data-key-model]').forEach((button) => {
+    const model = button.dataset.keyModel;
+    button.setAttribute('aria-pressed', String(model ? wanted.has(model) : !hasSpecific));
+  });
+}
+
+function fillKeyModelButtons(selected = []) {
+  const chosen = [...new Set(selected.filter(Boolean))];
+  const ids = (Array.isArray(S.models) ? S.models.map((m) => m.id).filter(Boolean) : []).slice();
+  for (const id of chosen) if (!ids.includes(id)) ids.push(id);
+  const root = $('newKeyModels');
+  root.innerHTML = [
+    `<button type="button" class="key-model-option" data-key-model="" aria-pressed="${chosen.length === 0}" title="不限模型">All</button>`,
+    ...ids.map((id) => `<button type="button" class="key-model-option" data-key-model="${esc(id)}" aria-pressed="${chosen.includes(id)}">${esc(id)}</button>`),
+  ].join('');
+  root.querySelectorAll('[data-key-model]').forEach((button) => button.addEventListener('click', () => {
+    const model = button.dataset.keyModel;
+    if (!model) {
+      setKeyModelSelection([]);
+    } else {
+      const selected = new Set(selectedKeyModels());
+      if (selected.has(model)) selected.delete(model);
+      else selected.add(model);
+      setKeyModelSelection([...selected]);
+    }
   }));
 }
 
@@ -469,8 +542,8 @@ function resetKeyForm() {
   $('newKeyName').value = '';
   $('newKeyConcurrency').value = '1';   // 并发默认 1：免费通道同号并发 >1 就出问题
   $('newKeyDaily').value = '0';
-  fillKeyModelSelect([]);
-  $('keyAdd').textContent = '发一把新 Key';
+  fillKeyModelButtons([]);
+  $('keyAdd').textContent = '新建 Key';
   $('keyCancel').hidden = true;
 }
 
@@ -479,7 +552,7 @@ function fillKeyForm(k) {
   $('newKeyName').value = k.name || '';
   $('newKeyConcurrency').value = String(k.concurrency ?? 1);
   $('newKeyDaily').value = String(k.dailyLimit ?? 0);
-  fillKeyModelSelect(Array.isArray(k.models) ? k.models : []);
+  fillKeyModelButtons(Array.isArray(k.models) ? k.models : []);
   $('keyAdd').textContent = '保存修改';
   $('keyCancel').hidden = false;
   $('newKeyName').focus();
@@ -490,7 +563,7 @@ function renderKeys() {
   $('keyCount').textContent = `${list.length} 把`;
   const body = $('keyBody');
   if (!list.length) {
-    body.innerHTML = '<tr><td colspan="7" class="empty">'
+    body.innerHTML = '<tr><td colspan="8" class="empty">'
       + (S.keysLocked
         ? '未设置 ADMIN_PASSWORD,不能发分享 Key —— 拿到面板地址的人都能进来发 Key'
         : '还没有分享 Key。下面填个备注名就能发一把,默认并发 1、不限模型。')
@@ -498,21 +571,22 @@ function renderKeys() {
   } else {
     body.innerHTML = list.map((k) => {
       const st = S.keyStats[k.name] || {};
-      const models = Array.isArray(k.models) && k.models.length ? k.models.join(', ') : '不限';
+      const models = Array.isArray(k.models) && k.models.length ? k.models.join(', ') : 'All';
       const running = st.inFlight > 0 ? ` · 在跑 ${st.inFlight}` : '';
       return `<tr class="${k.disabled ? 'key-off' : ''}">
         <td><span class="nm">${esc(k.name)}</span>${k.disabled ? ' <span class="pill">已停用</span>' : ''}</td>
         <td><code title="${esc(k.key)}">${esc(keyMask(k.key))}</code></td>
         <td>${esc(String(k.concurrency))}</td>
-        <td>${k.dailyLimit > 0 ? esc(String(k.dailyLimit)) : '不限'}</td>
-        <td class="key-models-cell mono" title="${esc(models)}">${esc(models)}</td>
+        <td>${k.dailyLimit > 0 ? esc(String(k.dailyLimit)) : UNLIMITED_GLYPH}</td>
         <td class="mono">${fmtCount(st.dayCount || 0)} / ${fmtCount(st.total || 0)}${running}</td>
-        <td class="action-col">
-          <button class="btn tiny" data-kcopy="${esc(k.key)}">复制</button>
-          <button class="btn tiny" data-kedit="${esc(k.key)}">编辑</button>
-          <button class="btn tiny" data-ktoggle="${esc(k.key)}">${k.disabled ? '启用' : '停用'}</button>
-          <button class="btn tiny danger" data-kdel="${esc(k.key)}">删除</button>
-        </td></tr>`;
+        <td class="mono" title="历史累计 token ${esc(fmtCount(st.totalTokens || 0))}">${fmtTokens(st.totalTokens || 0)}</td>
+        <td class="key-models-cell mono" title="${esc(models)}">${esc(models)}</td>
+        <td class="action-col"><div class="actions icon-actions">
+          ${iconButton('copy', '复制 Key', `data-kcopy="${esc(k.key)}"`)}
+          ${iconButton('edit', '编辑 Key', `data-kedit="${esc(k.key)}"`)}
+          ${iconButton('power', k.disabled ? '启用 Key' : '停用 Key', `data-ktoggle="${esc(k.key)}"`, k.disabled ? 'ok' : 'warn')}
+          ${iconButton('trash', '删除 Key', `data-kdel="${esc(k.key)}"`, 'danger')}
+        </div></td></tr>`;
     }).join('');
   }
 
@@ -547,9 +621,9 @@ function renderKeys() {
     } catch (e) { toast('删除失败:' + e.message, 'err'); }
   }));
 
-  // 模型表是异步来的（/v1/models 比这张表晚），到了就补进多选框，
-  // 顺手保留用户已经勾上的项 —— 1 小时那拍自动刷新不该把选择清掉。
-  fillKeyModelSelect([...$('newKeyModels').selectedOptions].map((o) => o.value));
+  // 模型表是异步来的（/v1/models 比这张表晚），到了就补进按钮组，
+  // 顺手保留用户已经选中的项 —— 1 小时那拍自动刷新不该把选择清掉。
+  fillKeyModelButtons(selectedKeyModels());
 }
 
 // 返回是否成功：改名撞重名会被 400 挡回来，那时表单必须留着用户填的内容。
@@ -584,7 +658,7 @@ async function submitKeyForm() {
     name,
     concurrency: Number($('newKeyConcurrency').value) || 1,
     dailyLimit: Number($('newKeyDaily').value) || 0,
-    models: [...$('newKeyModels').selectedOptions].map((o) => o.value),
+    models: selectedKeyModels(),
   };
   if (keyEditing) {
     if (await patchKey(keyEditing, body, '已保存')) resetKeyForm();
@@ -597,9 +671,9 @@ async function submitKeyForm() {
     // 明文只在表里显示掩码，这里把整把 key 直接放进剪贴板：发出去就是要用的那一刻。
     try {
       await navigator.clipboard.writeText(r.key.key);
-      $('keyMsg').textContent = `已发出「${name}」，Key 已复制到剪贴板`;
+      $('keyMsg').textContent = `已发出「${name}」，文本 Key 已复制到剪贴板`;
     } catch {
-      $('keyMsg').textContent = `已发出「${name}」，点行里的「复制」拿完整 Key`;
+      $('keyMsg').textContent = `已发出「${name}」，点该 Key 行的复制图标获取完整 Key`;
     }
     toast('已发出新 Key', 'ok');
   } catch (e) {
@@ -1072,6 +1146,13 @@ function wire() {
     }
   });
 
+  // 账号列表头的眼睛：只切展示，不重新拉数据（静态按钮，只在这里挂一次监听）
+  $('maskEmail')?.addEventListener('click', () => {
+    S.maskEmail = !S.maskEmail;
+    renderAccounts();
+  });
+  renderMaskToggle();
+
   // 接入地址:各协议复制自己的 base URL
   for (const btn of document.querySelectorAll('[data-copy-proto]')) {
     btn.addEventListener('click', async () => {
@@ -1091,25 +1172,25 @@ function wire() {
     keyBtn.addEventListener('click', async () => {
       try {
         await navigator.clipboard.writeText(S.apiKey || '');
-        toast('已复制 Key', 'ok');
+        toast('已复制 Master Key', 'ok');
       } catch { toast('复制失败', 'err'); }
     });
   }
 
-  // 重置 Key:生成新随机 key,旧 key 立即失效
+  // 重置 Master Key:生成新随机 key,旧 key 立即失效
   const resetBtn = document.querySelector('[data-reset-key]');
   if (resetBtn) {
     resetBtn.addEventListener('click', () => run(resetBtn, '重置', async () => {
       if (!S.keyRotatable) throw new Error('当前 Key 由环境变量 FREEBUFF_API_KEY 配置,面板不可重置');
       if (!await confirmBox({
-        title: '重置 API Key',
-        text: '重置后旧 Key 立即失效，正在使用该 Key 的客户端需要更新。继续？',
+        title: '重置 Master Key',
+        text: '重置后旧 Master Key 立即失效，正在使用它的客户端需要更新（分享 Key 不受影响）。继续？',
         ok: '重置',
       })) return '已取消';
       const r = await api('/key/rotate', { method: 'POST' });
       S.apiKey = r.apiKey;
       $('key-mask').textContent = S.apiKey.slice(0, 8) + '…';
-      return '新 Key 已生效';
+      return '新 Master Key 已生效';
     }));
   }
 

@@ -102,28 +102,13 @@
       <div class="pane" id="pane-manage" data-pane="manage" role="tabpanel" aria-labelledby="tab-manage">
         <div class="table-scroll" role="region" tabindex="0" aria-label="账号列表，可横向滚动">
           <table class="tbl account-table is-empty">
-            <thead><tr><th>账号</th><th>状态</th><th id="quotaHead">可用模型(重置时间)</th><th>操作</th></tr></thead>
+            <thead><tr><th>账号 <button type="button" class="mask-toggle" id="maskEmail" aria-pressed="true"></button></th><th>状态</th><th id="quotaHead">可用模型(重置时间)</th><th>操作</th></tr></thead>
             <tbody id="acctBody"><tr><td colspan="4" class="empty">加载中…</td></tr></tbody>
           </table>
         </div>
       </div>
 
       <div class="pane add-pane" id="pane-add" data-pane="add" role="tabpanel" aria-labelledby="tab-add" hidden>
-        <section class="form-block" aria-labelledby="h-manual-add">
-          <div class="block-heading">
-            <h3 id="h-manual-add">手动添加</h3>
-            <p class="hint">粘贴账号 Token，邮箱与备注可选。</p>
-          </div>
-          <form id="addForm" class="stack-form">
-            <input type="text" id="authToken" placeholder="authToken（必填）" autocomplete="off" spellcheck="false" aria-label="authToken">
-            <div class="two-fields">
-              <input type="text" id="email" placeholder="邮箱" aria-label="邮箱">
-              <input type="text" id="name" placeholder="备注名" aria-label="备注名">
-            </div>
-            <button type="submit" class="btn primary wide" id="addBtn">添加并探测</button>
-          </form>
-        </section>
-
         <section class="form-block oauth-block" aria-labelledby="h-oauth-add">
           <div class="block-heading">
             <h3 id="h-oauth-add">Freebuff 授权</h3>
@@ -137,6 +122,21 @@
             <button type="button" class="login-url-copy" id="loginUrlCopy" title="复制授权链接" aria-label="复制授权链接"><svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>
           </div>
           <p class="hint" id="oauthStatus" aria-live="polite"></p>
+        </section>
+
+        <section class="form-block" aria-labelledby="h-manual-add">
+          <div class="block-heading">
+            <h3 id="h-manual-add">手动添加</h3>
+            <p class="hint">粘贴账号 Token，邮箱与备注可选。</p>
+          </div>
+          <form id="addForm" class="stack-form">
+            <input type="text" id="authToken" placeholder="authToken（必填）" autocomplete="off" spellcheck="false" aria-label="authToken">
+            <div class="two-fields">
+              <input type="text" id="email" placeholder="邮箱" aria-label="邮箱">
+              <input type="text" id="name" placeholder="备注名" aria-label="备注名">
+            </div>
+            <button type="submit" class="btn primary wide" id="addBtn">添加并探测</button>
+          </form>
         </section>
       </div>
     </section>
@@ -198,14 +198,14 @@
           <div class="subcard-head">
             <div>
               <h3 id="h-keys">分享 Key</h3>
-              <p class="hint">每把 key 各自限并发、可用模型与每日请求数。</p>
+              <p class="hint">每把 key 各自限并发、可用模型与每日会话数；同一小时会话内重复调用只计一次。</p>
             </div>
             <span class="count" id="keyCount"></span>
           </div>
           <div class="table-scroll" role="region" tabindex="0" aria-label="分享 Key 列表，可横向滚动">
             <table class="tbl key-table">
-              <thead><tr><th>备注</th><th>Key</th><th>并发</th><th>每日</th><th>可用模型</th><th>今日 / 累计</th><th class="action-col">操作</th></tr></thead>
-              <tbody id="keyBody"><tr><td colspan="7" class="empty">加载中…</td></tr></tbody>
+              <thead><tr><th>备注</th><th>Key</th><th>并发</th><th>会话</th><th>今日 / 累计</th><th>统计</th><th>可用模型</th><th class="action-col">操作</th></tr></thead>
+              <tbody id="keyBody"><tr><td colspan="8" class="empty">加载中…</td></tr></tbody>
             </table>
           </div>
 
@@ -217,20 +217,20 @@
               <label class="key-num"><span class="lbl">并发</span>
                 <input type="number" id="newKeyConcurrency" min="1" max="32" step="1" value="1" aria-label="并发上限，默认 1">
               </label>
-              <label class="key-num"><span class="lbl">每日</span>
-                <input type="number" id="newKeyDaily" min="0" max="100000" step="1" value="0" aria-label="每日请求上限，0 表示不限">
+              <label class="key-num"><span class="lbl">会话</span>
+                <input type="number" id="newKeyDaily" min="0" max="100000" step="1" value="0" aria-label="每日会话上限，0 表示不限">
               </label>
             </div>
-            <label class="key-models">
-              <span class="lbl">可用模型<span class="hint">（不选 = 不限；按住 Ctrl/⌘ 多选）</span></span>
-              <select id="newKeyModels" multiple size="4" aria-describedby="keyMsg"></select>
-            </label>
+            <div class="key-models">
+              <span class="lbl">可用模型<span class="hint">（可多选）</span></span>
+              <div class="key-model-options" id="newKeyModels" role="group" aria-label="可用模型，可多选" aria-describedby="keyMsg"></div>
+            </div>
             <div class="key-form-actions">
-              <button type="submit" class="btn primary" id="keyAdd">发一把新 Key</button>
+              <button type="submit" class="btn primary" id="keyAdd">新建 Key</button>
               <button type="button" class="btn ghost" id="keyCancel" hidden>取消编辑</button>
+              <span class="hint key-message" id="keyMsg" aria-live="polite"></span>
             </div>
           </form>
-          <p class="hint key-message" id="keyMsg" aria-live="polite"></p>
         </section>
       </div>
     </section>
@@ -300,8 +300,8 @@
         <div class="access-actions" role="group" aria-label="接入信息操作">
           <button type="button" class="btn tiny" data-copy-proto="openai">复制 OpenAI</button>
           <button type="button" class="btn tiny" data-copy-proto="anthropic">复制 Anthropic</button>
-          <button type="button" class="btn tiny" data-copy-key>复制 Key</button>
-          <button type="button" class="btn tiny warn" data-reset-key>重置 Key</button>
+          <button type="button" class="btn tiny" data-copy-key>复制 Master Key</button>
+          <button type="button" class="btn tiny warn" data-reset-key>重置 Master Key</button>
         </div>
       </div>
     </section>

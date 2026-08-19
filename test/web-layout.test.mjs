@@ -30,7 +30,7 @@ for (const id of [
   'sTotal', 'sTotalSub', 'sAlive', 'sWarn', 'sBad',
   'accountSummary',
   'acctCount', 'acctBody', 'addForm', 'addBtn', 'authToken', 'email', 'name',
-  'quotaHead',
+  'quotaHead', 'maskEmail',
   'oauthStart', 'loginUrl', 'oauthStatus', 'key-mask', 'models', 'models-empty',
   'modelCount',
   'aliasCount', 'aliasBody', 'newAlias', 'newAliasTarget', 'aliasAdd', 'aliasMsg',
@@ -70,6 +70,9 @@ assert.match(css, /\.account-card \.table-scroll::-webkit-scrollbar\s*\{[^}]*dis
   'WebKit/Blink 认伪元素而非 scrollbar-width，两处都要关');
 assert.match(css, /\.account-card > \.pane\.add-pane\s*\{[^}]*overflow-y:\s*auto/s,
   '「添加」分页在卡被压矮时也要内联滚动，否则表单被 overflow:hidden 切掉');
+// 授权是首选路径（点一下就完事），手写 token 是兜底，顺序按这个来。
+assert.match(html, /id="pane-add"[\s\S]*id="h-oauth-add">Freebuff 授权[\s\S]*id="h-manual-add">手动添加/s,
+  '「添加」分页必须 Freebuff 授权在上、手动添加在下');
 // 纯 CSS 收不住左列：Chrome 里纵向 flex 容器的 min-content 高度等于 max-content，
 // grid-template-rows:min-content / min-height:0 都是空转，只有显式 max-height 才封得住。
 assert.match(app, /function syncColumnBottoms\(\)[\s\S]*?\$\('proxyCard'\)/s,
@@ -226,6 +229,11 @@ assert.match(html,
   '接入信息必须落在运行概况卡内、四格统计下方');
 assert.ok(html.indexOf('data-copy-key') > html.indexOf('id="usageCard"'),
   '账号池概况里不应再残留接入信息按钮（必须整组在概况卡之后）');
+// 两个按钮动的是主 Key，不是分享 Key —— 文案必须写明 Master，否则跟下面的「新建 Key」混
+assert.match(html, /data-copy-key>复制 Master Key<\/button>/, '复制按钮必须点明是 Master Key');
+assert.match(html, /data-reset-key>重置 Master Key<\/button>/, '重置按钮必须点明是 Master Key');
+assert.match(app, /title: '重置 Master Key',\s*\n\s*text: '重置后旧 Master Key 立即失效[^']*分享 Key 不受影响/,
+  '重置确认框必须同样说 Master Key，并交代分享 Key 不受影响');
 assert.match(html,
   /class="model-workspace-grid"[\s\S]*class="alias-editor"[\s\S]*class="model-catalog"/s,
   '模型配置内部顺序必须为模型映射 | 模型列表');
@@ -233,6 +241,15 @@ assert.match(html, /id="h-model-workspace">模型与 Key<\/h2>/,
   '模型卡标题必须是“模型与 Key”（同卡两页：模型与映射 | Key 管理）');
 assert.match(html, /<h3 id="h-models">模型列表<\/h3>/,
   '右侧子卡标题必须是“模型列表”（原“可用模型”）');
+assert.match(html,
+  /class="tbl key-table"[\s\S]*?<thead><tr><th>备注<\/th><th>Key<\/th><th>并发<\/th><th>会话<\/th><th>今日 \/ 累计<\/th><th>统计<\/th><th>可用模型<\/th><th class="action-col">操作<\/th><\/tr><\/thead>/s,
+  '分享 Key 表格必须按 会话 → 今日 / 累计 → 统计 排列，再显示可用模型');
+assert.match(html, /id="keyBody"><tr><td colspan="8" class="empty">/,
+  '分享 Key 空态必须覆盖新增后的 8 列');
+assert.match(app, /<td class="mono" title="历史累计 token \$\{esc\(fmtCount\(st\.totalTokens \|\| 0\)\)\}">\$\{fmtTokens\(st\.totalTokens \|\| 0\)\}<\/td>/,
+  '分享 Key 的统计列必须显示该 Key 历史累计 token，并在悬停里给出精确值（列头只有“统计”两个字，不写明就看不出是 token）');
+assert.match(app, /\/ \$\{fmtCount\(st\.total \|\| 0\)\}\$\{running\}<\/td>\s*\n\s*<td class="mono" title="历史累计 token/,
+  '统计列必须紧跟在今日 \/ 累计右侧');
 assert.ok(!/^\.models li\s*\{[^}]*(?:border:|background:)/m.test(css),
   '模型列表条目必须是纯文本，不再套卡片（无边框、无底色）');
 assert.match(css, /^\.models li\s*\{[^}]*font:\s*10px/m,
@@ -243,6 +260,12 @@ assert.match(css, /\.model-catalog \.models[\s\S]*scrollbar-width:\s*none/s,
   '模型列表必须使用卡片内滚动且隐藏滚动条');
 assert.match(css, /\.model-catalog \.models\s*\{[^}]*justify-items:\s*start/s,
   '模型列表条目必须按模型名称宽度自适应');
+assert.match(css, /\.model-catalog \.models\s*\{[^}]*align-content:\s*start/s,
+  '模型列表被 flex 拉高时，自动行必须紧贴顶部，不能均分剩余高度拉大行距');
+assert.match(css, /\.model-catalog \.models\s*\{[^}]*grid-auto-rows:\s*max-content/s,
+  '模型列表隐式行必须按内容高度，不能被卡片剩余高度拉伸');
+assert.match(css, /\.model-catalog \.models\s*\{[^}]*row-gap:\s*3px/s,
+  '模型列表纵向间距必须固定为紧凑的 3px，不能被通用 gap 或 flex 剩余高度放大');
 assert.match(css, /\.model-catalog \.models li\s*\{[^}]*width:\s*fit-content/s,
   '模型列表条目不应横向拉伸并留下空白');
 assert.match(app, /MODEL_TIER_LABELS = \{ free: '免费', us_sg: 'US \/ SG', limited: '限定' \}/,
@@ -279,6 +302,37 @@ assert.match(css, /\.btn\s*\{[^}]*white-space:\s*nowrap/s,
   '按钮文字必须横排：收缩列里中文会逐字折行（「删除」竖成两行）');
 assert.ok(!/\.account-table th:nth-child\(1\)/.test(css),
   '小屏不应再用百分比切死账号表列宽，否则会盖掉自适应规则');
+
+// 账号列的邮箱去敏：表头一只眼睛切整列，去敏后连长度都不能泄。
+assert.match(html, /<th>账号 <button type="button" class="mask-toggle" id="maskEmail" aria-pressed="true"><\/button><\/th>/,
+  '去敏开关必须在账号列表头、账号二字右侧（图标由 JS 填，初始为已按下）');
+assert.match(app, /maskEmail: true,/, '邮箱去敏必须默认开着：默认漏了才是问题，多点一下不是');
+assert.match(app, /function maskEmail\(s\)[\s\S]*?if \(!S\.maskEmail\) return text;[\s\S]*?domain\.lastIndexOf\('\.'\)[\s\S]*?\*\*\*@\*\*\*\$\{dot > 0 \? domain\.slice\(dot\) : ''\}/s,
+  '去敏后域名只能留最后一段：取 lastIndexOf 而不是第一个点，否则子域全露出来');
+// 纯字符串逻辑，静态断言看不出「两个字的邮箱名会不会整个露出来」——把函数抠出来真跑一遍。
+{
+  const src = app.slice(app.indexOf('function maskEmail(s)'), app.indexOf('// 表头那只眼睛'));
+  const build = (on) => new Function('S', `${src}; return maskEmail;`)({ maskEmail: on });
+  const mask = build(true);
+  assert.equal(mask('henryhall9920@do-ge.v0n0v.eu.cc'), 'he***@***.cc', '多级子域只留一级域名');
+  assert.equal(mask('hello@freebuff.cc'), 'he***@***.cc', '本地部分留 2 位，域名只剩一级域名');
+  assert.equal(mask('ab@qq.com'), 'a***@***.com', '本地部分 ≤3 位时只留 1 位，否则等于没去敏');
+  assert.equal(mask('alice.wang@gmail.com'), 'al***@***.com', '星号定长，不透露长度');
+  assert.equal(mask('bob@outlook.co.uk'), 'b***@***.uk', '.co.uk 也只留最后一段');
+  assert.equal(mask('dev@localhost'), 'd***@***', '没有点的域名整段抹掉');
+  assert.equal(mask('小明'), '小明', '备注名不含 @ 就原样显示');
+  assert.equal(mask(null), '', '空值要渲染成空串而不是 "null"');
+  assert.equal(build(false)('alice.wang@gmail.com'), 'alice.wang@gmail.com', '关掉去敏必须原样显示');
+}
+assert.match(app, /<div class="nm">\$\{esc\(maskEmail\(label\)\)\}[\s\S]*?<div class="mono">\$\{esc\(maskEmail\(secondary\)\)\}/s,
+  '账号行主次两行都要过去敏，否则没备注名的账号仍露出完整邮箱');
+assert.match(app, /确认删除「\$\{maskEmail\(label\)\}」/, '删除确认框也不能把去敏掉的邮箱抖出来');
+assert.match(app, /\$\('maskEmail'\)\?\.addEventListener\('click', \(\) => \{\s*\n\s*S\.maskEmail = !S\.maskEmail;\s*\n\s*renderAccounts\(\);/,
+  '去敏开关是静态按钮：监听只挂一次，切换只重渲染不重新拉数据');
+assert.match(app, /function renderMaskToggle\(\)[\s\S]*?iconSvg\(S\.maskEmail \? 'eyeOff' : 'eye'[\s\S]*?aria-pressed[\s\S]*?aria-label/s,
+  '眼睛图标必须随状态换形并同步 aria-pressed / aria-label');
+assert.match(css, /\.mask-toggle\s*\{[^}]*width:\s*18px[^}]*height:\s*18px/s,
+  '去敏开关必须是不撑高表头的小方块');
 assert.match(css, /@media\s*\(max-width:\s*900px\)[\s\S]*?\.model-catalog\s+\.models\s*\{[^}]*height:\s*var\(--model-list-height\)/s,
   '窄屏可用模型列表必须回退到固定高度');
 assert.ok(app.includes("api('/proxy')"), '面板轮询必须读取代理订阅状态');
@@ -548,6 +602,81 @@ assert.ok(app.includes('function keyMask('), '表里只显示掩码，完整 key
 assert.match(app, /if \(r\.key && r\.key !== S\.ownerName\)/,
   '调用日志只在共享 key 上标 Key 名：主 Key 自己用时那行是噪音，历史空值也不显示');
 assert.ok(app.includes("api('/keys')"), '面板必须读取分享 Key 列表与归账');
+
+// ── Key 面板控件精简：纯图标操作、圆点状态、模型按钮组 ──────────
+// 账号池 / 模型映射 / Key 管理的操作统一为线框 SVG；纯图标仍须有悬停和读屏说明。
+assert.match(app, /const ICONS\s*=\s*\{[\s\S]*?copy:[\s\S]*?edit:[\s\S]*?power:[\s\S]*?trash:/s,
+  '动态表格必须集中定义复制、编辑、电源和垃圾桶线框图标');
+assert.match(app, /function iconSvg\(icon, size = 15\)[\s\S]*?<svg viewBox="0 0 24 24" width="\$\{size\}"[\s\S]*?stroke="currentColor"[\s\S]*?\$\{ICONS\[icon\]\}/s,
+  'SVG 外壳必须只有一份，图标按钮与独立字形共用');
+assert.match(app, /function iconButton\([\s\S]*?title="\$\{esc\(label\)\}"[\s\S]*?aria-label="\$\{esc\(label\)\}"[\s\S]*?\$\{iconSvg\(icon\)\}/s,
+  '纯图标按钮必须由统一 helper 输出 title、aria-label 和 SVG');
+for (const binding of ['data-del', 'data-adel', 'data-kcopy', 'data-kedit', 'data-ktoggle', 'data-kdel']) {
+  assert.match(app, new RegExp(`iconButton\\([^\\n]*${binding}`), `${binding} 操作必须使用纯图标按钮`);
+}
+const dynamicTables = app.slice(app.indexOf('function renderAccounts'), app.indexOf('// 模型分组 tag'));
+assert.ok(!/>\s*(?:复制|编辑|启用|停用|删除)\s*<\/button>/.test(dynamicTables),
+  '账号池、模型映射和 Key 管理不得再渲染文字操作按钮');
+assert.match(css, /\.action-col \.btn\.icon\s*\{[^}]*width:\s*30px[^}]*height:\s*30px/s,
+  '表格纯图标按钮必须使用紧凑且一致的 30px 方形点击区');
+
+// 账号状态只显示一个圆点；文字语义放进 title / aria-label。
+assert.match(app, /function stateDot\(s, detail = ''\)[\s\S]*?class="account-state-dot dot \$\{cls\}"[\s\S]*?title="状态：\$\{esc\(label\)\}"[\s\S]*?aria-label="状态：\$\{esc\(label\)\}"[\s\S]*?role="img"/s,
+  '账号状态必须渲染成带悬停详情和可访问名称的单个圆点');
+assert.match(app, /spend_limited: \['warn'[^\n]*waiting_room: \['warn'/,
+  '账号消费额度受限与等待室排队必须使用琥珀色，不能回落成灰色未知状态');
+assert.match(app, /<td>\$\{h \? stateDot\(h\.state, h\.label\) : stateDot\('unknown', '未探测'\)\}<\/td>/,
+  '账号行只显示状态圆点，并优先把后端详细 label 用作悬停说明');
+assert.match(css, /\.account-state-dot\s*\{[^}]*display:\s*inline-block[^}]*width:\s*8px[^}]*height:\s*8px/s,
+  '状态圆点必须是不带胶囊文字的独立 8px 圆点');
+
+// 会话列的「不限」同样只留字形：莫比乌斯环 + title / aria-label。
+assert.match(app, /\n {2}mobius: '<path d="M12 12c[^']*"\/><path d="M12 12c[^']*"\/>',/,
+  'ICONS 必须提供双瓣交叉的莫比乌斯环图标');
+assert.match(app, /const UNLIMITED_GLYPH = `<span class="unlimited" title="不限" aria-label="不限" role="img">\$\{iconSvg\('mobius', 16\)\}<\/span>`/,
+  '不限字形必须带悬停说明和可访问名称，不能只丢一个无语义符号');
+assert.match(app, /<td>\$\{k\.dailyLimit > 0 \? esc\(String\(k\.dailyLimit\)\) : UNLIMITED_GLYPH\}<\/td>/,
+  '会话列不限时显示莫比乌斯环，有上限时仍显示数字');
+assert.match(css, /\.unlimited\s*\{[^}]*display:\s*inline-flex[^}]*align-items:\s*center/s,
+  '莫比乌斯环必须与同格文字基线对齐，不能把行高顶开');
+
+// 原生 Ctrl/⌘ 多选下拉改为按钮组；数据契约仍是 []（不限）或模型 ID 数组。
+assert.match(html, /<div class="key-model-options" id="newKeyModels" role="group"[^>]*aria-label="可用模型，可多选"/s,
+  '可用模型必须使用有可访问名称的按钮组');
+// 列头缩成「会话」「今日 / 累计」后，session 口径只剩 hint 与 aria-label 交代，必须保住。
+for (const label of ['每日会话上限，0 表示不限', '同一小时会话内重复调用只计一次']) {
+  assert.ok(html.includes(label), `Key 面板必须明确 session 计数口径：${label}`);
+}
+assert.ok(!/<select[^>]*id="newKeyModels"/.test(html), '不得保留 Ctrl/⌘ 多选下拉');
+assert.match(app, /function fillKeyModelButtons\(selected = \[\]\)[\s\S]*?data-key-model=""[^>]*title="不限模型">All<\/button>/s,
+  '模型按钮组必须提供代表 models: [] 的 All 按钮，中文口径留在 title 里');
+assert.match(app, /k\.models\.length \? k\.models\.join\(', '\) : 'All'/,
+  '可用模型列空白名单必须显示 All，与按钮组同一套说法');
+assert.match(app, /function selectedKeyModels\(\)[\s\S]*?\[data-key-model\]\[aria-pressed="true"\][\s\S]*?dataset\.keyModel/s,
+  '提交时必须从 aria-pressed=true 的具体模型按钮读取白名单');
+assert.match(app, /if \(!model\)[\s\S]*?setKeyModelSelection\(\[\]\)[\s\S]*?else[\s\S]*?selected\.has\(model\)[\s\S]*?setKeyModelSelection/s,
+  '点击 All 须清空具体模型，具体模型须支持独立切换并在空集时回到 All');
+assert.match(app, /models:\s*selectedKeyModels\(\)/,
+  'Key POST/PATCH 数据必须继续提交 models 数组');
+assert.match(css, /\.key-model-options\s*\{[^}]*display:\s*flex[^}]*flex-wrap:\s*wrap/s,
+  '模型按钮组必须自动换行');
+assert.match(css, /\.key-model-option\[aria-pressed="true"\]/,
+  '模型按钮必须有明确的选中样式');
+
+// 主按钮和状态消息同处一行，空间不足时自然换行。
+const keyActions = html.slice(html.indexOf('<div class="key-form-actions">'), html.indexOf('</form>', html.indexOf('<div class="key-form-actions">')));
+assert.match(keyActions, /id="keyAdd">新建 Key<\/button>[\s\S]*id="keyCancel"[\s\S]*id="keyMsg"[^>]*aria-live="polite"/s,
+  '新建/编辑按钮和状态消息必须位于同一个操作区，默认文案为“新建 Key”');
+assert.ok(!/<p class="hint key-message"[^>]*id="keyMsg"/.test(html.slice(html.indexOf('</form>'))),
+  'keyMsg 不得再独占表单下方一行');
+assert.match(app, /\$\('keyAdd'\)\.textContent = '新建 Key'/,
+  '重置表单后主按钮必须回到“新建 Key”');
+assert.ok(app.includes('文本 Key 已复制到剪贴板'), '新建成功消息必须明确写“文本 Key 已复制到剪贴板”');
+assert.ok(app.includes('复制图标获取完整 Key'), '剪贴板失败消息必须指向行内复制图标');
+assert.match(css, /\.key-form-actions\s*\{[^}]*display:\s*flex[^}]*flex-wrap:\s*wrap[^}]*align-items:\s*center/s,
+  'Key 操作区必须允许按钮和反馈消息同行并在窄屏换行');
+assert.match(css, /\.key-message\s*\{[^}]*margin:\s*0[^}]*flex:\s*1\s+1/s,
+  '状态消息必须取消独立行外边距并吸收按钮右侧剩余空间');
 
 
 const ids = [...html.matchAll(/\bid=["']([^"']+)["']/g)].map((m) => m[1]);
