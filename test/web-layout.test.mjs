@@ -511,13 +511,14 @@ assert.match(css, /@media\s*\(max-width:\s*660px\)[\s\S]*?\.usage-card \.usage-g
 
 // ── 概况统计持久化开关（无文字胶囊开关，右侧） ────────────
 assert.match(html,
-  /<label class="switch usage-persistence-toggle" title="持久化统计数据（默认关闭）">[\s\S]*?<input type="checkbox" id="usagePersistence">[\s\S]*?<span class="switch-track"[\s\S]*?<span class="sr-only">持久化统计数据（默认关闭）<\/span>/s,
-  '概况标题右侧必须有无文字胶囊开关，悬停提示「持久化统计数据（默认关闭）」');
+  /<label class="switch usage-persistence-toggle" title="持久化概况统计（Key 统计始终保存）">[\s\S]*?<input type="checkbox" id="usagePersistence">[\s\S]*?<span class="switch-track"[\s\S]*?<span class="sr-only">持久化概况统计（Key 统计始终保存，默认关闭）<\/span>/s,
+  '概况标题右侧必须有无文字胶囊开关，并说明 Key 统计始终保存');
 // 开关必须落在概况卡 .card-head 内（标题之后），不是卡别处。
 const usageHead = html.slice(html.indexOf('<div class="card-head">', html.indexOf('id="usageCard"')), html.indexOf('<div class="usage-grid">'));
 assert.match(usageHead, /id="usagePersistence"/, '持久化开关必须位于概况卡 card-head 内');
 // 可见文字只有 sr-only 的可访问名：label 里除 sr-only 外不应有文字节点承载说明。
-assert.ok(html.includes('持久化统计数据（默认关闭）'), '开关悬停提示与无障碍名必须写明「默认关闭」');
+assert.ok(html.includes('持久化概况统计（Key 统计始终保存，默认关闭）'),
+  '开关悬停提示与无障碍名必须说明 Key 统计始终保存');
 // 默认关闭：checkbox 不带 checked 属性。
 assert.ok(!/<input type="checkbox" id="usagePersistence"[^>]*checked/.test(html),
   '持久化开关 HTML 默认必须关闭');
@@ -576,9 +577,12 @@ for (const id of ['tab-models', 'tab-keys', 'pane-models', 'pane-keys', 'keyBody
 }
 assert.match(html, /id="tab-models"[^>]*aria-controls="pane-models"/s, '模型与映射标签必须关联面板');
 assert.match(html, /id="tab-keys"[^>]*aria-controls="pane-keys"/s, 'Key 管理标签必须关联面板');
-assert.match(html, /id="tab-models"[^>]*aria-selected="true"/s,
-  '默认页必须还是「模型与映射」：加 Key 管理不该改变打开面板时看到的东西');
-assert.match(html, /id="pane-keys"[^>]*hidden/s, 'Key 页默认收起');
+// 分页顺序：Key 管理在前、模型与映射在后，第一页就是打开面板时看到的那页。
+assert.ok(html.indexOf('id="tab-keys"') < html.indexOf('id="tab-models"'),
+  'Key 管理必须排在模型与映射之前');
+assert.match(html, /id="tab-keys"[^>]*aria-selected="true"/s, '默认页是「Key 管理」');
+assert.match(html, /id="pane-models"[^>]*hidden/s, '模型与映射页默认收起');
+assert.doesNotMatch(html, /id="pane-keys"[^>]*hidden/s, 'Key 页是默认页，不能带 hidden');
 assert.match(html, /class="pane"[^>]*id="pane-models"[\s\S]*class="model-workspace-grid"/s,
   '模型与映射整块必须整体搬进 pane-models，内部结构不动');
 // 同页现在有两组 tablist（账号池 管理|添加、模型与 Key 模型与映射|Key 管理）。

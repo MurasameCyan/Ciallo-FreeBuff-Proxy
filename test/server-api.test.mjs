@@ -11,6 +11,17 @@ import { fileURLToPath } from 'node:url';
 
 const SERVER = fileURLToPath(new URL('../server.js', import.meta.url));
 
+function workerFingerprint(token) {
+  let h1 = 0x811c9dc5, h2 = 0x01000193;
+  const s = 'freebuff-fp-v2:' + token;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 0x01000193) >>> 0;
+    h2 = Math.imul(h2 ^ c, 0x85ebca6b) >>> 0;
+  }
+  return 'enhanced-' + h1.toString(16).padStart(8, '0') + h2.toString(16).padStart(8, '0');
+}
+
 // 找一个空闲端口，避免和宿主 8787 冲突。
 function freePort() {
   return new Promise((resolve, reject) => {
@@ -179,15 +190,80 @@ test('概况统计持久化 API 契约', async (t) => {
   });
 });
 
+test('概况开关关闭时，分享 Key 统计仍从 usage-stats.json 恢复到面板', async (t) => {
+  const key = 'fbk-server-key-stats-restore';
+  const fingerprint = workerFingerprint(key);
+  const s = await startServer({}, async (dir) => {
+    await mkdir(join(dir, 'credentials'), { recursive: true });
+    await writeFile(join(dir, 'credentials', 'api-keys.json'), JSON.stringify({ keys: [{
+      key, name: '持久 Key', concurrency: 1, models: [], dailyLimit: 5, disabled: false,
+    }] }));
+    await writeFile(join(dir, 'usage-stats.json'), JSON.stringify({
+      enabled: false,
+      snapshot: {
+        total: { requests: 0, success: 0, fail: 0, promptTokens: 0, completionTokens: 0,
+          reasoningTokens: 0, totalTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 },
+        byModel: {},
+        byKey: { [fingerprint]: { name: '持久 Key', totalTokens: 88, day: '2030-01-01',
+          daySessions: ['enhanced-session'], total: 3, lastAt: 1893456000000 } },
+        startTime: 123, lastRequest: null,
+      },
+    }));
+  });
+  t.after(() => stopServer(s));
+  const r = await fetch(s.base + '/_api/keys');
+  assert.equal(r.status, 200);
+  const body = await r.json();
+  assert.equal(body.stats['持久 Key']?.totalTokens, 88);
+  assert.equal(body.stats['持久 Key']?.total, 3);
+  assert.equal(body.stats['持久 Key']?.dayCount, 0,
+    '非当天的会话统计只保留累计，不应伪装成今日使用');
+});
+
 test('API 契约静态标记（服务端路由已注册）', () => {
   const src = readFileSync(SERVER, 'utf8');
-  for (const marker of ["seg === 'usage-persistence'", "createUsagePersistence(dataFile('usage-stats.json'))", "configureUsagePersistence"]) {
+  for (const marker of ["seg === 'usage-persistence'", "createUsagePersistence(dataFile('usage-stats.json'))", "saveKey", "restoreKeyUsageSnapshot", "configureUsagePersistence"]) {
     assert.ok(src.includes(marker), `server.js 缺少持久化接线: ${marker}`);
   }
   for (const marker of ["seg === 'keys'", "createApiKeyStore(dataFile('credentials', 'api-keys.json'))", 'FREEBUFF_API_KEYS: apiKeyStore.descriptors()']) {
     assert.ok(src.includes(marker), `server.js 缺少分享 Key 接线: ${marker}`);
   }
   assert.equal(src.includes('RELAY_KEY'), false, '死配置 RELAY_KEY 已移除（worker.js 从来没读它）');
+});
+
+test('优雅关停强制断开长流后要给清理回调留窗口', () => {
+  const src = readFileSync(SERVER, 'utf8');
+  const shutdown = src.slice(src.indexOf('async function shutdown'));
+  assert.match(shutdown, /closeHttpServer\(server\)/,
+    '生产关停必须使用经过真实 socket 时序测试的 closeHttpServer');
+  assert.match(shutdown, /await new Promise\(\(resolve\) => setImmediate\(resolve\)\)/,
+    '第二次 flush 前必须让 close/onDone 回调入队');
+});
+
+test('强制断开最后一个 socket 后仍等待清理窗口', async (t) => {
+  const { closeHttpServer } = await import('../server/graceful-shutdown.mjs');
+  let cleanupDone = false;
+  const open = createHttpServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/plain' });
+    res.write('open');
+  });
+  open.on('connection', (socket) => {
+    socket.once('close', () => {
+      setTimeout(() => { cleanupDone = true; }, 40);
+    });
+  });
+  await new Promise((resolve, reject) => {
+    open.once('error', reject);
+    open.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(() => { try { open.closeAllConnections?.(); open.close(); } catch {} });
+  const response = await fetch(`http://127.0.0.1:${open.address().port}`);
+  const startedAt = Date.now();
+  await closeHttpServer(open, { forceAfterMs: 20, cleanupGraceMs: 80 });
+  assert.ok(Date.now() - startedAt >= 80,
+    'closeAllConnections 触发 close 回调后不能绕过清理窗口');
+  assert.equal(cleanupDone, true, '最终 flush 前必须给 socket/流清理回调入队机会');
+  await response.body?.cancel().catch(() => {});
 });
 
 // 分享 Key 的两条硬约束：没设面板密码不许发 key（发出去等于把面板也发出去了），
@@ -211,6 +287,60 @@ test('分享 Key：未设 ADMIN_PASSWORD 时锁定发放', async (t) => {
   });
   assert.equal(post.status, 403);
   assert.equal((await post.json()).error.type, 'admin_password_required');
+});
+
+test('分享 Key 持久化统计按 key 指纹关联，改备注名后仍显示在当前 Key', async (t) => {
+  const key = 'fbk-persist-rename-key-123456789';
+  const replacementKey = 'fbk-reissued-old-name-987654321';
+  const fp = workerFingerprint(key);
+  const s = await startServer({}, async (dir) => {
+    await mkdir(join(dir, 'credentials'), { recursive: true });
+    await writeFile(join(dir, 'credentials', 'api-keys.json'), JSON.stringify({ keys: [
+      { key, name: '新备注', concurrency: 1, models: [], dailyLimit: 0, disabled: false, createdAt: 1 },
+      { key: replacementKey, name: '旧备注', concurrency: 1, models: [], dailyLimit: 0, disabled: false, createdAt: 2 },
+    ] }));
+    await writeFile(join(dir, 'usage-stats.json'), JSON.stringify({
+      enabled: true,
+      snapshot: {
+        total: { requests: 0, success: 0, fail: 0, promptTokens: 0, completionTokens: 0, reasoningTokens: 0, totalTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 },
+        byModel: {},
+        byKey: { [fp]: { name: '旧备注', totalTokens: 77 } },
+        startTime: 1,
+        lastRequest: null,
+      },
+    }));
+  });
+  t.after(() => stopServer(s));
+
+  const body = await (await fetch(s.base + '/_api/keys')).json();
+  assert.equal(body.stats['新备注']?.totalTokens, 77,
+    '同一明文 Key 改备注名后，历史统计必须跟着 Key 而不是留在旧备注名下');
+  assert.equal(body.stats['旧备注'], undefined,
+    '删除旧 Key 后把原备注给新 Key，也不能把旧指纹统计错挂到新 Key');
+});
+
+test('分享 Key 备注为原型属性名时统计仍能按 Key 返回', async (t) => {
+  const key = 'fbk-proto-name-test';
+  const fingerprint = workerFingerprint(key);
+  const s = await startServer({}, async (dir) => {
+    await mkdir(join(dir, 'credentials'), { recursive: true });
+    await writeFile(join(dir, 'credentials', 'api-keys.json'), JSON.stringify({ keys: [
+      { key, name: '__proto__', concurrency: 1, models: [], dailyLimit: 0, disabled: false },
+    ] }));
+    await writeFile(join(dir, 'usage-stats.json'), JSON.stringify({
+      enabled: false,
+      snapshot: {
+        total: { requests: 0, success: 0, fail: 0, promptTokens: 0, completionTokens: 0,
+          reasoningTokens: 0, totalTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 },
+        byModel: {}, byKey: { [fingerprint]: { name: '__proto__', totalTokens: 7 } },
+        startTime: 1, lastRequest: null,
+      },
+    }));
+  });
+  t.after(() => stopServer(s));
+  const body = await (await fetch(s.base + '/_api/keys')).json();
+  assert.equal(Object.prototype.hasOwnProperty.call(body.stats, '__proto__'), true);
+  assert.equal(body.stats['__proto__']?.totalTokens, 7);
 });
 
 test('分享 Key：发/改/删对下一个客户端请求立刻生效', async (t) => {

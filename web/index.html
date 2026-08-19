@@ -141,7 +141,7 @@
       </div>
     </section>
 
-    <!-- ── 模型配置：模型映射 + 模型列表 + 分享 Key（同卡分页） ─── -->
+    <!-- ── 模型配置：分享 Key（默认页） + 模型映射 + 模型列表（同卡分页） ─── -->
     <section class="card model-workspace-card alias-card models-card" id="modelWorkspace" aria-labelledby="h-model-workspace">
       <div class="card-head model-workspace-head">
         <div class="card-title">
@@ -149,13 +149,13 @@
           <h2 id="h-model-workspace">模型与 Key</h2>
         </div>
         <nav class="seg" role="tablist" aria-label="模型与 Key 视图">
-          <button type="button" class="seg-btn active" id="tab-models" data-pane="models" role="tab"
-                  aria-selected="true" aria-controls="pane-models" tabindex="0">模型与映射</button>
-          <button type="button" class="seg-btn" id="tab-keys" data-pane="keys" role="tab"
-                  aria-selected="false" aria-controls="pane-keys" tabindex="-1">Key 管理</button>
+          <button type="button" class="seg-btn active" id="tab-keys" data-pane="keys" role="tab"
+                  aria-selected="true" aria-controls="pane-keys" tabindex="0">Key 管理</button>
+          <button type="button" class="seg-btn" id="tab-models" data-pane="models" role="tab"
+                  aria-selected="false" aria-controls="pane-models" tabindex="-1">模型与映射</button>
         </nav>
       </div>
-      <div class="pane" id="pane-models" data-pane="models" role="tabpanel" aria-labelledby="tab-models">
+      <div class="pane" id="pane-models" data-pane="models" role="tabpanel" aria-labelledby="tab-models" hidden>
       <div class="model-workspace-grid">
         <section class="alias-editor" id="aliasEditor" aria-labelledby="h-alias">
           <div class="subcard-head">
@@ -193,7 +193,7 @@
 
       <!-- 分享给别人的 key。主 Key（右上「接入信息」那把）不在这张表里：它不限并发、
            不限模型、不计每日上限，行为与加多 key 之前一致，也不能在这里删掉。 -->
-      <div class="pane key-pane" id="pane-keys" data-pane="keys" role="tabpanel" aria-labelledby="tab-keys" hidden>
+      <div class="pane key-pane" id="pane-keys" data-pane="keys" role="tabpanel" aria-labelledby="tab-keys">
         <section class="key-editor" id="keyEditor" aria-labelledby="h-keys">
           <div class="subcard-head">
             <div>
@@ -248,10 +248,10 @@
           <p class="eyebrow">运行概况</p>
           <h2 id="h-usage">概况</h2>
         </div>
-        <label class="switch usage-persistence-toggle" title="持久化统计数据（默认关闭）">
+        <label class="switch usage-persistence-toggle" title="持久化概况统计（Key 统计始终保存）">
           <input type="checkbox" id="usagePersistence">
           <span class="switch-track" aria-hidden="true"></span>
-          <span class="sr-only">持久化统计数据（默认关闭）</span>
+          <span class="sr-only">持久化概况统计（Key 统计始终保存，默认关闭）</span>
         </label>
       </div>
       <div class="usage-grid">

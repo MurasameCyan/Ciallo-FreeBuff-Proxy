@@ -1165,12 +1165,40 @@ await at('注入适配器且开启时 recordRequest 触发 save（带最新快�
   if (snap.lastRequest == null) throw new Error('save 快照应含 lastRequest');
 });
 
+await at('save 钩子在返回前注册写队列，关停 flush 不会漏掉同一 tick 的统计', async () => {
+  let started = false;
+  configureUsagePersistence({
+    load: null,
+    save: () => { started = true; },
+    enabled: () => true,
+  });
+  recordRequest('m-persist-sync', null, false);
+  if (!started) throw new Error('save 不应等到下一个微任务才开始，否则关停时 flush 可能提前返回');
+});
+
 await at('注入适配器但关闭时 recordRequest 不触发 save', async () => {
   const saves = [];
   configureUsagePersistence({ load: null, save: (s) => { saves.push(s); }, enabled: () => false });
   recordRequest('m-persist-B', null, false);
   await new Promise((r) => setTimeout(r, 0));
   if (saves.length !== 0) throw new Error('关闭时不应调用 save，实际 ' + saves.length);
+});
+
+await at('概况关闭时仍触发独立的 Key 统计保存', async () => {
+  const keySaves = [];
+  configureUsagePersistence({
+    load: null,
+    save: null,
+    saveKey: (byKey) => { keySaves.push(byKey); },
+    enabled: () => false,
+  });
+  recordRequest('m-persist-key', { total_tokens: 4 }, true, {
+    key: 'fbk-key-persist-test', name: 'Key 持久化', owner: false,
+  });
+  await new Promise((r) => setTimeout(r, 0));
+  if (keySaves.length !== 1) throw new Error('Key 统计应独立保存，实际 ' + keySaves.length);
+  const row = Object.values(keySaves[0]).find((v) => v.name === 'Key 持久化');
+  if (!row || row.totalTokens !== 4) throw new Error('Key 保存快照缺少最新 token 统计');
 });
 
 await at('save 抛异常不阻断 recordRequest', async () => {

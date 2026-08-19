@@ -140,8 +140,12 @@ test('手改过/旧版本写的文件也能用：缺字段补默认值，坏 JSO
 test('喂给 worker 的鉴权表只带闸门要用的字段', async () => {
   await withStore(async (store) => {
     store.add({ name: '小明', concurrency: 2, dailyLimit: 6, models: ['m1'] });
-    assert.deepEqual(Object.keys(store.descriptors()[0]).sort(),
-      ['concurrency', 'dailyLimit', 'disabled', 'key', 'models', 'name']);
+    const descriptor = store.descriptors()[0];
+    assert.deepEqual(Object.keys(descriptor).sort(),
+      ['concurrency', 'dailyLimit', 'disabled', 'fingerprint', 'key', 'models', 'name']);
+    assert.match(descriptor.fingerprint, /^sha256-[0-9a-f]{64}$/,
+      '落盘关联必须使用抗碰撞的密码学指纹');
+    assert.equal(descriptor.fingerprint.includes(descriptor.key), false);
   });
 });
 
@@ -151,7 +155,7 @@ const workerSource = readFileSync(new URL('../worker.js', import.meta.url), 'utf
 const workerWrapper = workerSource.replace('export default {', 'const __workerDefault__ = {')
   + '\n\nglobalThis.__workerDefault__ = __workerDefault__;\n'
   + 'globalThis.__keyTestApi__ = { resolveClient, openClientGate, clientStatsSnapshot, releaseOnStreamEnd,'
-  + ' quotaDay, secondsToNextQuotaDay, CLIENT_SLOT_STALE_MS, OWNER_KEY_NAME };\n';
+  + ' quotaDay, secondsToNextQuotaDay, CLIENT_SLOT_STALE_MS, OWNER_KEY_NAME, usageSnapshot };\n';
 
 const OWNER_KEY = 'owner-key-for-multi-key-test';
 const MODEL = { id: 'mimo/mimo-v2.5' };   // 静态兜底模型表里唯一那个
@@ -192,7 +196,8 @@ function req(key, path = '/v1/models', headerName = 'Authorization') {
 }
 
 const SHARED = {
-  key: 'fbk-shared-1', name: '小明', concurrency: 1, models: [], dailyLimit: 0, disabled: false,
+  key: 'fbk-shared-1', fingerprint: `sha256-${'a'.repeat(64)}`,
+  name: '小明', concurrency: 1, models: [], dailyLimit: 0, disabled: false,
 };
 
 test('鉴权：主 Key 与共享 key 都放行，停用/未知/空 key 一律 401', async () => {
@@ -208,6 +213,7 @@ test('鉴权：主 Key 与共享 key 都放行，停用/未知/空 key 一律 40
   const shared = api.resolveClient(req(SHARED.key), env);
   assert.equal(shared.name, '小明');
   assert.equal(shared.owner, false);
+  assert.equal(shared.fingerprint, SHARED.fingerprint);
   assert.equal(shared.concurrency, 1);
   assert.deepEqual(plain(api.resolveClient(req(SHARED.key, '/v1/models', 'x-api-key'), env)), plain(shared),
     'x-api-key 与 Bearer 等价');
@@ -331,11 +337,15 @@ test('归账快照只出备注名，绝不出明文 key（GET /_api/usage 会整
   gate.release();
   api.openClientGate(api.resolveClient(req(OWNER_KEY), env), MODEL).release();
 
-  const snap = plain(api.clientStatsSnapshot());
+  const rawSnap = api.clientStatsSnapshot();
+  assert.equal(rawSnap[0].fingerprint, SHARED.fingerprint, '内部关联必须沿用服务端密码学指纹');
+  const snap = plain(rawSnap);
   assert.equal(JSON.stringify(snap).includes(SHARED.key), false, '快照里不许出现明文 key');
   assert.deepEqual(snap.map((s) => s.name).sort(), [api.OWNER_KEY_NAME, '小明'].sort());
   // 白名单式断言：多出字段就红，防止哪天顺手把 key/token 之类塞进快照。
   assert.deepEqual(Object.keys(snap[0]).sort(), ['dayCount', 'inFlight', 'lastAt', 'name', 'owner', 'total', 'totalTokens']);
+  assert.deepEqual(Object.keys(plain(api.usageSnapshot().byKey)), [SHARED.fingerprint],
+    '持久化只保存分享 Key；可手写的 Master Key 不能成为离线口令校验器');
 });
 
 test('流式：槽位等 body 到终态才放（正常收尾走 flush，客户端断开走 cancel）', async () => {

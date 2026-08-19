@@ -24,6 +24,7 @@ import {
 } from './server/proxy.mjs';
 import { createUsagePersistence } from './server/usage-persistence.mjs';
 import { createApiKeyStore, OWNER_KEY_NAME } from './server/api-keys.mjs';
+import { closeHttpServer } from './server/graceful-shutdown.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -776,6 +777,8 @@ async function handleWebApi(req, res, url) {
 
   // ---------- 调用日志（成功调用的环形缓冲 + 失败累计计数） ----------
   // 数据仅存在于 worker 进程内存中，不落盘；来源为 handler.getCallLog()。
+  // 例外：byKey 里每把 Key 的会话/token 归账始终落盘并在重启后恢复；概况开关
+  // 只控制总量与模型统计，避免分享 Key 的限额账因管理员关闭概况统计而丢失。
   if (seg === 'usage' && method === 'GET') {
     const snapshot = typeof handler.getCallLog === 'function' ? handler.getCallLog() : { calls: [], totals: {} };
     return json(res, 200, snapshot);
@@ -946,10 +949,32 @@ async function handleWebApi(req, res, url) {
   // 热生效同 aliases.json：buildWorkerEnv() 每次请求重读文件，改完立刻作用于下一个请求。
   if (seg === 'keys') {
     if (method === 'GET') {
-      // 归账按备注名 join（worker 侧不外传明文 key）。
+      // 归账优先按 worker 提供的稳定指纹 join 回当前明文 Key；旧 worker 没有
+      // fingerprint 字段时回退按备注名，保持滚动升级期间的兼容性。
       const byKey = (typeof handler.getCallLog === 'function' ? handler.getCallLog().byKey : null) || [];
-      const stats = {};
-      for (const row of byKey) if (row && row.name) stats[row.name] = row;
+      // 备注名来自配置文件，可能是 __proto__/constructor 等原型属性名；
+      // 无原型对象才能把这些名字当普通 Key 返回给面板。
+      const stats = Object.create(null);
+      const keyed = new Map();
+      const legacy = [];
+      for (const row of byKey) {
+        if (!row) continue;
+        if (row.fingerprint) keyed.set(String(row.fingerprint), row);
+        else if (row.name) legacy.push(row);
+      }
+      const publicStats = (row, name) => {
+        if (!row) return null;
+        const out = { ...row, name: name || row.name };
+        delete out.fingerprint;
+        return out;
+      };
+      for (const key of apiKeyStore.list()) {
+        const fp = apiKeyStore.fingerprint(key.key);
+        const row = fp ? keyed.get(fp) : null;
+        if (row) stats[key.name] = publicStats(row, key.name);
+      }
+      // 旧 worker 的行没有指纹，只能暂按备注名兼容；不能覆盖已经按指纹匹配的行。
+      for (const row of legacy) if (row.name && !stats[row.name]) stats[row.name] = publicStats(row);
       return json(res, 200, {
         keys: apiKeyStore.list(),
         stats,
@@ -1057,15 +1082,34 @@ const handler = worker.default;
 // 概况统计持久化：开关与累计文件在数据目录。默认关闭；损坏/缺失回退空统计。
 // store 只在 server 侧持有；worker 通过注入的适配器在每次 recordRequest 后触发 save。
 const usageStore = createUsagePersistence(dataFile('usage-stats.json'));
+function keyUsageSnapshotForWorker(snapshot) {
+  const byKey = { ...(snapshot?.byKey || {}) };
+  // 兼容尚未发布版本热写入的旧 FNV 指纹；新写入只使用服务端 SHA-256 指纹。
+  if (typeof handler.keyFingerprint === 'function') {
+    for (const key of apiKeyStore.list()) {
+      const current = apiKeyStore.fingerprint(key.key);
+      const legacy = handler.keyFingerprint(key.key);
+      if (!byKey[current] && byKey[legacy]) byKey[current] = byKey[legacy];
+      if (legacy !== current) delete byKey[legacy];
+    }
+  }
+  return { ...(snapshot || {}), byKey };
+}
+const restoredUsageSnapshot = keyUsageSnapshotForWorker(usageStore.load());
 if (typeof handler.configureUsagePersistence === 'function') {
   handler.configureUsagePersistence({
     load: () => usageStore.load(),
     save: (snapshot) => usageStore.save(snapshot),
+    saveKey: (byKey) => usageStore.saveByKey(byKey),
     enabled: () => usageStore.enabled(),
   });
 }
+if (typeof handler.restoreKeyUsageSnapshot === 'function') {
+  // 分享 Key 统计始终恢复；概况总量是否恢复仍由面板开关控制。
+  handler.restoreKeyUsageSnapshot(restoredUsageSnapshot);
+}
 if (usageStore.enabled() && typeof handler.restoreUsageSnapshot === 'function') {
-  handler.restoreUsageSnapshot(usageStore.load());
+  handler.restoreUsageSnapshot(restoredUsageSnapshot);
   console.log('[server] 概况统计持久化已开启，恢复累计: ' + JSON.stringify(usageStore.load().total));
 }
 
@@ -1076,13 +1120,29 @@ server.listen(CFG.port, CFG.host, () => {
   console.log(`[ciallo] accounts: ${n} (file: ${CFG.credFile})`);
 });
 
-// 优雅退出：停 mihomo（容器 SIGTERM 时）
-process.on('SIGTERM', async () => {
-  console.log('[ciallo] SIGTERM, 正在退出...');
+// 优雅退出：先等统计写队列排空，再停 mihomo。usageSaveHook 为了不阻塞请求而
+// 异步保存；不 flush 的话，SIGTERM 紧跟在一次调用结束时会把最后的 Key 统计丢掉。
+let shuttingDown = false;
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  if (signal) console.log(`[ciallo] ${signal}, 正在退出...`);
+  try { await usageStore.flush?.(); } catch (e) {
+    console.error('[server] 统计持久化 flush 失败:', e.message);
+  }
+  // 先停止接收新请求并等在途请求收尾；它们可能在第一次 flush 之后才把
+  // 最终 usage 写入队列，所以关服后再 flush 一次。
+  try {
+    await closeHttpServer(server);
+  } catch (e) {
+    console.error('[server] HTTP 服务关闭失败:', e.message);
+  }
+  await new Promise((resolve) => setImmediate(resolve));
+  try { await usageStore.flush?.(); } catch (e) {
+    console.error('[server] 统计持久化 flush 失败:', e.message);
+  }
   try { await stopProxy(); } catch {}
   process.exit(0);
-});
-process.on('SIGINT', async () => {
-  try { await stopProxy(); } catch {}
-  process.exit(0);
-});
+}
+process.on('SIGTERM', () => { void shutdown('SIGTERM'); });
+process.on('SIGINT', () => { void shutdown('SIGINT'); });

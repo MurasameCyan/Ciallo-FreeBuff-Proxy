@@ -22,6 +22,13 @@ import crypto from 'node:crypto';
 // 模块，得留在单文件里跑 Cloudflare），改这里记得一起改。
 export const OWNER_KEY_NAME = '主 Key';
 
+function keyFingerprint(key) {
+  return 'sha256-' + crypto.createHash('sha256')
+    .update('freebuff-share-key-v1\0')
+    .update(String(key || ''))
+    .digest('hex');
+}
+
 const MAX_KEYS = 64;          // 一页看得完；也挡住脚本手滑把文件写爆
 const MAX_NAME_LEN = 40;
 const MAX_MODELS = 64;
@@ -126,6 +133,7 @@ export function createApiKeyStore(file) {
   return {
     file,
     list: load,
+    fingerprint: keyFingerprint,
 
     /** 新发一把 key。返回完整记录（含明文 key，只有这一次能拿全）。 */
     add(patch = {}) {
@@ -178,7 +186,7 @@ export function createApiKeyStore(file) {
     /** 喂给 worker 的鉴权表（就是存的那份，worker 只读不写）。 */
     descriptors() {
       return load().map(({ key, name, concurrency, models, dailyLimit, disabled }) => ({
-        key, name, concurrency, models, dailyLimit, disabled,
+        key, fingerprint: keyFingerprint(key), name, concurrency, models, dailyLimit, disabled,
       }));
     },
   };

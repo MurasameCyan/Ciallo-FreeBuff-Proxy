@@ -10,7 +10,7 @@ import { createAccountStateStore } from '../server/account-state.mjs';
 const workerSource = readFileSync(new URL('../worker.js', import.meta.url), 'utf8');
 const workerWrapper = workerSource.replace('export default {', 'const __workerDefault__ = {')
   + '\n\nglobalThis.__workerDefault__ = __workerDefault__;\n'
-  + 'globalThis.__accountSafetyTestApi__ = { pickToken, pickTokenWithSessionWait, sessionLeaseWaitMs, releaseToken, recordAccountObservation, cooldown, parseCooldown, accountPoolExhaustion, classifyRateLimit, quotaScopeForModel, freshQuotaProbe, startRun, executeChat, executeCodeReview, createSession, clientStatsSnapshot, recordRequest, usageSnapshot, restoreUsageSnapshot };\n';
+  + 'globalThis.__accountSafetyTestApi__ = { pickToken, pickTokenWithSessionWait, sessionLeaseWaitMs, releaseToken, recordAccountObservation, cooldown, parseCooldown, accountPoolExhaustion, classifyRateLimit, quotaScopeForModel, freshQuotaProbe, startRun, executeChat, executeCodeReview, createSession, clientStatsSnapshot, recordRequest, usageSnapshot, restoreUsageSnapshot, restoreKeyUsageSnapshot };\n';
 
 const TOKEN = 'permanent-banned-account-token-123456';
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -1047,6 +1047,125 @@ test('Key 历史 token 随概况快照恢复', () => {
   restoredVm.api.restoreUsageSnapshot(snapshot);
   const stats = restoredVm.api.clientStatsSnapshot().find((s) => s.name === client.name);
   assert.equal(stats.totalTokens, 42);
+});
+
+test('概况开关关闭时也能单独恢复分享 Key 统计', () => {
+  const client = { key: 'fbk-key-only-restore-secret', name: 'Key 独立恢复', concurrency: 1, models: [], dailyLimit: 0, owner: false };
+  const firstVm = createWorkerVm();
+  firstVm.api.recordRequest(terminalModel.id, { total_tokens: 17 }, true, client);
+  const keySnapshot = { byKey: firstVm.api.usageSnapshot().byKey };
+
+  const restoredVm = createWorkerVm();
+  restoredVm.api.restoreKeyUsageSnapshot(keySnapshot);
+  const stats = restoredVm.api.clientStatsSnapshot().find((s) => s.name === client.name);
+  assert.equal(stats.totalTokens, 17);
+  assert.equal(restoredVm.api.usageSnapshot().total.totalTokens, 0,
+    '独立恢复 Key 统计不能顺带恢复概况总量');
+});
+
+test('Key 会话归账（今日 / 累计）随概况快照跨重启恢复，预算不被重启白送', async () => {
+  const start = Date.UTC(2030, 0, 1, 12);          // LA 2030-01-01 04:00
+  const token = 'client-session-persist-account-123456';
+  const model = terminalModel.session;
+  const client = { key: 'fbk-session-persist', name: '持久归账', concurrency: 4, models: [], dailyLimit: 1, owner: false };
+  let postCalls = 0;
+  const fetchImpl = async (url, init = {}) => {
+    const path = new URL(String(url)).pathname;
+    const method = String(init.method || 'GET').toUpperCase();
+    if (path.includes('/api/v1/ads') || path.includes('/api/v1/usage')) return upstreamResponse(200, {});
+    if (path === '/api/v1/freebuff/session' && method === 'GET') return upstreamResponse(404, {});
+    if (path === '/api/v1/freebuff/session' && method === 'POST') {
+      postCalls += 1;
+      return upstreamResponse(200, {
+        status: 'active', instanceId: `persist-session-${postCalls}`, model, remainingMs: 3600 * 1000,
+      });
+    }
+    if (path === '/api/v1/agent-runs') return upstreamResponse(200, { runId: `persist-run-${postCalls}` });
+    if (path === '/api/v1/chat/completions') {
+      return new Response(
+        'data: ' + JSON.stringify({
+          choices: [{ delta: { content: 'ok' }, finish_reason: 'stop' }],
+          usage: { total_tokens: 12 },
+        }) + '\n\ndata: [DONE]\n\n',
+        { status: 200, headers: { 'content-type': 'text/event-stream' } },
+      );
+    }
+    return upstreamResponse(200, {});
+  };
+
+  const firstVm = createWorkerVm({ now: start, fetchImpl });
+  // 新建 session 就要落一次盘：不能等这把 key 下一次成功请求才写，中途重启会丢一整天的账。
+  const saved = [];
+  firstVm.worker.configureUsagePersistence({
+    load: () => null, save: (snap) => { saved.push(snap); }, enabled: () => true,
+  });
+  const first = await firstVm.api.executeChat(
+    terminalEnv(token), terminalChatParams, terminalModel, false, 'chat', null, client,
+  );
+  assert.equal(first.status, 200);
+  assert.ok(saved.length > 0, '认领新会话后必须触发一次持久化保存');
+  const snapshot = JSON.parse(JSON.stringify(firstVm.api.usageSnapshot()));
+  assert.equal(JSON.stringify(snapshot).includes(token), false,
+    '落盘的会话身份必须是指纹：上游账号 token 不许出现在统计文件里');
+
+  // 重启：新进程只有磁盘快照，连明文 key 都还没见过。
+  // instanceId 继续往上编号（真实上游每个新 session 都是新 id），否则新建的会话会撞上
+  // 恢复进来的旧身份、被当成同一个 session 而不计数。
+  const postsBeforeRestart = postCalls;
+  const restoredVm = createWorkerVm({ now: start + 2 * 3600 * 1000, fetchImpl });
+  restoredVm.api.restoreUsageSnapshot(snapshot);
+  const restored = restoredVm.api.clientStatsSnapshot().find((s) => s.name === client.name);
+  assert.equal(restored.dayCount, 1, '重启后不用等这把 key 再被用一次就该看到今日会话');
+  assert.equal(restored.total, 1, '累计会话跨重启保留');
+  assert.equal(restored.totalTokens, 12, '历史 token 同一行一起恢复');
+
+  // 上一个 session 早过期了，这里必然要新建 —— 但今日预算 1/1 已经用掉，重启不该退还。
+  const over = await restoredVm.api.executeChat(
+    terminalEnv(token), terminalChatParams, terminalModel, false, 'chat', null, client,
+  );
+  assert.equal(over.status, 429);
+  assert.equal((await over.json()).error?.type, 'key_daily_limit_exceeded');
+  assert.equal(postCalls, postsBeforeRestart, '预算已用尽时不得再发 session POST');
+
+  // 洛杉矶翻页后预算重新给，累计继续往上加。
+  restoredVm.setNow(Date.UTC(2030, 0, 2, 12));
+  const nextDay = await restoredVm.api.executeChat(
+    terminalEnv(token), terminalChatParams, terminalModel, false, 'chat', null, client,
+  );
+  assert.equal(nextDay.status, 200);
+  const after = restoredVm.api.clientStatsSnapshot().find((s) => s.name === client.name);
+  assert.equal(after.dayCount, 1, '新的一天今日会话从这次新建开始算');
+  assert.equal(after.total, 2, '累计会话接着昨天往上加');
+});
+
+test('跨洛杉矶午夜重启且上游 session 仍存活时，不重复占用新日会话预算', async () => {
+  const beforeMidnight = Date.UTC(2030, 0, 2, 7, 30); // LA 01/01 23:30
+  const afterMidnight = beforeMidnight + 2 * 3600 * 1000; // LA 01/02 01:30
+  const token = 'client-session-midnight-account-123456';
+  const model = terminalModel.session;
+  const client = { key: 'fbk-session-midnight', name: '跨午夜', concurrency: 1, models: [], dailyLimit: 1, owner: false };
+  const instanceId = 'midnight-live-session';
+  const expiresAt = new Date(afterMidnight + 2 * 3600 * 1000).toISOString();
+  const fetchImpl = async (url, init = {}) => {
+    const path = new URL(String(url)).pathname;
+    const method = String(init.method || 'GET').toUpperCase();
+    if (path === '/api/v1/freebuff/session' && method === 'GET') return upstreamResponse(404, {});
+    if (path === '/api/v1/freebuff/session' && method === 'POST') {
+      return upstreamResponse(200, { status: 'active', instanceId, model, expiresAt });
+    }
+    return upstreamResponse(200, {});
+  };
+
+  const firstVm = createWorkerVm({ now: beforeMidnight, fetchImpl });
+  await firstVm.api.createSession(token, model, false, client);
+  const snapshot = JSON.parse(JSON.stringify(firstVm.api.usageSnapshot()));
+  const restoredVm = createWorkerVm({ now: afterMidnight, fetchImpl });
+  restoredVm.api.restoreUsageSnapshot(snapshot);
+
+  await restoredVm.api.createSession(token, model, false, client);
+  const stats = restoredVm.api.clientStatsSnapshot().find((s) => s.name === client.name);
+  assert.equal(stats.total, 1, '同一仍存活 session 跨日不应重复累计');
+  assert.equal(stats.dayCount, 0, '同一仍存活 session 不应占用新日会话额度');
 });
 
 test('code review 成功入口把上游 usage 归到分享 Key', async () => {

@@ -441,7 +441,10 @@ export default {
   // 概况统计持久化适配器（server.js 启动时注入）。
   configureUsagePersistence,
   restoreUsageSnapshot,
+  restoreKeyUsageSnapshot,
   usageSnapshot,
+  // 只用于服务端迁移尚未发布版本写过的旧 FNV 快照；新分享 Key 使用服务端 SHA-256 指纹。
+  keyFingerprint(token) { return stableFingerprint(String(token || "")); },
   async fetch(request, env) {
     // 上游出站 fetch 注入（Node adapter 配了订阅时传入走 mihomo 的 fetch）。
     // env 可放函数（Node 的 env 是普通对象）；Cloudflare Worker 的 env 是 KV 型
@@ -994,8 +997,8 @@ function recordRequest(model, usage, success, client = null) {
     b.cacheReadTokens += u.cacheReadTokens;
     b.cacheWriteTokens += u.cacheWriteTokens;
   }
-  if (success && client && client.key && u.totalTokens > 0) {
-    const fingerprint = stableFingerprint(String(client.key));
+  if (success && client && client.key && client.owner !== true && u.totalTokens > 0) {
+    const fingerprint = clientKeyFingerprint(client);
     const entry = usageByKey[fingerprint] || {
       name: String(client.name || "").trim(),
       owner: client.owner === true,
@@ -1012,27 +1015,39 @@ function recordRequest(model, usage, success, client = null) {
 
 // ---------------------------------------------------------------------------
 // 概况统计持久化（可选）：server.js 注入 { load, save, enabled } 适配器后，worker
-// 在每次 recordRequest 更新内存后通知适配器保存。保存是异步安全的——异常不冒泡
-// 到请求处理。关闭时不保存；load() 提供启动快照，restoreUsageSnapshot 用它覆盖
-// 内存累计（仅接受规范化形状）。默认不注入：保持「纯内存、重启即清」的旧行为。
+// 在每次 recordRequest 更新内存后通知适配器保存。分享 Key 的 byKey 统计另有 saveKey
+// 通道，始终落盘，不受概况开关影响。保存是异步安全的——异常不冒泡到请求处理。
 // ---------------------------------------------------------------------------
-const usagePersistence = { load: null, save: null, enabled: null };
+const usagePersistence = { load: null, save: null, saveKey: null, enabled: null };
 
 function configureUsagePersistence(adapter) {
   if (!adapter || typeof adapter !== "object") return;
   usagePersistence.load = typeof adapter.load === "function" ? adapter.load : null;
   usagePersistence.save = typeof adapter.save === "function" ? adapter.save : null;
+  usagePersistence.saveKey = typeof adapter.saveKey === "function" ? adapter.saveKey : null;
   usagePersistence.enabled = typeof adapter.enabled === "function" ? adapter.enabled : null;
 }
 
 function usageSaveHook() {
   const save = usagePersistence.save;
-  if (!save) return;
-  if (usagePersistence.enabled && usagePersistence.enabled() !== true) return;
   const snapshot = usageSnapshot();
-  Promise.resolve()
-    .then(() => save(snapshot))
-    .catch(() => { /* 磁盘写失败不阻断请求处理；内存统计照常累计。 */ });
+  const fullEnabled = !usagePersistence.enabled || usagePersistence.enabled() === true;
+  const persist = save && fullEnabled
+    ? () => save(snapshot)
+    : usagePersistence.saveKey
+      ? () => usagePersistence.saveKey(snapshot.byKey)
+      : null;
+  if (!persist) return;
+  // 立即调用适配器，让它把写入登记到自己的队列；只把异步 I/O 错误转为
+  // rejected promise，避免请求被磁盘故障阻断。若延迟到下一个微任务，SIGTERM
+  // 期间的 flush 可能在 save 尚未入队时提前返回，丢掉最后一条 Key 统计。
+  try {
+    Promise.resolve(persist()).catch(() => {
+      /* 磁盘写失败不阻断请求处理；内存统计照常累计。 */
+    });
+  } catch {
+    /* 同步适配器错误同样不阻断请求处理。 */
+  }
 }
 
 function usageSnapshot() {
@@ -1040,6 +1055,20 @@ function usageSnapshot() {
   for (const k of Object.keys(usageByModel)) byModel[k] = { ...usageByModel[k] };
   const byKey = {};
   for (const k of Object.keys(usageByKey)) byKey[k] = { ...usageByKey[k] };
+  // 会话归账（今日 / 累计）跟 token 累计合成同一行落盘：只有 token 会重启清零很奇怪，
+  // 面板那两列本来就是并排显示的。daySessions 存的是会话身份指纹，不含账号凭据。
+  for (const [fingerprint, row] of clientSessionRows()) {
+    if (row.owner) continue;
+    const entry = byKey[fingerprint] || { name: row.name, owner: row.owner, totalTokens: 0 };
+    entry.name = entry.name || row.name;
+    entry.owner = row.owner;
+    entry.day = row.day;
+    entry.daySessions = row.daySessions;
+    if (row.seenSessions?.length) entry.seenSessions = row.seenSessions;
+    entry.total = row.total;
+    entry.lastAt = row.lastAt;
+    byKey[fingerprint] = entry;
+  }
   return {
     total: { ...usageTotals },
     byModel,
@@ -1051,6 +1080,51 @@ function usageSnapshot() {
 
 // 用启动时加载的持久化快照覆盖内存累计。只认规范化形状，缺字段回退空值；
 // 外部传入畸形对象不会破坏内部状态。
+function restoreKeyUsageSnapshot(src) {
+  for (const k of Object.keys(usageByKey)) delete usageByKey[k];
+  restoredClientSessions.clear();
+  if (!src || typeof src !== "object" || !src.byKey || typeof src.byKey !== "object") return;
+  const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+  for (const [fingerprint, v] of Object.entries(src.byKey)) {
+    if (!v || typeof v !== "object") continue;
+    if (v.owner === true) continue;
+    const name = String(v.name ?? "").trim();
+    const totalTokens = num(v.totalTokens);
+    if (!name || totalTokens < 0) continue;
+    usageByKey[fingerprint] = {
+      name,
+      owner: v.owner === true,
+      totalTokens,
+    };
+    // 会话归账：明文 key 要等请求带来才知道，先按指纹搁着（见 restoredClientSessions）。
+    const day = String(v.day ?? "").trim();
+    const total = num(v.total);
+    if (!day && total <= 0) continue;
+    const seenIds = new Set();
+    const seenSessions = Array.isArray(v.seenSessions)
+      ? v.seenSessions.flatMap((raw) => {
+        const id = typeof raw === "string" ? raw : String(raw?.id ?? "");
+        if (!id || seenIds.has(id)) return [];
+        seenIds.add(id);
+        const expiresAt = raw && typeof raw === "object" && Number.isFinite(Number(raw.expiresAt))
+          ? Number(raw.expiresAt) : null;
+        return [{ id, expiresAt }];
+      })
+      : [];
+    restoredClientSessions.set(fingerprint, {
+      name,
+      owner: v.owner === true,
+      day,
+      daySessions: Array.isArray(v.daySessions)
+        ? v.daySessions.filter((id) => typeof id === "string" && id)
+        : [],
+      seenSessions,
+      total,
+      lastAt: Number.isFinite(Number(v.lastAt)) && v.lastAt !== null ? num(v.lastAt) : null,
+    });
+  }
+}
+
 function restoreUsageSnapshot(src) {
   if (!src || typeof src !== "object") return;
   const t = src.total && typeof src.total === "object" ? src.total : {};
@@ -1066,20 +1140,7 @@ function restoreUsageSnapshot(src) {
       usageByModel[model] = b;
     }
   }
-  for (const k of Object.keys(usageByKey)) delete usageByKey[k];
-  if (src.byKey && typeof src.byKey === "object") {
-    for (const [fingerprint, v] of Object.entries(src.byKey)) {
-      if (!v || typeof v !== "object") continue;
-      const name = String(v.name ?? "").trim();
-      const totalTokens = num(v.totalTokens);
-      if (!name || totalTokens < 0) continue;
-      usageByKey[fingerprint] = {
-        name,
-        owner: v.owner === true,
-        totalTokens,
-      };
-    }
-  }
+  restoreKeyUsageSnapshot(src);
   if (Number.isFinite(Number(src.startTime))) OVERVIEW_START = num(src.startTime);
   lastRequestAt = Number.isFinite(Number(src.lastRequest)) ? num(src.lastRequest) : null;
 }
@@ -1111,6 +1172,10 @@ function recordChatCall(env, token, mc, effort, t0, firstTokenAt, usage, client 
 // 多次请求只算一次；换账号、换模型或强制重建得到新 instanceId 时再算一次。
 // ---------------------------------------------------------------------------
 const clientStats = new Map(); // key(明文，只在进程内) -> 并发槽位 + session 归账
+// 启动时从持久化快照恢复的会话归账，按指纹索引：明文 key 要等请求带着它来才知道，
+// 所以先搁在这里，clientStat() 第一次见到这把 key 时灌进去（灌完就从这里移走）。
+// 没被本进程用过的 key 也要出现在面板里，所以快照会一并读这份。
+const restoredClientSessions = new Map(); // fingerprint -> { name, owner, day, daySessions[], total, lastAt }
 // 槽位兜底回收窗口：任何一条释放路径漏了，槽位也不会把 key 永久卡死。
 // ponytail: 这是泄漏兜底，不是超时策略 —— 正常释放走 finally / 流 flush-cancel。
 // 真有超过这个时长的长流，它占的槽位会被下一个请求提前回收，最坏情况是并发短暂超 1。
@@ -1131,11 +1196,13 @@ function clientStat(client, now = Date.now()) {
   let st = clientStats.get(id);
   if (!st) {
     st = {
-      key: id, name: client.name, owner: client.owner === true, live: [], day: quotaDay(now),
+      key: id, fingerprint: clientKeyFingerprint(client), name: client.name,
+      owner: client.owner === true, live: [], day: quotaDay(now),
       daySessions: new Set(), seenSessions: new Map(), pendingSessions: new Set(),
       dayCount: 0, total: 0, lastAt: null,
     };
     clientStats.set(id, st);
+    hydrateClientStat(st, now);
   }
   if (!(st.daySessions instanceof Set)) st.daySessions = new Set();
   if (!(st.seenSessions instanceof Map)) st.seenSessions = new Map();
@@ -1154,6 +1221,71 @@ function clientStat(client, now = Date.now()) {
   // 兜底回收：只在这里做，不额外挂定时器
   if (st.live.length) st.live = st.live.filter((at) => now - at < CLIENT_SLOT_STALE_MS);
   return st;
+}
+
+// 用持久化快照里的会话归账填一把新 key 的进程内状态。日期不是今天就只补累计：
+// 那是上一个太平洋日的记录，今日预算本该重新给。
+// 旧快照没有每条 session 的过期时间时，才按「不过期」兼容恢复；新快照会保存
+// seenSessions 的 [identity, expiresAt]，因此跨午夜重启仍能准确去重。
+function hydrateClientStat(st, now) {
+  const fingerprint = st.fingerprint || stableFingerprint(st.key || "");
+  const rec = restoredClientSessions.get(fingerprint);
+  if (!rec) return;
+  restoredClientSessions.delete(fingerprint);   // 活状态接管，避免快照里同一把 key 出现两行
+  st.total = rec.total;
+  st.lastAt = rec.lastAt;
+  for (const item of rec.seenSessions || []) st.seenSessions.set(item.id, item.expiresAt);
+  // Old snapshots only had daySessions. Keep their current-day dedupe behavior;
+  // new snapshots carry exact expiry times so a live session can cross midnight.
+  if (!rec.seenSessions?.length) {
+    for (const identity of rec.daySessions) st.seenSessions.set(identity, null);
+  }
+  if (rec.day !== quotaDay(now)) return;
+  st.day = rec.day;
+  for (const identity of rec.daySessions) {
+    st.daySessions.add(identity);
+    if (!st.seenSessions.has(identity)) st.seenSessions.set(identity, null);
+  }
+  st.dayCount = st.daySessions.size;
+}
+
+// 每把 Key 的会话归账（今日集合 + 累计），进程内的活状态优先，没被本进程碰过的 key
+// 用启动时恢复的那份补上 —— 否则重启后面板得等这把 key 再被用一次才看得见历史。
+function clientSessionRows(now = Date.now()) {
+  const today = quotaDay(now);
+  const out = new Map();
+  for (const [fingerprint, rec] of restoredClientSessions) {
+    out.set(fingerprint, {
+      name: rec.name,
+      owner: rec.owner === true,
+      inFlight: 0,
+      day: rec.day,
+      daySessions: rec.daySessions.slice(),
+      seenSessions: (rec.seenSessions || []).map((item) => ({ ...item })),
+      dayCount: rec.day === today ? rec.daySessions.length : 0,
+      total: rec.total,
+      lastAt: rec.lastAt,
+    });
+  }
+  for (const st of clientStats.values()) {
+    const seenSessions = [];
+    for (const [id, expiresAt] of st.seenSessions) {
+      if (Number.isFinite(expiresAt) && expiresAt <= now) continue;
+      seenSessions.push({ id, expiresAt: Number.isFinite(expiresAt) ? expiresAt : null });
+    }
+    out.set(st.fingerprint || stableFingerprint(st.key || ""), {
+      name: st.name,
+      owner: st.owner === true,
+      inFlight: st.live.filter((at) => now - at < CLIENT_SLOT_STALE_MS).length,
+      day: st.day,
+      daySessions: [...st.daySessions],
+      seenSessions,
+      dayCount: st.day === today ? st.dayCount : 0,
+      total: st.total,
+      lastAt: st.lastAt,
+    });
+  }
+  return out;
 }
 
 // 白名单比对解析后的真实模型 id：客户端只要能自己配别名就能绕开按别名写的白名单。
@@ -1221,8 +1353,16 @@ function clientSessionLimitResponse(error) {
   }, 429, { "Retry-After": String(retryAfterSec), "X-RateLimit-Scope": "api-key" });
 }
 
+// 会话身份只当去重键用，所以直接存指纹：这份集合要落盘（usage-stats.json），
+// 原文里的 token 是上游账号凭据，不该出现在统计文件里。
 function clientSessionIdentity(token, model, session) {
-  return session?.instanceId ? `${token}:${model}:${session.instanceId}` : "";
+  return session?.instanceId ? stableFingerprint(`${token}:${model}:${session.instanceId}`) : "";
+}
+
+function clientKeyFingerprint(client) {
+  const supplied = String(client?.fingerprint || "");
+  if (client?.owner !== true && /^sha256-[0-9a-f]{64}$/.test(supplied)) return supplied;
+  return stableFingerprint(String(client?.key || ""));
 }
 
 // 同一 Key 对同一 instanceId 只记一次。seenSessions 跨太平洋日保留到 session 过期，
@@ -1241,6 +1381,7 @@ function claimClientSession(client, token, model, session, now = Date.now()) {
   st.dayCount = st.daySessions.size;
   st.total++;
   st.lastAt = now;
+  usageSaveHook();   // 今日/累计要跨重启活下来，新会话落一次盘（一天最多几次，不是每请求）
   return session;
 }
 
@@ -1289,21 +1430,24 @@ function releaseOnStreamEnd(release) {
   });
 }
 
-// 面板用的按 key 归账快照。只出备注名，绝不出明文 key（GET /_api/usage 会整份返回）。
+// 面板用的按 key 归账快照。只出备注名，绝不出明文 key（GET /_api/usage 会整份返回）；
+// 会话身份指纹也不出——面板用不上，出去只是噪音。
 function clientStatsSnapshot() {
-  const now = Date.now();
   const out = new Map();
-  for (const st of clientStats.values()) {
-    const today = quotaDay(now);
-    out.set(stableFingerprint(st.key || ""), {
-      name: st.name,
-      owner: st.owner,
-      inFlight: st.live.filter((at) => now - at < CLIENT_SLOT_STALE_MS).length,
-      dayCount: st.day === today ? st.dayCount : 0,
-      total: st.total,
+  for (const [fingerprint, row] of clientSessionRows()) {
+    const output = {
+      name: row.name,
+      owner: row.owner,
+      inFlight: row.inFlight,
+      dayCount: row.dayCount,
+      total: row.total,
       totalTokens: 0,
-      lastAt: st.lastAt,
-    });
+      lastAt: row.lastAt,
+    };
+    // 仅供同进程的 server.js 做稳定关联；设为不可枚举，JSON 响应仍不会暴露
+    // 指纹字段（更不会暴露明文 Key）。
+    Object.defineProperty(output, "fingerprint", { value: fingerprint, enumerable: false });
+    out.set(fingerprint, output);
   }
   for (const [fingerprint, usage] of Object.entries(usageByKey)) {
     const row = out.get(fingerprint) || {
@@ -1318,6 +1462,9 @@ function clientStatsSnapshot() {
     row.name = usage.name || row.name;
     row.owner = usage.owner === true;
     row.totalTokens = usage.totalTokens;
+    if (!Object.prototype.hasOwnProperty.call(row, "fingerprint")) {
+      Object.defineProperty(row, "fingerprint", { value: fingerprint, enumerable: false });
+    }
     out.set(fingerprint, row);
   }
   return [...out.values()].sort((a, b) => b.total - a.total || b.totalTokens - a.totalTokens);
@@ -4378,6 +4525,7 @@ function resolveClient(request, env) {
     if (k.disabled === true) return null;   // 停用的 key 当无效 key，不泄露"这把存在但被停了"
     return {
       key: presented,
+      fingerprint: String(k.fingerprint || "").trim(),
       name: String(k.name || "").trim() || presented.slice(0, 10),
       concurrency: Number.isFinite(Number(k.concurrency)) ? Math.max(1, Math.floor(Number(k.concurrency))) : 1,
       models: Array.isArray(k.models) ? k.models.map((m) => String(m || "").trim()).filter(Boolean) : [],
