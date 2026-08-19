@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createUsagePersistence } from '../server/usage-persistence.mjs';
 
-const blank = { total: { requests: 0, success: 0, fail: 0, promptTokens: 0, completionTokens: 0, reasoningTokens: 0, totalTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }, byModel: {}, startTime: 123, lastRequest: null };
+const blank = { total: { requests: 0, success: 0, fail: 0, promptTokens: 0, completionTokens: 0, reasoningTokens: 0, totalTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }, byModel: {}, byKey: {}, startTime: 123, lastRequest: null };
 
 test('默认关闭且不产生统计文件', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'freebuff-usage-'));
@@ -23,7 +23,14 @@ test('开启后保存并可重新加载完整快照', async () => {
     const file = join(dir, 'usage.json');
     const first = createUsagePersistence(file);
     first.setEnabled(true);
-    const snapshot = { ...blank, total: { ...blank.total, requests: 3, totalTokens: 99 }, byModel: { 'mimo/mimo-v2.5': { ...blank.total, requests: 3, success: 3 } }, startTime: 456, lastRequest: 789 };
+    const snapshot = {
+      ...blank,
+      total: { ...blank.total, requests: 3, totalTokens: 99 },
+      byModel: { 'mimo/mimo-v2.5': { ...blank.total, requests: 3, success: 3 } },
+      byKey: { 'key-fingerprint': { name: '小明', totalTokens: 99 } },
+      startTime: 456,
+      lastRequest: 789,
+    };
     await first.save(snapshot);
     const second = createUsagePersistence(file);
     assert.equal(second.enabled(), true);

@@ -898,6 +898,8 @@ function blankUsageTotals() {
 }
 const usageTotals = blankUsageTotals();
 const usageByModel = {}; // { 模型id: blankUsageTotals() }
+// 按稳定 Key 指纹累计成功请求 token；只存备注名和数值，不把明文 Key 写入快照。
+const usageByKey = {}; // { keyFingerprint: { name, owner, totalTokens } }
 
 // 归一化上游 usage：chat（prompt/completion_tokens）与 Responses（input/output_tokens）
 // 两套命名都吃；推理 token 取 completion/output_tokens_details.reasoning_tokens。
@@ -978,7 +980,7 @@ function logCall(entry) {
 
 // 记一次客户端请求的终态到概况累计。success=true 时带 usage（累加各类 token），
 // 失败时 usage 传空。总量与「该模型」两处一并累加，模型键用解析后的模型 id。
-function recordRequest(model, usage, success) {
+function recordRequest(model, usage, success, client = null) {
   const u = readUsageFull(usage);
   const key = (model && String(model).trim()) || "unknown";
   if (!usageByModel[key]) usageByModel[key] = blankUsageTotals();
@@ -991,6 +993,18 @@ function recordRequest(model, usage, success) {
     b.totalTokens += u.totalTokens;
     b.cacheReadTokens += u.cacheReadTokens;
     b.cacheWriteTokens += u.cacheWriteTokens;
+  }
+  if (success && client && client.key && u.totalTokens > 0) {
+    const fingerprint = stableFingerprint(String(client.key));
+    const entry = usageByKey[fingerprint] || {
+      name: String(client.name || "").trim(),
+      owner: client.owner === true,
+      totalTokens: 0,
+    };
+    entry.name = String(client.name || entry.name).trim();
+    entry.owner = client.owner === true;
+    entry.totalTokens += u.totalTokens;
+    usageByKey[fingerprint] = entry;
   }
   lastRequestAt = Date.now();
   usageSaveHook();
@@ -1024,9 +1038,12 @@ function usageSaveHook() {
 function usageSnapshot() {
   const byModel = {};
   for (const k of Object.keys(usageByModel)) byModel[k] = { ...usageByModel[k] };
+  const byKey = {};
+  for (const k of Object.keys(usageByKey)) byKey[k] = { ...usageByKey[k] };
   return {
     total: { ...usageTotals },
     byModel,
+    byKey,
     startTime: OVERVIEW_START,
     lastRequest: lastRequestAt,
   };
@@ -1049,6 +1066,20 @@ function restoreUsageSnapshot(src) {
       usageByModel[model] = b;
     }
   }
+  for (const k of Object.keys(usageByKey)) delete usageByKey[k];
+  if (src.byKey && typeof src.byKey === "object") {
+    for (const [fingerprint, v] of Object.entries(src.byKey)) {
+      if (!v || typeof v !== "object") continue;
+      const name = String(v.name ?? "").trim();
+      const totalTokens = num(v.totalTokens);
+      if (!name || totalTokens < 0) continue;
+      usageByKey[fingerprint] = {
+        name,
+        owner: v.owner === true,
+        totalTokens,
+      };
+    }
+  }
   if (Number.isFinite(Number(src.startTime))) OVERVIEW_START = num(src.startTime);
   lastRequestAt = Number.isFinite(Number(src.lastRequest)) ? num(src.lastRequest) : null;
 }
@@ -1068,20 +1099,18 @@ function recordChatCall(env, token, mc, effort, t0, firstTokenAt, usage, client 
     reasoning: u ? u.reasoning : 0,
   });
   // 成功调用 == 该客户端请求的成功终态，顺带记入概况累计（每次成功恰好一条）。
-  recordRequest(mc && mc.id ? mc.id : "", usage, true);
+  recordRequest(mc && mc.id ? mc.id : "", usage, true, client);
 }
 
 // ---------------------------------------------------------------------------
 // 客户端 key 闸门与归账（多 key）。
-// 每把共享 key 各自限：可用模型白名单、并发请求数（默认 1）、每日请求数。
+// 每把共享 key 各自限：可用模型白名单、并发请求数（默认 1）、每日 session 数。
 // 主 Key 三项全不限，走同一条代码路径。
 //
-// 归账口径：**准入的客户端请求**，不是上游 session 创建数，也不是成功数。
-// ponytail: 请求数与真实额度消耗不是 1:1 —— code review 一次请求打两趟上游、失败
-// 的请求也算一次。选准入而不是成功计数是刻意的：否则一个疯狂重试的客户端可以绕开
-// 每日上限。要精确到额度就得把 client 一路穿到 createSession/startRun，收益不值。
+// 归账口径：每把 Key 当天实际使用的不同上游 session。命中同一个一小时 session 的
+// 多次请求只算一次；换账号、换模型或强制重建得到新 instanceId 时再算一次。
 // ---------------------------------------------------------------------------
-const clientStats = new Map(); // key(明文，只在进程内) -> { name, owner, live[], day, dayCount, total, lastAt }
+const clientStats = new Map(); // key(明文，只在进程内) -> 并发槽位 + session 归账
 // 槽位兜底回收窗口：任何一条释放路径漏了，槽位也不会把 key 永久卡死。
 // ponytail: 这是泄漏兜底，不是超时策略 —— 正常释放走 finally / 流 flush-cancel。
 // 真有超过这个时长的长流，它占的槽位会被下一个请求提前回收，最坏情况是并发短暂超 1。
@@ -1101,12 +1130,27 @@ function clientStat(client, now = Date.now()) {
   const id = client.key;
   let st = clientStats.get(id);
   if (!st) {
-    st = { name: client.name, owner: client.owner === true, live: [], day: quotaDay(now), dayCount: 0, total: 0, lastAt: null };
+    st = {
+      key: id, name: client.name, owner: client.owner === true, live: [], day: quotaDay(now),
+      daySessions: new Set(), seenSessions: new Map(), pendingSessions: new Set(),
+      dayCount: 0, total: 0, lastAt: null,
+    };
     clientStats.set(id, st);
   }
+  if (!(st.daySessions instanceof Set)) st.daySessions = new Set();
+  if (!(st.seenSessions instanceof Map)) st.seenSessions = new Map();
+  if (!(st.pendingSessions instanceof Set)) st.pendingSessions = new Set();
   st.name = client.name;              // 面板改了备注名，历史归账跟着改名，不另起一行
   const today = quotaDay(now);
-  if (st.day !== today) { st.day = today; st.dayCount = 0; }
+  if (st.day !== today) {
+    st.day = today;
+    st.daySessions.clear();
+    st.pendingSessions.clear();
+    st.dayCount = 0;
+  }
+  for (const [identity, expiresAt] of st.seenSessions) {
+    if (Number.isFinite(expiresAt) && expiresAt <= now) st.seenSessions.delete(identity);
+  }
   // 兜底回收：只在这里做，不额外挂定时器
   if (st.live.length) st.live = st.live.filter((at) => now - at < CLIENT_SLOT_STALE_MS);
   return st;
@@ -1118,7 +1162,7 @@ function clientModelAllowed(client, mc) {
   return client.models.includes(mc && mc.id);
 }
 
-// 准入闸门。返回 { error } = 直接回给客户端；否则 { release } 已占用一个槽位。
+// 准入闸门只管模型与并发。每日 session 预算必须等 createSession 知道是否复用后再判。
 function openClientGate(client, mc) {
   if (!client) return { release: () => {} };   // 没有 key 上下文（内部调用）不设限
   if (!clientModelAllowed(client, mc)) {
@@ -1133,18 +1177,6 @@ function openClientGate(client, mc) {
   }
   const now = Date.now();
   const st = clientStat(client, now);
-  if (client.dailyLimit > 0 && st.dayCount >= client.dailyLimit) {
-    // 到下一个上游重置点的秒数：上游额度和这里的预算同一个边界翻页。
-    const retryAfterSec = secondsToNextQuotaDay(now);
-    return {
-      error: jsonResponse({
-        error: {
-          message: `当前 Key 今日请求已达上限 ${client.dailyLimit} 次,${Math.ceil(retryAfterSec / 3600)} 小时后重置`,
-          type: "key_daily_limit_exceeded",
-        },
-      }, 429, { "Retry-After": String(retryAfterSec), "X-RateLimit-Scope": "api-key" }),
-    };
-  }
   if (client.concurrency > 0 && st.live.length >= client.concurrency) {
     // 不排队：排队只会让客户端自己超时，还看不出是被自己的并发限住了。
     return {
@@ -1157,9 +1189,6 @@ function openClientGate(client, mc) {
     };
   }
   st.live.push(now);
-  st.dayCount++;
-  st.total++;
-  st.lastAt = now;
   let released = false;
   return {
     release: () => {
@@ -1168,6 +1197,74 @@ function openClientGate(client, mc) {
       const idx = st.live.indexOf(now);
       if (idx >= 0) st.live.splice(idx, 1);
       else if (st.live.length) st.live.shift();   // 时间戳被兜底回收清掉了，扣一个避免负计数
+    },
+  };
+}
+
+class ClientSessionLimitError extends Error {
+  constructor(client, now = Date.now()) {
+    super("client key daily session limit exceeded");
+    this.name = "ClientSessionLimitError";
+    this.limit = Math.max(0, Number(client?.dailyLimit) || 0);
+    this.retryAfterSec = secondsToNextQuotaDay(now);
+  }
+}
+
+function clientSessionLimitResponse(error) {
+  const retryAfterSec = Math.max(60, Number(error?.retryAfterSec) || secondsToNextQuotaDay());
+  const limit = Math.max(0, Number(error?.limit) || 0);
+  return jsonResponse({
+    error: {
+      message: `当前 Key 今日会话已达上限 ${limit} 次,${Math.ceil(retryAfterSec / 3600)} 小时后重置`,
+      type: "key_daily_limit_exceeded",
+    },
+  }, 429, { "Retry-After": String(retryAfterSec), "X-RateLimit-Scope": "api-key" });
+}
+
+function clientSessionIdentity(token, model, session) {
+  return session?.instanceId ? `${token}:${model}:${session.instanceId}` : "";
+}
+
+// 同一 Key 对同一 instanceId 只记一次。seenSessions 跨太平洋日保留到 session 过期，
+// 避免一个跨午夜仍存活的 session 被新的一天重复计数。
+function claimClientSession(client, token, model, session, now = Date.now()) {
+  if (!client || !session?.instanceId) return session;
+  const st = clientStat(client, now);
+  const identity = clientSessionIdentity(token, model, session);
+  if (st.seenSessions.has(identity)) return session;
+  if (client.dailyLimit > 0 && st.daySessions.size >= client.dailyLimit) {
+    throw new ClientSessionLimitError(client, now);
+  }
+  const expiresAt = Date.parse(session.expiresAt || "");
+  st.seenSessions.set(identity, Number.isFinite(expiresAt) ? expiresAt : null);
+  st.daySessions.add(identity);
+  st.dayCount = st.daySessions.size;
+  st.total++;
+  st.lastAt = now;
+  return session;
+}
+
+// 只在确定要发 fresh-session POST 时预留预算。失败会取消；成功后用真实 instanceId 提交。
+function reserveClientSession(client, flightKey, now = Date.now()) {
+  if (!client) return null;
+  const st = clientStat(client, now);
+  if (st.pendingSessions.has(flightKey)) return null;
+  if (client.dailyLimit > 0 && st.daySessions.size + st.pendingSessions.size >= client.dailyLimit) {
+    throw new ClientSessionLimitError(client, now);
+  }
+  st.pendingSessions.add(flightKey);
+  let settled = false;
+  return {
+    commit(token, model, session) {
+      if (settled) return session;
+      settled = true;
+      st.pendingSessions.delete(flightKey);
+      return claimClientSession(client, token, model, session);
+    },
+    cancel() {
+      if (settled) return;
+      settled = true;
+      st.pendingSessions.delete(flightKey);
     },
   };
 }
@@ -1195,19 +1292,35 @@ function releaseOnStreamEnd(release) {
 // 面板用的按 key 归账快照。只出备注名，绝不出明文 key（GET /_api/usage 会整份返回）。
 function clientStatsSnapshot() {
   const now = Date.now();
-  const out = [];
+  const out = new Map();
   for (const st of clientStats.values()) {
     const today = quotaDay(now);
-    out.push({
+    out.set(stableFingerprint(st.key || ""), {
       name: st.name,
       owner: st.owner,
       inFlight: st.live.filter((at) => now - at < CLIENT_SLOT_STALE_MS).length,
       dayCount: st.day === today ? st.dayCount : 0,
       total: st.total,
+      totalTokens: 0,
       lastAt: st.lastAt,
     });
   }
-  return out.sort((a, b) => b.total - a.total);
+  for (const [fingerprint, usage] of Object.entries(usageByKey)) {
+    const row = out.get(fingerprint) || {
+      name: usage.name,
+      owner: usage.owner === true,
+      inFlight: 0,
+      dayCount: 0,
+      total: 0,
+      totalTokens: 0,
+      lastAt: null,
+    };
+    row.name = usage.name || row.name;
+    row.owner = usage.owner === true;
+    row.totalTokens = usage.totalTokens;
+    out.set(fingerprint, row);
+  }
+  return [...out.values()].sort((a, b) => b.total - a.total || b.totalTokens - a.totalTokens);
 }
 
 // 面板读取用的快照（数组/计数/概况都深拷一层，避免外部改到内部状态）。
@@ -1960,6 +2073,7 @@ function isExpectedFlowError(error) {
     || error instanceof EgressRejectedError
     || error instanceof QuotaExhaustedError
     || error instanceof WaitingRoomError
+    || error instanceof ClientSessionLimitError
     || error instanceof EmptyUpstreamStreamError;
 }
 
@@ -2364,7 +2478,7 @@ async function verifySessionInBackground(token, sessionModel) {
   } catch { /* 后台验证失败静默，下次请求自然重建 */ }
 }
 
-async function createSession(token, sessionModel, forceCreate = false) {
+async function createSession(token, sessionModel, forceCreate = false, client = null) {
   // 0) 正常客户端行为：广告链 + usage 触碰（30 分钟节流，失败静默）
   try {
     await runNormalClientBehavior(token, stableFingerprint(token));
@@ -2380,11 +2494,11 @@ async function createSession(token, sessionModel, forceCreate = false) {
     const cached = sessCache.get(key);
     if (cached) {
       const remain = sessionRemainingMs(cached);
-      if (remain >= SESSION_REUSE_SAFE_MS) return cached;
+      if (remain >= SESSION_REUSE_SAFE_MS) return claimClientSession(client, token, sessionModel, cached);
       if (remain > 0 && remain >= SESSION_REUSE_SAFE_MS - SESSION_VERIFY_WINDOW_MS) {
         // 临界区：先复用，同时后台验证（验证失败删缓存，下次请求重建）
         verifySessionInBackground(token, sessionModel).catch(() => {});
-        return cached;
+        return claimClientSession(client, token, sessionModel, cached);
       }
       // 剩余不足 30s（或已过期）：删除，走重建
       sessCache.delete(key);
@@ -2394,7 +2508,10 @@ async function createSession(token, sessionModel, forceCreate = false) {
   // 2) 真正建 session（single-flight 去重：并发请求共享同一次 POST）。
   //    forceCreate=true 也必须走 single-flight —— 强制重建场景多个并发
   //    请求同时重建，也会互相顶掉（409 session_superseded 的根源）。
-  return singleFlight(key + (forceCreate ? ":force" : ""), async () => {
+  const flightKey = key + (forceCreate ? ":force" : "");
+  let reservation = null;
+  try {
+    const session = await singleFlight(flightKey, async () => {
     // 查上游当前 session，同模型直接复用（forceCreate 时跳过：僵尸 active session
     // 会被 GET 反复复用，导致 chat 一直 428；强制 POST 拿全新实例）
     // 桌面版签名：GET 带 include-unused-rate-limits（模型选择器额度快照头）
@@ -2426,6 +2543,7 @@ async function createSession(token, sessionModel, forceCreate = false) {
     //    ⚠️ 实测（2026-08-10）：multi-session:1 创建的实例 chat 报 428 waiting_room_required
     //    （服务端 chat gate 不识别多会话实例），所以这里用单会话 + 预生成 instance-id：
     //    既保留桌面版客户端预生成实例的指纹，又确保 chat 能被识别。
+    reservation = reserveClientSession(client, flightKey);
     const instId = crypto.randomUUID();
     const r = await enqueueUp("POST", "/api/v1/freebuff/session", token, undefined,
       { "x-freebuff-model": sessionModel, "x-freebuff-instance-id": instId, "Content-Type": "application/json" }, SESSION_TIMEOUT_MS);
@@ -2442,10 +2560,12 @@ async function createSession(token, sessionModel, forceCreate = false) {
     if (r.status === 200 && r.data?.status === "active" && r.data?.instanceId) {
       const s = normalizeSession(r.data, sessionModel);
       sessCache.set(key, s);
+      reservation?.commit(token, sessionModel, s);
       return s;
     }
     if (r.status === 200 && r.data?.status === "queued" && r.data?.instanceId) {
       const inst = r.data.instanceId;
+      reservation?.commit(token, sessionModel, normalizeSession(r.data, sessionModel));
       for (let i = 0; i < 8; i++) {
         await sleep(1500);
         const q = await enqueueUp("GET", "/api/v1/freebuff/session", token, undefined, { "x-freebuff-instance-id": inst }, SESSION_TIMEOUT_MS);
@@ -2468,7 +2588,12 @@ async function createSession(token, sessionModel, forceCreate = false) {
     }
     if (r.status === 409) throw new Error("session_model_mismatch: " + String(r.data?.message || r.data?.error || "上游拒绝该模型"));
     throw new Error("create session failed: " + r.status + " " + (r.text || "").slice(0, 300));
-  });
+    });
+    return claimClientSession(client, token, sessionModel, session);
+  } catch (error) {
+    reservation?.cancel();
+    throw error;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -2886,7 +3011,7 @@ function responsesInputToMessages(input, instructions) {
 // 第一阶段：显式代码审计模式。
 // 这是 reviewer-only 入口：创建 root run 作为父链，再创建 code-reviewer 子 run，
 // 不执行普通 root chat，也不把 reviewer agent 混入普通模型路由。
-async function executeCodeReview(env, chatParams, mc, isStream, mode, requestSignal = null) {
+async function executeCodeReview(env, chatParams, mc, isStream, mode, requestSignal = null, client = null) {
   syncAccountState(env);
   const debug = env.FREEBUFF_DEBUG === "true";
   const reviewerAgent = mc.reviewer_agent;
@@ -2948,7 +3073,9 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode, requestSig
     let leaseTransferred = false;
     try {
       throwIfRequestAborted(requestSignal);
-      const sess = await createSession(token, mc.session);
+      const t0 = Date.now();
+      let effort = "";
+      const sess = await createSession(token, mc.session, false, client);
       throwIfRequestAborted(requestSignal);
       const root = await startRunChain(token, mc.root_agent || mc.agent, mc.session);
       throwIfRequestAborted(requestSignal);
@@ -2958,6 +3085,7 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode, requestSig
       if (debug) console.log(`[review][acct ${acctTry + 1}] root=${rootRunId} reviewer=${reviewerRunId} model=${reviewerModel}`);
 
       const payload = buildReviewerPayload(chatParams, { ...mc, upstream: reviewerModel }, sess, reviewerRunId);
+      effort = payload.reasoning_effort || "";
       const headers = {
         Authorization: "Bearer " + token,
         "Content-Type": "application/json",
@@ -3004,7 +3132,11 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode, requestSig
       if (isStream) {
         const { readable, writable } = new TransformStream();
         const onDone = async (info) => {
-          try { await finalize(info); } finally { releaseToken(token); }
+          try {
+            // 与普通 chat 同口径：成功一次记一行调用日志 + 概况/Key 累计。
+            recordChatCall(env, token, mc, effort, t0, info && info.firstTokenAt, info && info.usage, client);
+            await finalize(info);
+          } finally { releaseToken(token); }
         };
         if (mode === "responses") pipeUpstreamToResponsesStream(resp.body, writable, mc, onDone);
         else pipeUpstreamToClient(resp.body, writable, onDone);
@@ -3019,6 +3151,7 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode, requestSig
         ? await responsesToNonStream(resp.body, mc)
         : await streamToNonStream(resp.body, reviewerModel);
       await finalize();
+      recordChatCall(env, token, mc, effort, t0, null, result && result.usage, client);
       return mode === "responses" ? jsonResponse(result, 200) : jsonResponse(result, 200);
     } catch (e) {
       if (requestSignal?.aborted) throw e;
@@ -3028,6 +3161,7 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode, requestSig
         recordRequest(mc && mc.id ? mc.id : "", null, false);
         return egressRejectedResponse(e.state);
       }
+      if (e instanceof ClientSessionLimitError) return clientSessionLimitResponse(e);
       if (e instanceof WaitingRoomError || /session stayed queued|waiting.room/i.test(lastErrMsg)) {
         lastWaitingRetryAfter = e.retryAfterMs || 30 * 1000;
       } else lastWaitingRetryAfter = null;
@@ -3094,9 +3228,9 @@ async function executeChat(env, chatParams, mc, isStream, mode, requestSignal = 
 }
 
 // chat completions 与 responses 共用的上游执行：多号重试 + session/run 生命周期 + 流式/非流式出口
-// client 只用于调用日志归账（限额已在 executeChat 闸门里判完）。
+// client 同时用于调用日志与 createSession 的每日 session 预算。
 async function executeChatPooled(env, chatParams, mc, isStream, mode, requestSignal = null, client = null) {
-  if (isCodeReviewRequest(chatParams)) return executeCodeReview(env, chatParams, mc, isStream, mode, requestSignal);
+  if (isCodeReviewRequest(chatParams)) return executeCodeReview(env, chatParams, mc, isStream, mode, requestSignal, client);
   syncAccountState(env);
   const debug = env.FREEBUFF_DEBUG === "true";
   const pool = parseAccounts(env);
@@ -3156,7 +3290,7 @@ async function executeChatPooled(env, chatParams, mc, isStream, mode, requestSig
       const t0 = Date.now();
       let effort = "";
       // 1) session
-      const sess = await createSession(token, mc.session);
+      const sess = await createSession(token, mc.session, false, client);
       throwIfRequestAborted(requestSignal);
       if (debug) console.log(`[acct ${acctTry + 1}] session=${sess.instanceId}`);
 
@@ -3206,7 +3340,7 @@ async function executeChatPooled(env, chatParams, mc, isStream, mode, requestSig
             }
             await deleteUpstreamSession(token, sessForChat.instanceId, mc.session);
             if (debug) console.log(`[acct ${acctTry + 1}][chat] empty stream, same-model session recovery`);
-            sessForChat = await createSession(token, mc.session, true);
+            sessForChat = await createSession(token, mc.session, true, client);
             continue;
           }
           throw error;
@@ -3238,7 +3372,7 @@ async function executeChatPooled(env, chatParams, mc, isStream, mode, requestSig
           }
           await deleteUpstreamSession(token, sessForChat.instanceId, mc.session);
           if (debug) console.log(`[acct ${acctTry + 1}][chat] session stale (${resp.status}), recreate…`);
-          sessForChat = await createSession(token, mc.session, true);
+          sessForChat = await createSession(token, mc.session, true, client);
           continue;
         }
         // 重建后仍失败：该号 session 状态异常，冷却交给外层换号
@@ -3298,6 +3432,7 @@ async function executeChatPooled(env, chatParams, mc, isStream, mode, requestSig
         recordRequest(mc && mc.id ? mc.id : "", null, false);
         return egressRejectedResponse(e.state);
       }
+      if (e instanceof ClientSessionLimitError) return clientSessionLimitResponse(e);
       if (e instanceof WaitingRoomError || /session stayed queued|waiting.room/i.test(msg)) {
         lastWaitingRetryAfter = e.retryAfterMs || 30 * 1000;
       } else lastWaitingRetryAfter = null;
@@ -4228,7 +4363,7 @@ function presentedApiKey(request) {
 }
 
 // 鉴权：主 Key（部署自带，不设限）或共享 key（env.FREEBUFF_API_KEYS，各自限
-// 并发/模型/每日上限）。返回客户端描述符，null = 无效 key。
+// 并发/模型/每日 session 上限）。返回客户端描述符，null = 无效 key。
 // 主 Key 的 limits 全为不限，所以下游闸门一律按同一条路径走，不必到处判"是不是主 Key"。
 function resolveClient(request, env) {
   const presented = presentedApiKey(request).trim();

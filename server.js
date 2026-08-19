@@ -940,7 +940,7 @@ async function handleWebApi(req, res, url) {
 
   // ---------- 分享 Key 管理（写入 credentials/api-keys.json，热生效） ----------
   // GET    /_api/keys            → { keys, stats, ownerName, locked }
-  // POST   /_api/keys            { name, concurrency, models, dailyLimit } → 新发一把
+  // POST   /_api/keys            { name, concurrency, models, dailyLimit } → 新发一把（dailyLimit = 每日 session 数）
   // PATCH  /_api/keys/:key       同上字段，传哪个改哪个（含 disabled）
   // DELETE /_api/keys/:key
   // 热生效同 aliases.json：buildWorkerEnv() 每次请求重读文件，改完立刻作用于下一个请求。

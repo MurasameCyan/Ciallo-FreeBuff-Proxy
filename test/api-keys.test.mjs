@@ -1,6 +1,6 @@
 // 多 key（分享给别人用的那些 key）契约：
 //   前半段 —— server/api-keys.mjs 的存储与校验（默认并发 1、备注名唯一、手改文件也得能用）
-//   后半段 —— worker.js 的鉴权与闸门（白名单 / 并发 / 每日上限 / 归账不泄露明文 key）
+//   后半段 —— worker.js 的鉴权与闸门（白名单 / 并发 / 每日 session 上限 / 归账不泄露明文 key）
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, rm, writeFile, readFile } from 'node:fs/promises';
@@ -32,7 +32,7 @@ test('新发 key：默认并发 1、不限模型、不限每日，落盘可再�
     assert.match(k.key, /^fbk-[\w-]{20,}$/, 'key 必须是带前缀的随机串');
     assert.equal(k.concurrency, 1, '并发默认 1（免费通道同号并发 >1 就出问题）');
     assert.deepEqual(k.models, [], '默认不限模型');
-    assert.equal(k.dailyLimit, 0, '默认不限每日请求数');
+    assert.equal(k.dailyLimit, 0, '默认不限每日 session 数');
     assert.equal(k.disabled, false);
     assert.ok(k.createdAt > 0);
 
@@ -295,30 +295,23 @@ test('闸门：并发按 key 计，默认 1；上一个放了才让下一个进'
   many.forEach((g) => g.release());
 });
 
-test('闸门：每日上限按上游的洛杉矶日历日翻页，不是 UTC 日', async () => {
+test('闸门：每日会话上限不在每次请求放行时递增，日期仍按洛杉矶日历日翻页', async () => {
   const start = Date.UTC(2030, 0, 1, 12);          // LA 2030-01-01 04:00
   const { api, setNow } = createWorkerVm({ now: start });
   const env = envWith([{ ...SHARED, concurrency: 4, dailyLimit: 2 }]);
   const client = api.resolveClient(req(SHARED.key), env);
 
-  for (const i of [1, 2]) {
+  for (const i of [1, 2, 3, 4]) {
     const g = api.openClientGate(client, MODEL);
     assert.equal(g.error, undefined, `第 ${i} 个应放行`);
     g.release();
   }
-  const over = api.openClientGate(client, MODEL);
-  assert.equal(over.error.status, 429);
-  const body = await over.error.json();
-  assert.equal(body.error.type, 'key_daily_limit_exceeded');
-  assert.match(body.error.message, /2 次/);
-  const retry = Number(over.error.headers.get('Retry-After'));
-  assert.ok(retry > 0 && retry <= 26 * 3600, `Retry-After 要指向下一个重置点，实得 ${retry}`);
-  assert.equal(api.clientStatsSnapshot()[0].dayCount, 2, '被拒的不计数');
+  assert.equal(api.clientStatsSnapshot()[0].dayCount, 0, '请求闸门不应把请求数当成会话数');
 
   // UTC 已经翻到 1/2，洛杉矶还是 1/1 16:30 —— 此时不能重置，否则白送一轮预算
   setNow(Date.UTC(2030, 0, 2, 0, 30));
   assert.equal(api.quotaDay(Date.UTC(2030, 0, 2, 0, 30)), '2030-01-01');
-  assert.equal(api.openClientGate(client, MODEL).error.status, 429, 'UTC 翻页不算翻页');
+  assert.equal(api.openClientGate(client, MODEL).error, undefined, 'UTC 翻页不影响并发闸门');
 
   // 洛杉矶 1/2 00:30 —— 这才是新的一天
   setNow(Date.UTC(2030, 0, 2, 8, 30));
@@ -327,8 +320,8 @@ test('闸门：每日上限按上游的洛杉矶日历日翻页，不是 UTC 日
   assert.equal(next.error, undefined, '上游额度重置点一到，每日预算跟着翻页');
   next.release();
   const snap = api.clientStatsSnapshot()[0];
-  assert.equal(snap.dayCount, 1, '新的一天从 1 开始');
-  assert.equal(snap.total, 3, '累计不清零');
+  assert.equal(snap.dayCount, 0, '没有新建 session 时新的一天仍为 0');
+  assert.equal(snap.total, 0, '没有新建 session 时累计仍为 0');
 });
 
 test('归账快照只出备注名，绝不出明文 key（GET /_api/usage 会整份回给面板）', () => {
@@ -341,7 +334,8 @@ test('归账快照只出备注名，绝不出明文 key（GET /_api/usage 会整
   const snap = plain(api.clientStatsSnapshot());
   assert.equal(JSON.stringify(snap).includes(SHARED.key), false, '快照里不许出现明文 key');
   assert.deepEqual(snap.map((s) => s.name).sort(), [api.OWNER_KEY_NAME, '小明'].sort());
-  assert.deepEqual(Object.keys(snap[0]).sort(), ['dayCount', 'inFlight', 'lastAt', 'name', 'owner', 'total']);
+  // 白名单式断言：多出字段就红，防止哪天顺手把 key/token 之类塞进快照。
+  assert.deepEqual(Object.keys(snap[0]).sort(), ['dayCount', 'inFlight', 'lastAt', 'name', 'owner', 'total', 'totalTokens']);
 });
 
 test('流式：槽位等 body 到终态才放（正常收尾走 flush，客户端断开走 cancel）', async () => {

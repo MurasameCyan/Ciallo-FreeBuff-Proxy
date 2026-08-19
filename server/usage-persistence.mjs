@@ -25,7 +25,7 @@ function blankTotal() {
 }
 
 function blankSnapshot() {
-  return { total: blankTotal(), byModel: {}, startTime: DEFAULT_START, lastRequest: null };
+  return { total: blankTotal(), byModel: {}, byKey: {}, startTime: DEFAULT_START, lastRequest: null };
 }
 
 function isFiniteNonNeg(v) {
@@ -48,9 +48,22 @@ function normalizeSnapshot(src) {
       if (v && typeof v === 'object') byModel[model] = normalizeTotal(v);
     }
   }
+  const byKey = {};
+  if (src.byKey && typeof src.byKey === 'object') {
+    for (const [fingerprint, v] of Object.entries(src.byKey)) {
+      const name = String(v?.name ?? '').trim();
+      if (!name || !v || typeof v !== 'object' || !isFiniteNonNeg(v.totalTokens)) continue;
+      byKey[fingerprint] = {
+        name,
+        totalTokens: v.totalTokens,
+        ...(v.owner === true ? { owner: true } : {}),
+      };
+    }
+  }
   return {
     total: normalizeTotal(src.total),
     byModel,
+    byKey,
     startTime: isFiniteNonNeg(src.startTime) ? src.startTime : DEFAULT_START,
     lastRequest: isFiniteNonNeg(src.lastRequest) ? src.lastRequest : null,
   };

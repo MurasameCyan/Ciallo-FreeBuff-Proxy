@@ -10,7 +10,7 @@ import { createAccountStateStore } from '../server/account-state.mjs';
 const workerSource = readFileSync(new URL('../worker.js', import.meta.url), 'utf8');
 const workerWrapper = workerSource.replace('export default {', 'const __workerDefault__ = {')
   + '\n\nglobalThis.__workerDefault__ = __workerDefault__;\n'
-  + 'globalThis.__accountSafetyTestApi__ = { pickToken, pickTokenWithSessionWait, sessionLeaseWaitMs, releaseToken, recordAccountObservation, cooldown, parseCooldown, accountPoolExhaustion, classifyRateLimit, quotaScopeForModel, freshQuotaProbe, startRun, executeChat, executeCodeReview, createSession };\n';
+  + 'globalThis.__accountSafetyTestApi__ = { pickToken, pickTokenWithSessionWait, sessionLeaseWaitMs, releaseToken, recordAccountObservation, cooldown, parseCooldown, accountPoolExhaustion, classifyRateLimit, quotaScopeForModel, freshQuotaProbe, startRun, executeChat, executeCodeReview, createSession, clientStatsSnapshot, recordRequest, usageSnapshot, restoreUsageSnapshot };\n';
 
 const TOKEN = 'permanent-banned-account-token-123456';
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -951,6 +951,179 @@ test('生产 createSession 顺序调用复用一小时缓存且不再请求 sess
   assert.equal(first.instanceId, 'sequential-reuse-instance');
   assert.equal(second.instanceId, first.instanceId);
   assert.equal(sessionCalls, callsAfterCreate, '缓存命中后不得新增 session GET/POST');
+});
+
+test('Key 每日上限按新建上游 session 计数，同一小时 session 内重复调用不递增', async () => {
+  const start = Date.UTC(2030, 0, 1);
+  const token = 'client-session-budget-account-123456';
+  const model = terminalModel.session;
+  const client = { key: 'fbk-session-budget', name: '会话预算', concurrency: 4, models: [], dailyLimit: 2, owner: false };
+  let postCalls = 0;
+  const workerVm = createWorkerVm({
+    now: start,
+    fetchImpl: async (url, init = {}) => {
+      const path = new URL(String(url)).pathname;
+      const method = String(init.method || 'GET').toUpperCase();
+      if (path.includes('/api/v1/ads') || path.includes('/api/v1/usage')) return upstreamResponse(200, {});
+      if (path === '/api/v1/freebuff/session' && method === 'GET') return upstreamResponse(404, {});
+      if (path === '/api/v1/freebuff/session' && method === 'POST') {
+        postCalls += 1;
+        return upstreamResponse(200, {
+          status: 'active', instanceId: `budget-session-${postCalls}`, model,
+          remainingMs: 3600 * 1000,
+        });
+      }
+      if (path === '/api/v1/agent-runs') return upstreamResponse(200, { runId: `budget-run-${postCalls}` });
+      if (path === '/api/v1/chat/completions') {
+        return new Response(
+          'data: ' + JSON.stringify({ choices: [{ delta: { content: 'ok' }, finish_reason: 'stop' }] }) + '\n\n'
+            + 'data: [DONE]\n\n',
+          { status: 200, headers: { 'content-type': 'text/event-stream' } },
+        );
+      }
+      return upstreamResponse(200, {});
+    },
+  });
+  const first = await workerVm.api.executeChat(
+    terminalEnv(token), terminalChatParams, terminalModel, false, 'chat', null, client,
+  );
+  const second = await workerVm.api.executeChat(
+    terminalEnv(token), terminalChatParams, terminalModel, false, 'chat', null, client,
+  );
+  assert.equal(first.status, 200);
+  assert.equal(second.status, 200);
+  assert.equal(postCalls, 1, '同一个缓存 session 内重复请求不得创建第二个 session');
+  let stats = workerVm.api.clientStatsSnapshot().find((s) => s.name === client.name);
+  assert.equal(stats.dayCount, 1, '同一个上游 instance 当天只计一次');
+  assert.equal(stats.total, 1, '累计也按新建 session 计数');
+
+  // session 过期后允许再创建一个新实例；第三个 fresh session 在达到 2/2 后必须在 POST 前被拒。
+  workerVm.setNow(start + 3600 * 1000);
+  const third = await workerVm.api.executeChat(
+    terminalEnv(token), terminalChatParams, terminalModel, false, 'chat', null, client,
+  );
+  assert.equal(third.status, 200);
+  assert.equal(postCalls, 2);
+  stats = workerVm.api.clientStatsSnapshot().find((s) => s.name === client.name);
+  assert.equal(stats.dayCount, 2);
+
+  workerVm.setNow(start + 2 * 3600 * 1000);
+  const over = await workerVm.api.executeChat(
+    terminalEnv(token), terminalChatParams, terminalModel, false, 'chat', null, client,
+  );
+  const body = await over.json();
+  assert.equal(over.status, 429);
+  assert.equal(body.error?.type, 'key_daily_limit_exceeded');
+  assert.equal(postCalls, 2, '达到每日新会话上限后不得再发 session POST');
+});
+
+test('Key 历史 token 只累计成功请求，并兼容两套 usage 字段', () => {
+  const workerVm = createWorkerVm();
+  const client = { key: 'fbk-token-stats-secret', name: 'Token 统计', concurrency: 1, models: [], dailyLimit: 0, owner: false };
+
+  workerVm.api.recordRequest(terminalModel.id, {
+    prompt_tokens: 10,
+    completion_tokens: 5,
+    total_tokens: 18,
+  }, true, client);
+  workerVm.api.recordRequest(terminalModel.id, {
+    input_tokens: 2,
+    output_tokens: 3,
+  }, true, client);
+  workerVm.api.recordRequest(terminalModel.id, { total_tokens: 99 }, false, client);
+
+  const stats = workerVm.api.clientStatsSnapshot().find((s) => s.name === client.name);
+  assert.equal(stats.totalTokens, 23, '优先累计 total_tokens，缺失时回退输入 + 输出，失败不累计');
+  assert.ok(!JSON.stringify(workerVm.api.usageSnapshot()).includes(client.key), '持久化快照不得包含明文 Key');
+});
+
+test('Key 历史 token 随概况快照恢复', () => {
+  const client = { key: 'fbk-token-stats-restore-secret', name: '恢复统计', concurrency: 1, models: [], dailyLimit: 0, owner: false };
+  const firstVm = createWorkerVm();
+  firstVm.api.recordRequest(terminalModel.id, { total_tokens: 42 }, true, client);
+  const snapshot = firstVm.api.usageSnapshot();
+
+  const restoredVm = createWorkerVm();
+  restoredVm.api.restoreUsageSnapshot(snapshot);
+  const stats = restoredVm.api.clientStatsSnapshot().find((s) => s.name === client.name);
+  assert.equal(stats.totalTokens, 42);
+});
+
+test('code review 成功入口把上游 usage 归到分享 Key', async () => {
+  const token = 'reviewer-token-stats-account-123456';
+  const client = { key: 'fbk-reviewer-token-stats', name: '审计统计', concurrency: 1, models: [], dailyLimit: 0, owner: false };
+  const baseFetch = terminalFetch();
+  const workerVm = createWorkerVm({
+    fetchImpl: async (url, init = {}) => {
+      const path = new URL(String(url)).pathname;
+      if (path === '/api/v1/chat/completions') {
+        const chunk = {
+          choices: [{ delta: { content: 'reviewed' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 7, completion_tokens: 4, total_tokens: 11 },
+        };
+        return new Response(
+          `data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`,
+          { status: 200, headers: { 'content-type': 'text/event-stream' } },
+        );
+      }
+      return baseFetch(url, init);
+    },
+  });
+  const response = await workerVm.api.executeChat(
+    terminalEnv(token),
+    { ...terminalChatParams, metadata: { freebuff_mode: 'code_review' } },
+    { ...terminalModel, root_agent: terminalModel.agent, reviewer_agent: 'code-reviewer' },
+    false,
+    'chat',
+    null,
+    client,
+  );
+
+  assert.equal(response.status, 200);
+  const stats = workerVm.api.clientStatsSnapshot().find((s) => s.name === client.name);
+  assert.equal(stats.totalTokens, 11, 'code review 成功也必须累计上游 usage');
+});
+
+test('Key 新 session POST 失败不消耗每日会话预算，singleFlight 并发只计一次', async () => {
+  const start = Date.UTC(2030, 0, 1);
+  const token = 'client-session-budget-retry-account-123456';
+  const model = terminalModel.session;
+  const client = { key: 'fbk-session-retry', name: '重试预算', concurrency: 4, models: [], dailyLimit: 1, owner: false };
+  let postCalls = 0;
+  let fail = true;
+  const workerVm = createWorkerVm({
+    now: start,
+    fetchImpl: async (url, init = {}) => {
+      const path = new URL(String(url)).pathname;
+      const method = String(init.method || 'GET').toUpperCase();
+      if (path.includes('/api/v1/ads') || path.includes('/api/v1/usage')) return upstreamResponse(200, {});
+      if (path === '/api/v1/freebuff/session' && method === 'GET') return upstreamResponse(404, {});
+      if (path === '/api/v1/freebuff/session' && method === 'POST') {
+        postCalls += 1;
+        if (fail) return upstreamResponse(500, { error: 'temporary create failure' });
+        return upstreamResponse(200, {
+          status: 'active', instanceId: 'retry-budget-session', model,
+          expiresAt: new Date(start + 3600 * 1000).toISOString(),
+        });
+      }
+      return upstreamResponse(200, {});
+    },
+  });
+  await assert.rejects(workerVm.api.createSession(token, model, false, client), /create session failed: 500/);
+  let stats = workerVm.api.clientStatsSnapshot().find((s) => s.name === client.name);
+  assert.equal(stats?.dayCount || 0, 0, '失败的 session 创建不应消耗今日会话预算');
+  assert.equal(stats?.total || 0, 0, '失败的 session 创建不应增加累计会话数');
+
+  fail = false;
+  const [first, second] = await Promise.all([
+    workerVm.api.createSession(token, model, false, client),
+    workerVm.api.createSession(token, model, false, client),
+  ]);
+  assert.equal(first.instanceId, second.instanceId);
+  assert.equal(postCalls, 2, '失败后重试一次，成功并发调用仍只发一个 POST');
+  stats = workerVm.api.clientStatsSnapshot().find((s) => s.name === client.name);
+  assert.equal(stats.dayCount, 1);
+  assert.equal(stats.total, 1);
 });
 
 test('同模型 active session 忙时并发请求依次等待原账号，不在其他账号创建新 session', async () => {
