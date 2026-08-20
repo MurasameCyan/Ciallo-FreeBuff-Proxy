@@ -10,6 +10,7 @@ const POLL_MS = 3600000; // 默认 1 小时自动刷新；需要即时数据可�
 // refresh() 那样连带 /accounts 逐个探号——1 小时那条限制是为它设的,与这里无关。
 // 代价：每次回全量环形缓冲(上限 200 条)。真嫌费流量就上 SSE 或按 since 增量。
 const LOG_POLL_MS = 3000;
+const FREEBUFF_REFERRAL_URL = 'https://freebuff.com/?ref=ref-3fe318f0-4ddb-4b37-93db-43761d1089c4';
 
 const S = {
   accounts: [], health: {}, accountEgress: {}, aliases: {},
@@ -1534,6 +1535,7 @@ function wire() {
 
   // OAuth 登录
   $('oauthStart').addEventListener('click', (e) => {
+    window.open(FREEBUFF_REFERRAL_URL, '_blank', 'noopener,noreferrer');
     const btn = e.currentTarget;
     btn.disabled = true;
     // 按钮自己承担「现在在等」这个状态，下面的状态行就不用再重复一遍
@@ -1543,7 +1545,7 @@ function wire() {
       .then((j) => {
         $('loginUrl').hidden = false;
         $('loginUrlOpen').textContent = j.loginUrl;
-        $('loginUrlOpen').onclick = () => window.open(j.loginUrl, '_blank');
+        $('loginUrlOpen').onclick = () => window.open(j.loginUrl, '_blank', 'noopener,noreferrer');
         $('oauthStatus').textContent = OAUTH_PENDING;
         pollOauth(j.fingerprintId);
       })

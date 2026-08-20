@@ -272,6 +272,19 @@ assert.ok(app.includes("$('loginUrlOpen').textContent = j.loginUrl"),
   '链接文字必须写进内层 button，而不是外层的框');
 assert.match(app, /loginUrlCopy[\s\S]*?clipboard\.writeText\(\$\('loginUrlOpen'\)\.textContent/s,
   '复制按钮必须把框里显示的链接写入剪贴板');
+assert.ok(app.includes("const FREEBUFF_REFERRAL_URL = 'https://freebuff.com/?ref=ref-3fe318f0-4ddb-4b37-93db-43761d1089c4'"),
+  'Freebuff 授权入口必须使用指定推广链接');
+const oauthClick = app.slice(
+  app.indexOf("$('oauthStart').addEventListener"),
+  app.indexOf('// 复制授权链接'),
+);
+assert.match(oauthClick,
+  /window\.open\(FREEBUFF_REFERRAL_URL, '_blank', 'noopener,noreferrer'\)[\s\S]*?api\('\/login\/start', \{ method: 'POST' \}\)/s,
+  '开始授权必须先在同一浏览器打开推广页，再生成一次性授权链接');
+assert.match(oauthClick, /loginUrlOpen[\s\S]*?window\.open\(j\.loginUrl, '_blank', 'noopener,noreferrer'\)/s,
+  '正式授权必须原样打开上游一次性 loginUrl，不能把推广参数拼进去');
+assert.doesNotMatch(oauthClick, /new URL\(j\.loginUrl\)|j\.loginUrl\s*[+]\s*|searchParams\.set\(['"]ref/s,
+  '不得改写 fingerprint 绑定的一次性授权 URL');
 
 // 开始授权按钮：点下去就自报「等待授权」，三条出口（成功/过期/失败）都要复位
 assert.ok(app.includes("btn.textContent = '等待授权'"),
