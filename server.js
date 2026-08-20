@@ -14,6 +14,7 @@ import {
   getProxyStatus,
   setProxySubscription,
   setProxyNode,
+  setAccountProxySelectionPriority,
   setProxyHealth,
   setProxyUpdate,
   refreshSubscription,
@@ -29,10 +30,10 @@ import {
   getAccountAutoUpstreamFetch,
   getAccountProxyNode,
   getAccountProxyGeneration,
-  isAccountAutoEgressReady,
   getAccountEgressReject,
   inferNodeRegion,
-  accountProbeSupportsLuna,
+  classifyAccountProbeAuthorization,
+  setAccountAutoRefreshHandler,
 } from './server/proxy.mjs';
 import { createUsagePersistence } from './server/usage-persistence.mjs';
 import { createApiKeyStore, OWNER_KEY_NAME } from './server/api-keys.mjs';
@@ -372,11 +373,42 @@ function readBody(req, maxBytes = 2 * 1024 * 1024) {
   });
 }
 
-// === 上游代理（登录 OAuth + 账号探测），串行队列与 worker.js 保持一致 ===
+// === 上游代理 ===
+// OAuth 与无账号上下文的探测保留串行节流；账号池按账号排队、跨账号有限并发。
 let chainTail = Promise.resolve();
 function enqueueUp(fn) {
   const run = chainTail.then(() => new Promise((r) => setTimeout(r, 300))).then(fn);
   chainTail = run.catch(() => {});
+  return run;
+}
+
+const ACCOUNT_EGRESS_PROBE_CONCURRENCY = 8;
+const accountProbeFlights = new Set();
+const accountProbeTails = new Map();
+
+async function runWithAccountProbeSlot(fn) {
+  while (accountProbeFlights.size >= ACCOUNT_EGRESS_PROBE_CONCURRENCY) {
+    await Promise.race(accountProbeFlights);
+  }
+  const run = Promise.resolve().then(fn);
+  const settled = run.catch(() => {});
+  accountProbeFlights.add(settled);
+  try {
+    return await run;
+  } finally {
+    accountProbeFlights.delete(settled);
+  }
+}
+
+function enqueueAccountProbe(key, fn) {
+  const queueKey = String(key ?? '');
+  const previous = accountProbeTails.get(queueKey) || Promise.resolve();
+  const run = previous.catch(() => {}).then(() => runWithAccountProbeSlot(fn));
+  accountProbeTails.set(queueKey, run);
+  const clear = () => {
+    if (accountProbeTails.get(queueKey) === run) accountProbeTails.delete(queueKey);
+  };
+  run.then(clear, clear);
   return run;
 }
 
@@ -435,11 +467,22 @@ function findProbeState(value, depth = 0) {
   return fallback;
 }
 
+const ACCOUNT_EGRESS_PROBE_TIMEOUT_MS = 5000;
+
 // 账号健康探测：GET /api/v1/freebuff/session（0 消耗，不创建 session）
 // 判定规则与 extract_freebuff.py _check_one 一致
-async function probeAccount(token, { upstreamFetch = null, updateIsolation = true } = {}) {
-  const r = await enqueueUpstream('GET', '/api/v1/freebuff/session', token, undefined,
-    { 'x-freebuff-include-unused-rate-limits': '1' }, undefined, upstreamFetch);
+async function probeAccount(token, {
+  upstreamFetch = null,
+  updateIsolation = true,
+  timeoutMs = 15000,
+  queueKey = null,
+} = {}) {
+  const headers = { 'x-freebuff-include-unused-rate-limits': '1' };
+  const r = queueKey == null
+    ? await enqueueUpstream('GET', '/api/v1/freebuff/session', token, undefined,
+      headers, timeoutMs, upstreamFetch)
+    : await enqueueAccountProbe(queueKey, () => upstreamJson('GET', '/api/v1/freebuff/session', token, undefined,
+      headers, timeoutMs, upstreamFetch));
   const data = r.data && typeof r.data === 'object' ? r.data : {};
   let state = 'unknown', label = '未知', quota = null, retryAfterMs = null;
   const fmtQuota = () => {
@@ -447,8 +490,14 @@ async function probeAccount(token, { upstreamFetch = null, updateIsolation = tru
     if (!rl || typeof rl !== 'object') return null;
     const rows = [];
     for (const [m, info] of Object.entries(rl)) {
-      if (info && typeof info === 'object' && typeof info.recentCount === 'number' && typeof info.limit === 'number') {
-        rows.push({ model: m, used: info.recentCount, limit: info.limit, resetAt: info.resetAt || null });
+      if (info && typeof info === 'object' && typeof info.limit === 'number') {
+        rows.push({
+          model: m,
+          used: typeof info.recentCount === 'number' ? info.recentCount : null,
+          limit: info.limit,
+          remaining: typeof info.remaining === 'number' ? info.remaining : null,
+          resetAt: info.resetAt || null,
+        });
       }
     }
     return rows.length ? rows : null;
@@ -627,9 +676,11 @@ function accountEgressStatus(account) {
   const identity = accountEgressIdentity(account);
   const fetchForLane = Number.isInteger(account?.egressLane)
     ? getAccountUpstreamFetch(account.egressLane, { identity }) : null;
+  const autoVerifiedFetch = account?.egressMode === 'auto' && Number.isInteger(account?.egressLane)
+    ? getAccountAutoUpstreamFetch(account.egressLane, { allowStale: true, identity }) : null;
   const verified = account?.egressMode === 'manual'
     ? Boolean(fetchForLane && currentNode && currentNode === account.egressNode)
-    : Boolean(fetchForLane && isAccountAutoEgressReady(account?.egressLane, '', identity));
+    : Boolean(autoVerifiedFetch);
   let state = 'unavailable';
   let error = null;
   if (!getConfiguredSubscription()) {
@@ -638,18 +689,18 @@ function accountEgressStatus(account) {
   } else if (!Number.isInteger(account?.egressLane)) {
     state = 'unavailable';
     error = `账号出站通道已满（最多 ${ACCOUNT_EGRESS_LANE_COUNT} 个账号）`;
-  } else if (accountEgressTaskActive(account)) {
-    state = 'probing';
   } else if (reject) {
     state = 'rejected';
     error = `节点被上游拒绝（${reject.state || 'blocked'}）`;
   } else if (verified) {
     state = 'ready';
+  } else if (accountEgressTaskActive(account)) {
+    state = 'probing';
   } else if (account.egressMode === 'manual' && !account.egressNode) {
     error = '尚未选择手动节点';
   } else {
     error = account.egressMode === 'auto'
-      ? '尚未找到可访问 openai/gpt-5.6-luna 的 US/SG 节点'
+      ? '尚未找到具备可用高级或 Free 授权的 US/SG 节点'
       : '手动节点尚未就绪';
   }
   return {
@@ -687,8 +738,13 @@ async function configureAccountEgress(account, {
       identity: expectedIdentity,
       force,
       verify: async ({ fetch: fetchForLane }) => {
-        const probe = await probeAccount(account.token, { upstreamFetch: fetchForLane, updateIsolation: false });
-        return accountProbeSupportsLuna(probe);
+        const probe = await probeAccount(account.token, {
+          upstreamFetch: fetchForLane,
+          updateIsolation: false,
+          timeoutMs: ACCOUNT_EGRESS_PROBE_TIMEOUT_MS,
+          queueKey: account.key,
+        });
+        return classifyAccountProbeAuthorization(probe);
       },
     });
   }
@@ -739,16 +795,17 @@ function scheduleAccountEgress(account, { force = false } = {}) {
   return record.task;
 }
 
-async function initializeAccountEgress() {
+async function initializeAccountEgress({ force = false } = {}) {
   if (!getConfiguredSubscription()) return;
-  for (const account of listAccounts()) {
-    if (!account.hasToken || !Number.isInteger(account.egressLane)) continue;
-    try {
-      await scheduleAccountEgress(account);
-    } catch (error) {
-      console.error(`[server] 账号 ${account.key} 出站初始化失败: ${String(error?.message || error).slice(0, 180)}`);
-    }
-  }
+  await Promise.all(listAccounts()
+    .filter((account) => account.hasToken && Number.isInteger(account.egressLane))
+    .map(async (account) => {
+      try {
+        await scheduleAccountEgress(account, { force });
+      } catch (error) {
+        console.error(`[server] 账号 ${account.key} 出站初始化失败: ${String(error?.message || error).slice(0, 180)}`);
+      }
+    }));
 }
 
 function handleEgressReject(info = {}) {
@@ -876,7 +933,7 @@ function proxyApiError(res, error) {
   const code = error?.code || '';
   const raw = String(error?.message || '代理操作失败');
   if (code === 'ENV_LOCKED') return err(res, 409, 'SUBSCRIPTION_URL 由环境变量配置，面板不可覆盖', 'env_locked');
-  if (/订阅地址|必须以|必须是|模式|间隔|整数|节点不存在|选择节点|enabled/i.test(raw)) {
+  if (/订阅地址|必须以|必须是|模式|间隔|整数|节点不存在|选择节点|优先级|enabled/i.test(raw)) {
     return err(res, 400, raw.slice(0, 180), 'invalid_proxy_config');
   }
   if (/mihomo 未运行|内核未运行/i.test(raw)) {
@@ -999,6 +1056,7 @@ async function handleWebApi(req, res, url) {
   // PUT /_api/proxy[/subscription] { url }
   // POST /_api/proxy/refresh
   // PUT /_api/proxy/node { mode: auto|manual, node? }
+  // PUT /_api/proxy/account-priority { priority: advanced|unused }
   // PUT /_api/proxy/health { enabled, interval }
   // PUT /_api/proxy/update { enabled, interval }
   // 旧面板曾使用 PUT /_api/proxy，保留为订阅设置的兼容入口。
@@ -1054,6 +1112,19 @@ async function handleWebApi(req, res, url) {
       }
     }
 
+    if (method === 'PUT' && sub === 'account-priority') {
+      let body;
+      try { body = await readJsonObject(req); } catch (e) {
+        return e.code === 'INVALID_JSON' ? err(res, 400, e.message) : proxyApiError(res, e);
+      }
+      try {
+        const proxy = await setAccountProxySelectionPriority(body.priority);
+        return json(res, 200, { ok: proxy.ok, proxy });
+      } catch (e) {
+        return proxyApiError(res, e);
+      }
+    }
+
     if (method === 'PUT' && sub === 'health') {
       let body;
       try { body = await readJsonObject(req); } catch (e) {
@@ -1095,22 +1166,30 @@ async function handleWebApi(req, res, url) {
       const accounts = listAccounts();
       const health = {};
       const egress = {};
-      // 并发探测（受上游串行队列约束，内部自动排队）
-      for (const acct of accounts) {
+      const results = await Promise.all(accounts.map(async (acct) => {
         if (!acct.hasToken) {
-          egress[acct.key] = accountEgressStatus(acct);
-          continue;
+          return { key: acct.key, egress: accountEgressStatus(acct), probe: null };
         }
         const upstreamFetch = accountEgressFetch(acct);
-        egress[acct.key] = accountEgressStatus(acct);
+        const accountEgress = accountEgressStatus(acct);
         try {
-          health[acct.key] = await probeAccount(acct.token, {
+          const probe = await probeAccount(acct.token, {
             upstreamFetch,
+            queueKey: acct.key,
           });
+          return { key: acct.key, egress: accountEgress, probe };
         } catch (error) {
           if (error?.code !== 'ACCOUNT_EGRESS_UNAVAILABLE') throw error;
-          health[acct.key] = { state: 'egress_unavailable', label: '出站节点尚未就绪' };
+          return {
+            key: acct.key,
+            egress: accountEgress,
+            probe: { state: 'egress_unavailable', label: '出站节点尚未就绪' },
+          };
         }
+      }));
+      for (const result of results) {
+        egress[result.key] = result.egress;
+        if (result.probe) health[result.key] = result.probe;
       }
       return json(res, 200, { accounts: accounts.map(publicAccountDto), health, egress, readonly: CFG.readonlyAccounts });
     }
@@ -1148,7 +1227,7 @@ async function handleWebApi(req, res, url) {
       const upstreamFetch = accountEgressFetch(account);
       const probe = upstreamFetch === accountEgressUnavailableFetch
         ? { state: 'egress_unavailable', label: '出站节点尚未就绪' }
-        : await probeAccount(authToken, { upstreamFetch });
+        : await probeAccount(authToken, { upstreamFetch, queueKey: key });
       return json(res, 200, { ok: true, key, probe });
     }
     if (method === 'PATCH' && sub) {
@@ -1204,6 +1283,7 @@ async function handleWebApi(req, res, url) {
       try {
         return json(res, 200, await probeAccount(acct.token, {
           upstreamFetch: accountEgressFetch(acct),
+          queueKey: acct.key,
         }));
       } catch (error) {
         if (error?.code === 'ACCOUNT_EGRESS_UNAVAILABLE') {
@@ -1507,6 +1587,7 @@ if (!env.MODEL_ALIASES_FILE) {
 // 出口代理（可选）：订阅既可以来自 SUBSCRIPTION_URL，也可以来自
 // data/.mihomo/proxy-settings.json。环境变量非空时由 proxy service 锁定，
 // 面板不能覆盖；内核/订阅失败则保持 getUpstreamFetch() 为空，上游直连。
+setAccountAutoRefreshHandler((options) => { void initializeAccountEgress(options); });
 const startupSubscription = getConfiguredSubscription();
 if (startupSubscription) {
   setLogger((level, msg) => console.log(`[${level}] ${msg}`));

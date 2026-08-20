@@ -730,17 +730,24 @@ t('账号出站生成独立 selector 与 mixed listener', () => {
   if (groups.length !== 64 || listeners.length !== 64) {
     throw new Error(`账号 lane 数量错误: groups=${groups.length}, listeners=${listeners.length}`);
   }
-  for (const needle of [
-    'name: freebuff-account-probe',
-    'name: freebuff-account-probe-in',
-    'port: 17964',
-    'proxy: freebuff-account-probe',
-  ]) {
-    if (!y.includes(needle)) throw new Error('缺隔离 probe 配置: ' + needle);
+  for (const [lane, port] of [[0, 17964], [1, 17965], [63, 18027]]) {
+    for (const needle of [
+      `name: freebuff-account-probe-${lane}`,
+      `name: freebuff-account-probe-in-${lane}`,
+      `port: ${port}`,
+      `proxy: freebuff-account-probe-${lane}`,
+    ]) {
+      if (!y.includes(needle)) throw new Error(`缺隔离 probe lane ${lane}: ${needle}`);
+    }
+  }
+  const probeGroups = y.match(/name: freebuff-account-probe-\d+/g) || [];
+  const probeListeners = y.match(/name: freebuff-account-probe-in-\d+/g) || [];
+  if (probeGroups.length !== 64 || probeListeners.length !== 64) {
+    throw new Error(`probe lane 数量错误: groups=${probeGroups.length}, listeners=${probeListeners.length}`);
   }
   const localListeners = y.match(/listen: 127\.0\.0\.1/g) || [];
-  if (localListeners.length !== 65) {
-    throw new Error(`账号与 probe listener 必须全部仅监听本机: ${localListeners.length}/65`);
+  if (localListeners.length !== 128) {
+    throw new Error(`账号与 probe listener 必须全部仅监听本机: ${localListeners.length}/128`);
   }
 });
 t('空订阅抛错', () => {

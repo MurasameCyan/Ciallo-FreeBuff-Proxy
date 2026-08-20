@@ -162,6 +162,12 @@ assert.match(html,
   '账号池必须按账号、状态、出站节点、可用模型、操作排列');
 assert.match(html, /id="acctBody"><tr><td colspan="5" class="empty">加载中…<\/td>/,
   '账号池新增出站节点列后，初始空态必须横跨 5 列');
+assert.match(html, /id="accountPriorityToggle"[^>]*aria-pressed="true"[^>]*>优先高级<\/button>/s,
+  '账号池必须提供默认“优先高级”点击切换按钮');
+assert.ok(app.includes('accountSelectionPriority') && app.includes("/proxy/account-priority"),
+  '账号优先级按钮必须读取状态并调用专用管理 API');
+assert.match(css, /\.account-priority-toggle\s*\{[^}]*white-space:\s*nowrap/s,
+  '账号优先级按钮必须保持紧凑单行');
 assert.ok(app.includes('function poolResetAt') && app.includes('function renderQuotaHead'),
   '重置时间必须提到列标题（池级统一，逐行重复无信息量）');
 assert.ok(app.includes('`可用模型 (重置 ${formatResetAt(reset)})`'),
@@ -272,17 +278,16 @@ assert.ok(app.includes("$('loginUrlOpen').textContent = j.loginUrl"),
   '链接文字必须写进内层 button，而不是外层的框');
 assert.match(app, /loginUrlCopy[\s\S]*?clipboard\.writeText\(\$\('loginUrlOpen'\)\.textContent/s,
   '复制按钮必须把框里显示的链接写入剪贴板');
-assert.ok(app.includes("const FREEBUFF_REFERRAL_URL = 'https://freebuff.com/?ref=ref-3fe318f0-4ddb-4b37-93db-43761d1089c4'"),
-  'Freebuff 授权入口必须使用指定推广链接');
+assert.doesNotMatch(app, /FREEBUFF_REFERRAL_URL/,
+  '授权流程不得保留推广链接配置');
 const oauthClick = app.slice(
   app.indexOf("$('oauthStart').addEventListener"),
   app.indexOf('// 复制授权链接'),
 );
-assert.match(oauthClick,
-  /window\.open\(FREEBUFF_REFERRAL_URL, '_blank', 'noopener,noreferrer'\)[\s\S]*?api\('\/login\/start', \{ method: 'POST' \}\)/s,
-  '开始授权必须先在同一浏览器打开推广页，再生成一次性授权链接');
 assert.match(oauthClick, /loginUrlOpen[\s\S]*?window\.open\(j\.loginUrl, '_blank', 'noopener,noreferrer'\)/s,
   '正式授权必须原样打开上游一次性 loginUrl，不能把推广参数拼进去');
+assert.doesNotMatch(oauthClick, /window\.open\([^)]*(?:REFERRAL|freebuff\.com\/\?ref=)/i,
+  '开始授权不得在正式 loginUrl 之前预打开推广页');
 assert.doesNotMatch(oauthClick, /new URL\(j\.loginUrl\)|j\.loginUrl\s*[+]\s*|searchParams\.set\(['"]ref/s,
   '不得改写 fingerprint 绑定的一次性授权 URL');
 
@@ -681,7 +686,18 @@ assert.match(app, /if \(keyEditing\)\s*\{[\s\S]*?patchKey\(/s, '编辑走 PATCH'
 assert.match(app, /if \(await patchKey\(keyEditing, body, '已保存'\)\) resetKeyForm\(\)/,
   '保存失败（改名撞重名回 400）时表单必须留着用户填的内容，不能清空');
 assert.match(app, /api\('\/keys',\s*\{\s*method:\s*'POST'/, '新建走 POST');
-assert.ok(app.includes('function keyMask('), '表里只显示掩码，完整 key 走「复制」按钮');
+assert.match(app, /function keyMask\(key\)\s*\{\s*return `\$\{key\.slice\(0, 8\)\}…`;\s*\}/s,
+  '表里只显示 Key 前 8 位和省略号，完整 Key 走「复制」按钮');
+assert.doesNotMatch(app, /key\.slice\(-4\)/,
+  'Key 掩码不得暴露末尾字符');
+assert.doesNotMatch(app, /<code title="\$\{esc\(k\.key\)\}">/,
+  'Key 单元格的悬停提示也不得暴露完整 Key');
+assert.match(app, /const running = st\.inFlight > 0 \? ` · <span class="key-inflight" title="在跑 \$\{st\.inFlight\}" aria-label="在跑 \$\{st\.inFlight\}">\$\{st\.inFlight\}<\/span>` : '';/,
+  '今日/累计只显示绿色在跑数字，完整语义保留在 title 和 aria-label');
+assert.doesNotMatch(app, /在跑 \$\{st\.inFlight\}<\/span>/,
+  '运行状态的可见文本不得再包含“在跑”');
+assert.match(css, /\.key-inflight\s*\{[^}]*color:\s*var\(--mint\)/s,
+  '运行中的数量必须使用绿色样式');
 assert.match(app, /if \(r\.key && r\.key !== S\.ownerName\)/,
   '调用日志只在共享 key 上标 Key 名：主 Key 自己用时那行是噪音，历史空值也不显示');
 assert.ok(app.includes("api('/keys')"), '面板必须读取分享 Key 列表与归账');

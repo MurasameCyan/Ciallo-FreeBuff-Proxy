@@ -37,20 +37,21 @@ const POOL_NAME = 'freebuff-pool';
 const PROVIDER_NAME = 'freebuff-airport';
 export const ACCOUNT_EGRESS_PORT_BASE = readPort('MIHOMO_ACCOUNT_PORT_BASE', 17900);
 export const ACCOUNT_EGRESS_PROBE_PORT = ACCOUNT_EGRESS_PORT_BASE + ACCOUNT_EGRESS_LANE_COUNT;
+const ACCOUNT_EGRESS_LAST_PORT = ACCOUNT_EGRESS_PROBE_PORT + ACCOUNT_EGRESS_LANE_COUNT - 1;
 if (MIXED_PORT === CTRL_PORT) {
   throw new Error('MIHOMO_MIXED_PORT 不能与 MIHOMO_CTRL_PORT 冲突');
 }
-if (ACCOUNT_EGRESS_PROBE_PORT > 65535) {
+if (ACCOUNT_EGRESS_LAST_PORT > 65535) {
   throw new Error('MIHOMO_ACCOUNT_PORT_BASE 账号出站端口范围超出 65535');
 }
 for (const [name, port] of [['MIHOMO_MIXED_PORT', MIXED_PORT], ['MIHOMO_CTRL_PORT', CTRL_PORT]]) {
-  if (port >= ACCOUNT_EGRESS_PORT_BASE && port <= ACCOUNT_EGRESS_PROBE_PORT) {
+  if (port >= ACCOUNT_EGRESS_PORT_BASE && port <= ACCOUNT_EGRESS_LAST_PORT) {
     throw new Error(`MIHOMO_ACCOUNT_PORT_BASE 账号出站端口范围与 ${name} 冲突`);
   }
 }
 const ACCOUNT_AUTO_CACHE_TTL_MS = 10 * 60 * 1000;
-const ACCOUNT_PROBE_POOL_NAME = 'freebuff-account-probe';
-const ACCOUNT_PROBE_LISTENER_NAME = 'freebuff-account-probe-in';
+const ACCOUNT_FREE_AUTO_CACHE_TTL_MS = 15 * 60 * 1000;
+const ACCOUNT_AUTO_RETRY_TTL_MS = 60 * 1000;
 const MIHOMO_BIN = process.env.MIHOMO_BIN || '/usr/local/bin/mihomo';
 // mihomo 数据（订阅缓存、配置）放到数据目录。默认跟随 server.js 的 DATA_DIR
 // （Docker 里是 /data 卷，node 用户可写；本地开发回退到 ./data/.mihomo）。
@@ -72,6 +73,7 @@ const LEGACY_PROXY_SETTINGS_FILES = [
 const DEFAULT_PROXY_SETTINGS = Object.freeze({
   subscriptionUrl: '',
   nodeMode: 'auto',
+  accountSelectionPriority: 'advanced',
   selectedNode: '',
   autoHealthCheck: true,
   healthCheckInterval: 600,
@@ -125,21 +127,43 @@ function autoRegionRank(name) {
   return inferNodeRegion(name) ? 0 : 1;
 }
 
-export function accountProbeSupportsLuna(probe) {
-  if (!probe || typeof probe !== 'object' || probe.state !== 'ok') return false;
-  return Array.isArray(probe.quota) && probe.quota.some((row) => {
-    if (row?.model !== 'openai/gpt-5.6-luna') return false;
+const ACCOUNT_ADVANCED_AUTH_MODELS = [
+  'deepseek/deepseek-v4-pro',
+  'openai/gpt-5.6-luna',
+];
+const ACCOUNT_FREE_AUTH_MODELS = [
+  'deepseek/deepseek-v4-flash',
+  'mimo/mimo-v2.5',
+];
+
+export function classifyAccountProbeAuthorization(probe) {
+  if (!probe || typeof probe !== 'object' || probe.state !== 'ok') return null;
+  if (!Array.isArray(probe.quota)) return null;
+  for (const model of ACCOUNT_ADVANCED_AUTH_MODELS) {
+    const row = probe.quota.find((entry) => entry?.model === model);
+    if (!row) continue;
     const limit = Number(row.limit);
-    if (!(limit > 0)) return false;
-    if (row.remaining != null) return Number(row.remaining) > 0;
+    if (!(limit > 0)) continue;
+    if (row.remaining != null) {
+      if (Number(row.remaining) > 0) return { tier: 'advanced', model };
+      continue;
+    }
     const used = Number(row.used);
-    return Number.isFinite(used) && used >= 0 && used < limit;
-  });
+    if (Number.isFinite(used) && used >= 0 && used < limit) return { tier: 'advanced', model };
+  }
+  for (const model of ACCOUNT_FREE_AUTH_MODELS) {
+    const row = probe.quota.find((entry) => entry?.model === model);
+    if (row && Number(row.limit) > 0) return { tier: 'free', model };
+  }
+  return null;
 }
 
 function accountPoolName(lane) { return `freebuff-account-${lane}`; }
 function accountListenerName(lane) { return `freebuff-account-in-${lane}`; }
 function accountPort(lane) { return ACCOUNT_EGRESS_PORT_BASE + lane; }
+function accountProbePoolName(lane) { return `freebuff-account-probe-${lane}`; }
+function accountProbeListenerName(lane) { return `freebuff-account-probe-in-${lane}`; }
+function accountProbePort(lane) { return ACCOUNT_EGRESS_PROBE_PORT + lane; }
 
 function normalizeAccountLane(value) {
   const lane = Number(value);
@@ -150,8 +174,12 @@ function normalizeAccountLane(value) {
 }
 
 let logger = (level, msg) => console.log(`[${level}] ${msg}`);
+let accountAutoRefreshHandler = null;
 
 export function setLogger(fn) { logger = fn || logger; }
+export function setAccountAutoRefreshHandler(fn) {
+  accountAutoRefreshHandler = typeof fn === 'function' ? fn : null;
+}
 export function getMixedPort() { return MIXED_PORT; }
 
 // ── mihomo 配置生成（移植 Zen config.mjs buildMihomoYaml） ──
@@ -169,6 +197,14 @@ export function buildMihomoYaml(subscriptionUrl) {
     port: ${accountPort(lane)}
     listen: 127.0.0.1
     proxy: ${accountPoolName(lane)}`).join('\n');
+  const accountProbeGroups = Array.from({ length: ACCOUNT_EGRESS_LANE_COUNT }, (_, lane) => `  - name: ${accountProbePoolName(lane)}
+    type: select
+    use: [${PROVIDER_NAME}]`).join('\n');
+  const accountProbeListeners = Array.from({ length: ACCOUNT_EGRESS_LANE_COUNT }, (_, lane) => `  - name: ${accountProbeListenerName(lane)}
+    type: mixed
+    port: ${accountProbePort(lane)}
+    listen: 127.0.0.1
+    proxy: ${accountProbePoolName(lane)}`).join('\n');
 
   return `# 由 Ciallo FreeBuff Proxy 自动生成,手改会在下次保存时被覆盖。
 mixed-port: ${MIXED_PORT}
@@ -211,17 +247,11 @@ proxy-groups:
     interval: 300
     tolerance: 50
 ${accountGroups}
-  - name: ${ACCOUNT_PROBE_POOL_NAME}
-    type: select
-    use: [${PROVIDER_NAME}]
+${accountProbeGroups}
 
 listeners:
 ${accountListeners}
-  - name: ${ACCOUNT_PROBE_LISTENER_NAME}
-    type: mixed
-    port: ${ACCOUNT_EGRESS_PROBE_PORT}
-    listen: 127.0.0.1
-    proxy: ${ACCOUNT_PROBE_POOL_NAME}
+${accountProbeListeners}
 
 rules:
   - DOMAIN-SUFFIX,codebuff.com,${POOL_NAME}
@@ -261,6 +291,10 @@ function normalizeInterval(value, fallback = DEFAULT_PROXY_SETTINGS.healthCheckI
   return Number.isInteger(n) && n >= min && n <= max ? n : fallback;
 }
 
+function normalizeAccountSelectionPriority(value) {
+  return value === 'unused' ? 'unused' : 'advanced';
+}
+
 export function resolveProxySettings({ envUrl = '', saved = {} } = {}) {
   const lockedUrl = String(envUrl || '').trim();
   const savedUrl = String(saved?.subscriptionUrl || '').trim();
@@ -268,6 +302,7 @@ export function resolveProxySettings({ envUrl = '', saved = {} } = {}) {
   return {
     subscriptionUrl: lockedUrl || savedUrl,
     nodeMode,
+    accountSelectionPriority: normalizeAccountSelectionPriority(saved?.accountSelectionPriority),
     selectedNode: nodeMode === 'manual' ? String(saved?.selectedNode || '').trim() : '',
     autoHealthCheck: saved?.autoHealthCheck !== false,
     healthCheckInterval: normalizeInterval(saved?.healthCheckInterval),
@@ -353,6 +388,7 @@ export function createProxyService({
   now = () => Date.now(),
   setIntervalFn = setInterval,
   clearIntervalFn = clearInterval,
+  onAutoRefresh = null,
 } = {}) {
   if (!manager) throw new Error('proxy service 缺少 manager');
 
@@ -371,6 +407,9 @@ export function createProxyService({
   let nodeNames = [];
   let currentNode = '';
   let healthMap = new Map();
+  // 账号自动验证只读最近一次完整测活成功的内存快照。刷新失败时保留，
+  // 避免每个账号重复读取控制器或因短暂订阅错误失去旧路由。
+  let accountCandidateSnapshot = [];
   let lastReject = null;
   let upstreamFetch = null;
   let closeFetch = null;
@@ -380,19 +419,15 @@ export function createProxyService({
   const accountIdentities = new Map();
   const accountRejects = new Map();
   const accountAutoValidations = new Map();
-  // 自动选点的验证请求在 probe lane 上是串行的，但账号准备阶段可以并发。
   // 先占位再验证，避免多个账号都拿到同一个最低延迟节点。
   const accountAutoReservations = new Map();
   const accountRejectedNodes = new Map();
-  let accountProbeFetch = null;
-  let closeAccountProbeFetch = null;
-  let accountProbeNode = '';
-  let accountProbeTopologyVersion = 0;
+  const accountProbeDispatchers = new Map();
   let nextAccountGeneration = 1;
   let healthTimer = null;
   let updateTimer = null;
   let tail = Promise.resolve();
-  let probeTail = Promise.resolve();
+  const probeTails = new Map();
   let accountTopologyVersion = 1;
   const accountOperationVersions = new Map();
 
@@ -402,9 +437,13 @@ export function createProxyService({
     return next;
   };
 
-  const probeSerial = (fn) => {
-    const next = probeTail.catch(() => {}).then(fn);
-    probeTail = next;
+  const probeSerial = (lane, fn) => {
+    const next = (probeTails.get(lane) || Promise.resolve()).catch(() => {}).then(fn);
+    probeTails.set(lane, next);
+    const clear = () => {
+      if (probeTails.get(lane) === next) probeTails.delete(lane);
+    };
+    next.then(clear, clear);
     return next;
   };
 
@@ -435,6 +474,7 @@ export function createProxyService({
     return {
       subscriptionUrl: cfg.envLocked ? savedSubscriptionUrl : cfg.subscriptionUrl,
       nodeMode: cfg.nodeMode,
+      accountSelectionPriority: cfg.accountSelectionPriority,
       selectedNode: cfg.selectedNode,
       autoHealthCheck: cfg.autoHealthCheck,
       healthCheckInterval: cfg.healthCheckInterval,
@@ -450,8 +490,13 @@ export function createProxyService({
     Promise.resolve().then(() => dispatcher.close()).catch(() => {});
   }
 
-  function invalidateAccountLane(lane, { clearRejected = false } = {}) {
-    bumpAccountOperation(lane);
+  function invalidateAccountProbeLane(lane) {
+    const dispatcher = accountProbeDispatchers.get(lane);
+    accountProbeDispatchers.delete(lane);
+    closeInBackground(dispatcher);
+  }
+
+  function dropAccountLaneRuntime(lane, { clearRejected = false } = {}) {
     const dispatcher = accountFetches.get(lane);
     accountFetches.delete(lane);
     accountNodes.delete(lane);
@@ -461,6 +506,12 @@ export function createProxyService({
     accountAutoReservations.delete(lane);
     if (clearRejected) accountRejectedNodes.delete(lane);
     closeInBackground(dispatcher);
+    invalidateAccountProbeLane(lane);
+  }
+
+  function invalidateAccountLane(lane, options = {}) {
+    bumpAccountOperation(lane);
+    dropAccountLaneRuntime(lane, options);
   }
 
   function invalidateAccountLanes() {
@@ -472,6 +523,49 @@ export function createProxyService({
       ...accountAutoReservations.keys(),
     ]);
     for (const lane of lanes) invalidateAccountLane(lane);
+  }
+
+  function buildAccountCandidateSnapshot(names, delays) {
+    return names
+      .map((name, index) => ({
+        name,
+        region: inferNodeRegion(name),
+        delay: delays.has(name) ? delays.get(name) : null,
+        order: index,
+      }))
+      .filter((entry) => entry.region && entry.delay != null)
+      .sort((a, b) => a.delay - b.delay || a.order - b.order)
+      .map(({ order, ...entry }) => entry);
+  }
+
+  function rebuildAccountCandidateSnapshot() {
+    accountCandidateSnapshot = buildAccountCandidateSnapshot(nodeNames, healthMap);
+  }
+
+  function advanceAccountTopology(nextNodeNames) {
+    accountTopologyVersion++;
+    const lanes = new Set([
+      ...accountFetches.keys(),
+      ...accountNodes.keys(),
+      ...accountAutoValidations.keys(),
+      ...accountAutoReservations.keys(),
+    ]);
+    for (const lane of lanes) {
+      bumpAccountOperation(lane);
+      invalidateAccountProbeLane(lane);
+      const validation = accountAutoValidations.get(lane);
+      const node = accountNodes.get(lane);
+      if (!node || !nextNodeNames.includes(node)) {
+        dropAccountLaneRuntime(lane);
+      } else if (validation && accountFetches.has(lane)) {
+        accountAutoValidations.set(lane, {
+          ...validation,
+          topologyVersion: accountTopologyVersion,
+          stale: true,
+          expiresAt: 0,
+        });
+      }
+    }
   }
 
   async function closeDispatcher() {
@@ -492,15 +586,15 @@ export function createProxyService({
     }
     const accountDispatchers = [...accountFetches.values()];
     accountFetches.clear();
-    const closeProbe = closeAccountProbeFetch;
-    accountProbeFetch = null;
-    closeAccountProbeFetch = null;
-    accountProbeNode = '';
-    accountProbeTopologyVersion = 0;
+    const probeDispatchers = [...accountProbeDispatchers.values()];
+    accountProbeDispatchers.clear();
+    probeTails.clear();
     await Promise.all(accountDispatchers.map(async ({ close: closeAccount }) => {
       try { await closeAccount?.(); } catch {}
     }));
-    try { await closeProbe?.(); } catch {}
+    await Promise.all(probeDispatchers.map(async ({ close: closeProbe }) => {
+      try { await closeProbe?.(); } catch {}
+    }));
   }
 
   function stopHealthTimer() {
@@ -535,12 +629,15 @@ export function createProxyService({
   function scheduleUpdate() {
     stopUpdateTimer();
     if (!cfg.autoUpdate || !cfg.subscriptionUrl || state !== 'ready') return;
-    updateTimer = setIntervalFn(() => {
-      serial(() => refreshCore({ ensureStarted: true })).catch((e) => {
+    updateTimer = setIntervalFn(() => (
+      serial(() => refreshCore({ ensureStarted: true })).then((result) => {
+        if (result?.ok) onAutoRefresh?.(result);
+        return result;
+      }).catch((e) => {
         lastError = cleanError(e);
         serviceLogger('warn', `[proxy] 自动更新订阅失败: ${lastError}`);
-      });
-    }, cfg.autoUpdateInterval * 1000);
+      })
+    ), cfg.autoUpdateInterval * 1000);
     updateTimer?.unref?.();
   }
 
@@ -575,6 +672,7 @@ export function createProxyService({
       nodes,
       nodeMode: cfg.nodeMode,
       mode: cfg.nodeMode,
+      accountSelectionPriority: cfg.accountSelectionPriority,
       selectedNode: cfg.selectedNode || null,
       autoHealthCheck: cfg.autoHealthCheck,
       healthCheckInterval: cfg.healthCheckInterval,
@@ -604,24 +702,27 @@ export function createProxyService({
     for (const [lane, node] of accountNodes) {
       if (!nodeNames.includes(node)) invalidateAccountLane(lane);
     }
-    if (accountProbeNode && !nodeNames.includes(accountProbeNode)) {
-      const close = closeAccountProbeFetch;
-      accountProbeFetch = null;
-      closeAccountProbeFetch = null;
-      accountProbeNode = '';
-      accountProbeTopologyVersion = 0;
-      try { await close?.(); } catch {}
+    const removedProbeDispatchers = [];
+    for (const [lane, dispatcher] of accountProbeDispatchers) {
+      if (nodeNames.includes(dispatcher.node)) continue;
+      accountProbeDispatchers.delete(lane);
+      removedProbeDispatchers.push(dispatcher);
     }
+    await Promise.all(removedProbeDispatchers.map(async ({ close }) => {
+      try { await close?.(); } catch {}
+    }));
     return pool;
   }
 
   async function reconcileAccountSelectors() {
     await Promise.all([...accountNodes].map(async ([lane, expected]) => {
-      let actual = '';
+      let actual;
       try {
         const group = await controller.request(`/proxies/${encodeURIComponent(accountPoolName(lane))}`);
         actual = String(group?.now || '');
-      } catch {}
+      } catch {
+        return;
+      }
       if (actual !== expected) invalidateAccountLane(lane);
     }));
   }
@@ -658,7 +759,8 @@ export function createProxyService({
   }
 
   async function switchAccountNode(lane, name) {
-    if (accountNodes.get(lane) === name && accountFetches.has(lane)) {
+    const force = accountAutoValidations.get(lane)?.stale === true;
+    if (!force && accountNodes.get(lane) === name && accountFetches.has(lane)) {
       accountRejects.delete(lane);
       return accountFetches.get(lane).fetch;
     }
@@ -678,21 +780,17 @@ export function createProxyService({
     }
   }
 
-  async function switchAccountProbeNode(name, topologyVersion) {
+  async function switchAccountProbeNode(lane, name, topologyVersion) {
     assertAccountTopology(topologyVersion);
-    if (accountProbeNode === name && accountProbeFetch
-      && accountProbeTopologyVersion === topologyVersion) return accountProbeFetch;
-    const close = closeAccountProbeFetch;
-    accountProbeFetch = null;
-    closeAccountProbeFetch = null;
-    accountProbeNode = '';
-    accountProbeTopologyVersion = 0;
-    try { await close?.(); } catch {}
+    const current = accountProbeDispatchers.get(lane);
+    if (current?.node === name && current.topologyVersion === topologyVersion) return current.fetch;
+    accountProbeDispatchers.delete(lane);
+    try { await current?.close?.(); } catch {}
     assertAccountTopology(topologyVersion);
-    await controller.request(`/proxies/${encodeURIComponent(ACCOUNT_PROBE_POOL_NAME)}`, 'PUT', { name });
+    await controller.request(`/proxies/${encodeURIComponent(accountProbePoolName(lane))}`, 'PUT', { name });
     assertAccountTopology(topologyVersion);
     if (!buildFetch) throw new Error('无法创建账号节点验证连接');
-    const built = await buildFetch({ port: ACCOUNT_EGRESS_PROBE_PORT, lane: 'probe' });
+    const built = await buildFetch({ port: accountProbePort(lane), lane: 'probe' });
     const probeFetch = typeof built === 'function' ? built : built?.fetch || null;
     const closeBuilt = typeof built?.close === 'function' ? built.close : null;
     if (!probeFetch) {
@@ -704,22 +802,29 @@ export function createProxyService({
       try { await closeBuilt?.(); } catch {}
       assertAccountTopology(topologyVersion);
     }
-    accountProbeFetch = probeFetch;
-    closeAccountProbeFetch = closeBuilt;
-    accountProbeNode = name;
-    accountProbeTopologyVersion = topologyVersion;
+    accountProbeDispatchers.set(lane, {
+      fetch: probeFetch,
+      close: closeBuilt,
+      node: name,
+      topologyVersion,
+    });
     return probeFetch;
   }
 
-  function rejectAccountNode(lane, node) {
+  function rejectAccountNode(lane, node, {
+    preserveValidation = false,
+    ttlMs = ACCOUNT_AUTO_CACHE_TTL_MS,
+  } = {}) {
     if (!node) return;
     let rejected = accountRejectedNodes.get(lane);
     if (!rejected) {
       rejected = new Map();
       accountRejectedNodes.set(lane, rejected);
     }
-    rejected.set(node, now() + ACCOUNT_AUTO_CACHE_TTL_MS);
-    if (accountAutoValidations.get(lane)?.node === node) accountAutoValidations.delete(lane);
+    rejected.set(node, now() + ttlMs);
+    if (!preserveValidation && accountAutoValidations.get(lane)?.node === node) {
+      accountAutoValidations.delete(lane);
+    }
   }
 
   function liveRejectedNodes(lane) {
@@ -734,25 +839,28 @@ export function createProxyService({
   function accountAutoCandidates(lane = null) {
     const rejected = lane == null ? new Set() : liveRejectedNodes(lane);
     const usage = new Map();
+    const tierByNode = new Map();
     for (const [usedLane, node] of accountNodes) {
       if (usedLane !== lane && node) usage.set(node, (usage.get(node) || 0) + 1);
+      if (usedLane === lane || !node) continue;
+      const tier = accountAutoValidations.get(usedLane)?.tier;
+      if (tier === 'advanced' || (tier === 'free' && !tierByNode.has(node))) tierByNode.set(node, tier);
     }
     for (const [reservedLane, reservation] of accountAutoReservations) {
       if (reservedLane !== lane && reservation?.node) {
         usage.set(reservation.node, (usage.get(reservation.node) || 0) + 1);
       }
     }
-    const order = new Map(nodeNames.map((name, index) => [name, index]));
-    return nodeNames
-      .map((name) => ({
-        name,
-        region: inferNodeRegion(name),
-        delay: healthMap.has(name) ? healthMap.get(name) : null,
-        load: usage.get(name) || 0,
-      }))
-      .filter((entry) => entry.region && entry.delay != null && !rejected.has(entry.name))
+    const order = new Map(accountCandidateSnapshot.map((entry, index) => [entry.name, index]));
+    const tierRank = (tier) => tier === 'advanced' ? 0 : tier === 'free' ? 2 : 1;
+    return accountCandidateSnapshot
+      .filter((entry) => nodeNames.includes(entry.name))
+      .map((entry) => ({ ...entry, load: usage.get(entry.name) || 0, knownTier: tierByNode.get(entry.name) || null }))
+      .filter((entry) => !rejected.has(entry.name))
       .sort((a, b) => (
-        a.load - b.load
+        (cfg.accountSelectionPriority === 'advanced'
+          ? tierRank(a.knownTier) - tierRank(b.knownTier) : 0)
+        || a.load - b.load
         || a.delay - b.delay
         || order.get(a.name) - order.get(b.name)
       ));
@@ -766,11 +874,14 @@ export function createProxyService({
     ));
   }
 
-  function reserveNextAccountAutoCandidate({ lane, identity, operationVersion, topologyVersion }) {
+  function reserveNextAccountAutoCandidate({
+    lane, identity, operationVersion, topologyVersion, excludedNodes = new Set(), allowOccupied = false,
+  }) {
     assertAccountOperation(lane, operationVersion, identity, topologyVersion);
     const candidates = accountAutoCandidates(lane);
     for (const candidate of candidates) {
-      if (isAccountNodeOccupied(candidate.name, lane)) continue;
+      if (excludedNodes.has(candidate.name)) continue;
+      if (!allowOccupied && isAccountNodeOccupied(candidate.name, lane)) continue;
       accountAutoReservations.set(lane, {
         lane,
         node: candidate.name,
@@ -782,7 +893,7 @@ export function createProxyService({
     }
 
     // 节点不足时允许复用，但仍按当前负载最小、延迟最低的顺序取一个。
-    const fallback = candidates[0] || null;
+    const fallback = candidates.find((candidate) => !excludedNodes.has(candidate.name)) || null;
     if (fallback) {
       accountAutoReservations.set(lane, {
         lane,
@@ -793,6 +904,22 @@ export function createProxyService({
       });
     }
     return fallback;
+  }
+
+  function reserveAccountAutoCandidateByName({
+    lane, identity, operationVersion, topologyVersion, node,
+  }) {
+    assertAccountOperation(lane, operationVersion, identity, topologyVersion);
+    const candidate = accountAutoCandidates(lane).find((entry) => entry.name === node);
+    if (!candidate) return null;
+    accountAutoReservations.set(lane, {
+      lane,
+      node: candidate.name,
+      identity,
+      topologyVersion,
+      operationVersion,
+    });
+    return candidate;
   }
 
   function releaseAccountAutoReservation(lane, operationVersion = null) {
@@ -900,12 +1027,26 @@ export function createProxyService({
         const delay = Number(delays?.[name]);
         return [name, Number.isFinite(delay) && delay > 0 ? delay : null];
       }));
+      rebuildAccountCandidateSnapshot();
+      let accountValidationExpired = false;
       for (const [lane, validation] of accountAutoValidations) {
-        if (healthMap.get(validation.node) == null) accountAutoValidations.delete(lane);
+        if (healthMap.get(validation.node) == null) {
+          if (validation.expiresAt > now() && liveRejectedNodes(lane).has(validation.node)) continue;
+          accountValidationExpired = true;
+          accountAutoValidations.set(lane, {
+            ...validation,
+            expiresAt: Math.min(validation.expiresAt, now()),
+          });
+        }
       }
       healthError = '';
       lastHealthAt = new Date(now()).toISOString();
       if (cfg.nodeMode === 'auto') await applyNodeMode();
+      if (accountValidationExpired) {
+        try { onAutoRefresh?.(); } catch (error) {
+          serviceLogger('warn', `[proxy] 账号出站后台重验调度失败: ${cleanError(error)}`);
+        }
+      }
     } catch (e) {
       healthError = cleanError(e);
     }
@@ -961,31 +1102,49 @@ export function createProxyService({
     if (ensureStarted && !(await manager.isRunning())) {
       if (!(await startCore())) return snapshot();
     }
+    const hadLastGood = state === 'ready' && nodeNames.length > 0 && typeof upstreamFetch === 'function';
     try {
-      accountTopologyVersion++;
-      // Provider 刷新会替换节点对象，即使节点名相同，旧业务 dispatcher 也不能
-      // 跨拓扑继续复用；保留账号身份与节点拒绝快照，后续选择会重新建连。
-      invalidateAccountLanes();
-      // 刷新失败后会关闭 dispatcher 以确保上游回落直连；若内核仍在运行，
-      // 下一次刷新需要重新建立 dispatcher，而不是误以为已有代理连接。
       await ensureDispatcher();
       await controller.request(`/providers/proxies/${encodeURIComponent(PROVIDER_NAME)}`, 'PUT');
-      lastRefreshAt = new Date(now()).toISOString();
-      await updatePool();
+
+      // 先完整读取新拓扑和测活结果，全部成功后再一次性提交。刷新中途失败时，
+      // 旧候选快照、账号验证和业务 dispatcher 都保持可用。
+      const pool = await controller.request(`/proxies/${encodeURIComponent(POOL_NAME)}`);
+      const nextNodeNames = Array.isArray(pool?.all) ? pool.all.map(String).filter(Boolean) : [];
+      const nextCurrentNode = pool?.now ? String(pool.now) : '';
+      const query = `timeout=5000&url=${encodeURIComponent(healthUrl)}`;
+      const delays = await controller.request(`/group/${encodeURIComponent(POOL_NAME)}/delay?${query}`);
+      const nextHealthMap = new Map(nextNodeNames.map((name) => {
+        const delay = Number(delays?.[name]);
+        return [name, Number.isFinite(delay) && delay > 0 ? delay : null];
+      }));
+      const nextCandidates = buildAccountCandidateSnapshot(nextNodeNames, nextHealthMap);
+
+      advanceAccountTopology(nextNodeNames);
+      nodeNames = nextNodeNames;
+      currentNode = nextCurrentNode;
+      healthMap = nextHealthMap;
+      accountCandidateSnapshot = nextCandidates;
+      const refreshedAt = new Date(now()).toISOString();
+      lastRefreshAt = refreshedAt;
+      lastHealthAt = refreshedAt;
+      healthError = '';
       await reconcileAccountSelectors();
       await applyNodeMode();
-      // 订阅解析后总是测活一次：填充各节点延迟、让列表按延迟排序，
-      // 自动模式据此选出最快节点。周期性测活仍由 autoHealthCheck 控制（scheduleHealth）。
-      await testHealthCore();
       state = 'ready';
       lastError = '';
       scheduleHealth();
       scheduleUpdate();
     } catch (e) {
-      await closeDispatcher();
       lastError = cleanError(e);
-      state = 'error';
+      if (hadLastGood) {
+        state = 'ready';
+      } else {
+        await closeDispatcher();
+        state = 'error';
+      }
       serviceLogger('warn', `[proxy] 刷新订阅失败: ${lastError}`);
+      return { ...snapshot(), ok: false };
     }
     return snapshot();
   }
@@ -998,12 +1157,13 @@ export function createProxyService({
     lastError = '';
     lastRefreshAt = null;
     lastHealthAt = null;
-    healthError = '';
-    version = null;
-    nodeNames = [];
-    currentNode = '';
-    healthMap = new Map();
-    return snapshot();
+      healthError = '';
+      version = null;
+      nodeNames = [];
+      currentNode = '';
+      healthMap = new Map();
+      accountCandidateSnapshot = [];
+      return snapshot();
   }
 
   async function setSubscriptionCore(value) {
@@ -1095,6 +1255,25 @@ export function createProxyService({
         return snapshot();
       });
     },
+    setAccountSelectionPriority(priority) {
+      return serial(async () => {
+        if (!['advanced', 'unused'].includes(priority)) {
+          throw new Error('账号自动出站优先级必须是 advanced 或 unused');
+        }
+        if (cfg.accountSelectionPriority === priority) return snapshot();
+        cfg.accountSelectionPriority = priority;
+        save();
+        for (const [lane, validation] of accountAutoValidations) {
+          bumpAccountOperation(lane);
+          invalidateAccountProbeLane(lane);
+          accountAutoValidations.set(lane, { ...validation, stale: true, expiresAt: 0 });
+        }
+        try { onAutoRefresh?.({ force: true }); } catch (error) {
+          serviceLogger('warn', `[proxy] 账号出站优先级切换后重验调度失败: ${cleanError(error)}`);
+        }
+        return snapshot();
+      });
+    },
     setAccountNode({ lane: rawLane, node, identity = '' } = {}) {
       return serial(async () => {
         const lane = normalizeAccountLane(rawLane);
@@ -1116,9 +1295,11 @@ export function createProxyService({
         const normalizedIdentity = applyAccountIdentity(lane, identity);
         if (typeof verify !== 'function') throw new Error('自动模式缺少模型目录验证器');
         if (!cfg.subscriptionUrl || !(await manager.isRunning()) || state !== 'ready') throw new Error('mihomo 未运行');
-        await updatePool();
-        // updatePool 可能因 provider 删除旧节点而主动使 lane 失效；这属于本次
-        // 恢复操作的准备阶段，因此在它之后再取得提交代际。
+        // 显式 force 也用于外部 provider 变更后的恢复；此时同步一次 selector，
+        // 让已被删除的节点立即失效。普通并发验证仍只读已提交快照，不重复 GET。
+        if (force) await updatePool();
+        // 候选由最近一次成功的订阅刷新/测活原子提交。账号验证只读内存快照，
+        // 避免多账号并发时重复读取同一个全局节点池。
         const operationVersion = bumpAccountOperation(lane);
         const topologyVersion = accountTopologyVersion;
         const availableCandidates = accountAutoCandidates(lane);
@@ -1139,7 +1320,15 @@ export function createProxyService({
           && availableCandidates.some((entry) => entry.name === cached.node)) {
           await ensureAccountDispatcher(lane);
           if (accountNodes.get(lane) !== cached.node) await switchAccountNode(lane, cached.node);
-          return { result: { lane, node: cached.node, port: accountPort(lane), cached: true } };
+          return {
+            result: {
+              lane,
+              node: cached.node,
+              port: accountPort(lane),
+              cached: true,
+              ...(cached.tier && cached.model ? { tier: cached.tier, model: cached.model } : {}),
+            },
+          };
         }
 
         const candidate = reserveNextAccountAutoCandidate({
@@ -1147,6 +1336,7 @@ export function createProxyService({
           identity: normalizedIdentity,
           operationVersion,
           topologyVersion,
+          allowOccupied: cfg.accountSelectionPriority === 'advanced',
         });
         if (!candidate) {
           const error = new Error('没有测活成功的 US/SG 节点');
@@ -1159,19 +1349,62 @@ export function createProxyService({
 
       const { lane, normalizedIdentity, operationVersion, topologyVersion } = prepared;
       let candidate = prepared.candidate;
+      const selectionPriority = cfg.accountSelectionPriority;
+      const attemptedNodes = new Set();
+      let freeFallback = null;
+
+      // 只在 serial 队列内调用：reservation 已经属于当前 operation 时，
+      // 把验证通过的节点切到业务 lane 并写入授权缓存。
+      const commitReserved = async (entry, authorization) => {
+        const reservation = accountAutoReservations.get(lane);
+        if (!reservation || reservation.operationVersion !== operationVersion
+          || reservation.node !== entry.name) return null;
+        if (!nodeNames.includes(entry.name) || liveRejectedNodes(lane).has(entry.name)) {
+          rejectAccountNode(lane, entry.name);
+          releaseAccountAutoReservation(lane, operationVersion);
+          return null;
+        }
+        await switchAccountNode(lane, entry.name);
+        if (liveRejectedNodes(lane).has(entry.name)) {
+          releaseAccountAutoReservation(lane, operationVersion);
+          return null;
+        }
+        releaseAccountAutoReservation(lane, operationVersion);
+        accountAutoValidations.set(lane, {
+          node: entry.name,
+          identity: normalizedIdentity,
+          topologyVersion,
+          generation: accountGenerations.get(lane),
+          tier: authorization?.tier || null,
+          model: authorization?.model || null,
+          expiresAt: now() + (authorization?.tier === 'free'
+            ? ACCOUNT_FREE_AUTO_CACHE_TTL_MS : ACCOUNT_AUTO_CACHE_TTL_MS),
+        });
+        return {
+          lane,
+          node: entry.name,
+          port: accountPort(lane),
+          cached: false,
+          ...(authorization?.tier && authorization?.model
+            ? { tier: authorization.tier, model: authorization.model } : {}),
+        };
+      };
 
       try {
         while (candidate) {
-          let verified = false;
+          attemptedNodes.add(candidate.name);
+          let verification = null;
+          let verificationFailed = false;
           try {
-            verified = await probeSerial(async () => {
+            verification = await probeSerial(lane, async () => {
               assertAccountOperation(lane, operationVersion, normalizedIdentity, topologyVersion);
-              const probeFetch = await switchAccountProbeNode(candidate.name, topologyVersion);
+              const probeFetch = await switchAccountProbeNode(lane, candidate.name, topologyVersion);
               assertAccountOperation(lane, operationVersion, normalizedIdentity, topologyVersion);
               return verify({ lane, node: candidate.name, fetch: probeFetch });
             });
           } catch (error) {
             if (error?.code === 'ACCOUNT_EGRESS_SUPERSEDED') throw error;
+            verificationFailed = true;
             serviceLogger('warn', `[proxy] 账号 lane ${lane} 节点验证失败 ${candidate.name}: ${cleanError(error)}`);
           }
 
@@ -1180,25 +1413,56 @@ export function createProxyService({
             const reservation = accountAutoReservations.get(lane);
             if (!reservation || reservation.operationVersion !== operationVersion
               || reservation.node !== candidate.name) return null;
+            const authorization = typeof verification === 'object' ? verification : null;
             // 验证请求在途时，业务流量可能已经明确收到 country_blocked/ip_capped。
             // 后到的“模型目录正常”不能覆盖更新鲜的出口拒绝观测。
-            if (verified && nodeNames.includes(candidate.name) && !liveRejectedNodes(lane).has(candidate.name)) {
-              await switchAccountNode(lane, candidate.name);
-              if (liveRejectedNodes(lane).has(candidate.name)) return null;
-              releaseAccountAutoReservation(lane, operationVersion);
-              accountAutoValidations.set(lane, {
-                node: candidate.name,
-                identity: normalizedIdentity,
-                topologyVersion,
-                generation: accountGenerations.get(lane),
-                expiresAt: now() + ACCOUNT_AUTO_CACHE_TTL_MS,
-              });
-              return { lane, node: candidate.name, port: accountPort(lane), cached: false };
+            if (verification && nodeNames.includes(candidate.name) && !liveRejectedNodes(lane).has(candidate.name)) {
+              // 高级优先时，Free 只是候选，不立即提交；继续探测剩余节点。
+              // 没有高级节点时由循环末尾提交最早发现的 Free 兜底。
+              if (selectionPriority === 'advanced' && authorization?.tier === 'free') {
+                freeFallback ||= { candidate, authorization };
+                releaseAccountAutoReservation(lane, operationVersion);
+                return { deferred: true };
+              }
+              return commitReserved(candidate, authorization);
             }
-            rejectAccountNode(lane, candidate.name);
+            rejectAccountNode(lane, candidate.name, verificationFailed ? {
+              preserveValidation: true,
+              ttlMs: ACCOUNT_AUTO_RETRY_TTL_MS,
+            } : undefined);
             releaseAccountAutoReservation(lane, operationVersion);
             return null;
           });
+          if (committed?.deferred) {
+            candidate = await serial(async () => {
+              assertAccountOperation(lane, operationVersion, normalizedIdentity, topologyVersion);
+              releaseAccountAutoReservation(lane, operationVersion);
+              return reserveNextAccountAutoCandidate({
+                lane,
+                identity: normalizedIdentity,
+                operationVersion,
+                topologyVersion,
+                excludedNodes: attemptedNodes,
+                allowOccupied: selectionPriority === 'advanced',
+              });
+            });
+            if (!candidate && freeFallback) {
+              const fallbackResult = await serial(async () => {
+                assertAccountOperation(lane, operationVersion, normalizedIdentity, topologyVersion);
+                const reserved = reserveAccountAutoCandidateByName({
+                  lane,
+                  identity: normalizedIdentity,
+                  operationVersion,
+                  topologyVersion,
+                  node: freeFallback.candidate.name,
+                });
+                if (!reserved) return null;
+                return commitReserved(reserved, freeFallback.authorization);
+              });
+              if (fallbackResult) return fallbackResult;
+            }
+            continue;
+          }
           if (committed) return committed;
 
           candidate = await serial(async () => {
@@ -1209,15 +1473,27 @@ export function createProxyService({
               identity: normalizedIdentity,
               operationVersion,
               topologyVersion,
+              excludedNodes: attemptedNodes,
+              allowOccupied: selectionPriority === 'advanced',
             });
           });
         }
 
         await serial(async () => {
           assertAccountOperation(lane, operationVersion, normalizedIdentity, topologyVersion);
-          accountAutoValidations.delete(lane);
+          const stale = accountAutoValidations.get(lane);
+          if (stale && stale.identity === normalizedIdentity
+            && stale.topologyVersion === topologyVersion
+            && stale.generation === accountGenerations.get(lane)) {
+            accountAutoValidations.set(lane, {
+              ...stale,
+              expiresAt: now() + ACCOUNT_AUTO_RETRY_TTL_MS,
+            });
+          } else {
+            accountAutoValidations.delete(lane);
+          }
         });
-        const error = new Error('没有可访问 openai/gpt-5.6-luna 的 US/SG 节点');
+        const error = new Error('没有可用账号授权的 US/SG 节点');
         error.code = 'ACCOUNT_EGRESS_UNAVAILABLE';
         throw error;
       } finally {
@@ -1237,6 +1513,7 @@ export function createProxyService({
         accountAutoValidations.delete(lane);
         accountRejectedNodes.delete(lane);
         closeInBackground(dispatcher);
+        invalidateAccountProbeLane(lane);
       });
     },
     getAccountFetch(rawLane, { identity = '' } = {}) {
@@ -1364,6 +1641,7 @@ const proxyService = createProxyService({
   writeConfig: writeMihomoConfig,
   buildFetch: buildProxyFetch,
   logger: (level, message) => logger(level, message),
+  onAutoRefresh: () => accountAutoRefreshHandler?.(),
 });
 
 export async function initProxy(subscriptionUrl) {
@@ -1375,6 +1653,11 @@ export async function refreshSubscription() { return proxyService.refresh(); }
 export async function getProxyStatus() { return proxyService.status(); }
 export async function setProxySubscription(url) { return proxyService.setSubscription(url); }
 export async function setProxyNode(options) { return proxyService.setNode(options); }
+export async function setAccountProxySelectionPriority(priority) {
+  return proxyService.setAccountSelectionPriority(priority);
+}
+// 兼容更直观的命名，管理服务目前使用上面的 account-prefixed 导出。
+export const setProxyAccountSelectionPriority = setAccountProxySelectionPriority;
 export async function setProxyHealth(options) { return proxyService.setHealth(options); }
 export async function setProxyUpdate(options) { return proxyService.setUpdate(options); }
 export function getConfiguredSubscription() { return proxyService.getSubscriptionUrl(); }

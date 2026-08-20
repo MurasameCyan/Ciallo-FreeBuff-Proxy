@@ -10,7 +10,6 @@ const POLL_MS = 3600000; // 默认 1 小时自动刷新；需要即时数据可�
 // refresh() 那样连带 /accounts 逐个探号——1 小时那条限制是为它设的,与这里无关。
 // 代价：每次回全量环形缓冲(上限 200 条)。真嫌费流量就上 SSE 或按 since 增量。
 const LOG_POLL_MS = 3000;
-const FREEBUFF_REFERRAL_URL = 'https://freebuff.com/?ref=ref-3fe318f0-4ddb-4b37-93db-43761d1089c4';
 
 const S = {
   accounts: [], health: {}, accountEgress: {}, aliases: {},
@@ -622,7 +621,7 @@ async function saveAliases(next) {
 let keyEditing = null;
 
 function keyMask(key) {
-  return key.length > 14 ? `${key.slice(0, 8)}…${key.slice(-4)}` : key;
+  return `${key.slice(0, 8)}…`;
 }
 
 /** 已存的白名单模型即使当前模型表里没有也保留，
@@ -699,10 +698,10 @@ function renderKeys() {
     body.innerHTML = list.map((k) => {
       const st = S.keyStats[k.name] || {};
       const models = Array.isArray(k.models) && k.models.length ? k.models.join(', ') : 'All';
-      const running = st.inFlight > 0 ? ` · 在跑 ${st.inFlight}` : '';
+      const running = st.inFlight > 0 ? ` · <span class="key-inflight" title="在跑 ${st.inFlight}" aria-label="在跑 ${st.inFlight}">${st.inFlight}</span>` : '';
       return `<tr class="${k.disabled ? 'key-off' : ''}">
         <td><span class="nm">${esc(k.name)}</span>${k.disabled ? ' <span class="pill">已停用</span>' : ''}</td>
-        <td><code title="${esc(k.key)}">${esc(keyMask(k.key))}</code></td>
+        <td><code>${esc(keyMask(k.key))}</code></td>
         <td>${esc(String(k.concurrency))}</td>
         <td>${k.dailyLimit > 0 ? esc(String(k.dailyLimit)) : UNLIMITED_GLYPH}</td>
         <td class="mono">${fmtCount(st.dayCount || 0)} / ${fmtCount(st.total || 0)}${running}</td>
@@ -912,6 +911,19 @@ function renderProxy() {
   // 一个假的「更新完成」，所以这里拦住。envLocked 不拦——环境变量锁的是改地址，重拉合法。
   const refreshBtn = $('proxyRefresh');
   if (refreshBtn) refreshBtn.disabled = !p.configured || state === 'starting';
+
+  const accountPriority = p.accountSelectionPriority === 'unused' ? 'unused' : 'advanced';
+  const accountPriorityToggle = $('accountPriorityToggle');
+  if (accountPriorityToggle) {
+    const advanced = accountPriority === 'advanced';
+    accountPriorityToggle.textContent = advanced ? '优先高级' : '优先未用';
+    accountPriorityToggle.classList.toggle('active', advanced);
+    accountPriorityToggle.setAttribute('aria-pressed', String(advanced));
+    accountPriorityToggle.title = advanced
+      ? '当前优先选择高级授权节点，点击切换为优先未用'
+      : '当前优先选择未被其他账号使用的节点，点击切换为优先高级';
+    accountPriorityToggle.disabled = !p.configured || state === 'starting';
+  }
 
   const rawNodes = Array.isArray(p.nodes) ? p.nodes : [];
   // 后端已按延迟升序排序（失效节点垫底），前端只如实呈现顺序与延迟。
@@ -1426,6 +1438,19 @@ function wire() {
   });
   $('proxyModeAuto')?.addEventListener('click', (event) => saveProxyNode(event.currentTarget, 'auto'));
   $('proxyModeManual')?.addEventListener('click', (event) => saveProxyNode(event.currentTarget, 'manual'));
+  $('accountPriorityToggle')?.addEventListener('click', (event) => {
+    const button = event.currentTarget;
+    const current = S.proxy?.accountSelectionPriority === 'unused' ? 'unused' : 'advanced';
+    const priority = current === 'advanced' ? 'unused' : 'advanced';
+    run(button, '切换账号选点策略', async () => {
+      const r = await api('/proxy/account-priority', {
+        method: 'PUT', body: JSON.stringify({ priority }),
+      });
+      S.proxy = r?.proxy || r || S.proxy;
+      renderProxy();
+      return priority === 'advanced' ? '已设为优先高级' : '已设为优先未用';
+    }).finally(() => renderProxy());
+  });
   $('proxyNode')?.addEventListener('change', async (event) => {
     const select = event.currentTarget;
     const node = select.value;
@@ -1535,7 +1560,6 @@ function wire() {
 
   // OAuth 登录
   $('oauthStart').addEventListener('click', (e) => {
-    window.open(FREEBUFF_REFERRAL_URL, '_blank', 'noopener,noreferrer');
     const btn = e.currentTarget;
     btn.disabled = true;
     // 按钮自己承担「现在在等」这个状态，下面的状态行就不用再重复一遍

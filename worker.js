@@ -587,7 +587,7 @@ const durableAccountStates = new Map(); // token -> { state, until, reason }
 const dirtyAccountStates = new Set(); // 本请求刚写入，不能被旧 env 快照覆盖
 const accountStateRevisions = new Map(); // token -> 最近已应用/本地写入的 store revision
 const accountLeases = new Map(); // token -> inFlight count (最多 1)
-const accountLeaseWaiters = new Map(); // token -> settle[]，active session 忙时等待释放
+const accountLeaseWaiters = new Set(); // 任意账号租约变化时广播，等待者醒来后重新扫描
 // 等待原账号释放租约的上限。默认远大于一次普通请求，让同一对话尽量钉在同一个
 // 号上：换号=在新账号上再建一个 session，而免费额度按账号计（每天个位数）。
 // ponytail: 这个上限只是租约泄漏的兜底，不是调度策略。客户端断开会立即结束等待；
@@ -708,42 +708,38 @@ function acquireToken(token) {
 function releaseToken(token) {
   if (!token) return;
   accountLeases.delete(token);
-  const waiters = accountLeaseWaiters.get(token);
-  if (!waiters) return;
-  const next = waiters.shift();
-  if (waiters.length) accountLeaseWaiters.set(token, waiters);
-  next?.();
+  const waiters = [...accountLeaseWaiters];
+  accountLeaseWaiters.clear();
+  for (const wake of waiters) wake();
 }
 
 function tokenBusy(token) {
   return accountLeases.get(token) === 1;
 }
 
-function waitForTokenRelease(token, waitMs = ACTIVE_SESSION_LEASE_WAIT_MS, signal = null) {
-  if (!tokenBusy(token) || !(waitMs > 0)) return Promise.resolve();
+function waitForAnyTokenRelease(tokens, waitMs = ACTIVE_SESSION_LEASE_WAIT_MS, signal = null) {
+  const watched = [...new Set(tokens)].filter((token) => tokenBusy(token));
+  if (!watched.length || !(waitMs > 0)) return Promise.resolve();
   return new Promise((resolve, reject) => {
     let settled = false;
-    const waiters = accountLeaseWaiters.get(token) || [];
+    let timer = null;
     const finish = (error) => {
       if (settled) return;
       settled = true;
-      const index = waiters.indexOf(finish);
-      if (index >= 0) waiters.splice(index, 1);
-      if (waiters.length === 0) accountLeaseWaiters.delete(token);
-      clearTimeout(timer);
+      accountLeaseWaiters.delete(finish);
+      if (timer) clearTimeout(timer);
       if (signal) signal.removeEventListener("abort", onAbort);
       if (error) reject(error);
       else resolve();
     };
     const onAbort = () => finish(signal.reason instanceof Error ? signal.reason : new Error("request aborted"));
-    const timer = setTimeout(() => finish(), waitMs);
-    waiters.push(finish);
-    accountLeaseWaiters.set(token, waiters);
+    accountLeaseWaiters.add(finish);
+    timer = setTimeout(() => finish(), waitMs);
     if (signal) {
       if (signal.aborted) onAbort();
       else signal.addEventListener("abort", onAbort, { once: true });
     }
-    if (!tokenBusy(token)) finish();
+    if (watched.some((token) => !tokenBusy(token))) finish();
   });
 }
 
@@ -1497,24 +1493,62 @@ function callLogSnapshot() {
   };
 }
 
-// 第一次选号若已有同模型 active session，等待它的单并发租约释放而不是立刻换号；
-// 只有等待超时（租约泄漏兜底）或真正失败后的重试才走原 picker，保留故障转移。
+// 第一次选号若已有同模型 active session，等待它的单并发租约释放而不是立刻换号。
+// 有每日 session 预算的分享 Key 会等到该 session 不再可复用，避免长请求超过普通
+// 等待上限后换号建新 session；不限量 Key 仍保留超时回退，真正失败后的重试也照常换号。
 async function pickTokenWithSessionWait(
   env,
   sessionModel,
   attempted = new Set(),
   signal = null,
   waitMs = ACTIVE_SESSION_LEASE_WAIT_MS,
+  client = null,
 ) {
   if (sessionModel && attempted.size === 0) {
-    syncAccountState(env);
-    const preferred = parseAccounts(env).find((acct) =>
-      !accountIsBlocked(acct.token)
-      && !inScopedCooldown(acct.token, sessionModel)
-      && isUsableSession(sessCache.get(acct.token + ":" + sessionModel))
-    );
-    if (preferred && tokenBusy(preferred.token)) {
-      await waitForTokenRelease(preferred.token, waitMs, signal);
+    const preserveBudget = client?.owner !== true && Number(client?.dailyLimit) > 0;
+    while (true) {
+      syncAccountState(env);
+      const accounts = parseAccounts(env);
+      const active = accounts.flatMap((acct) => {
+        const session = sessCache.get(acct.token + ":" + sessionModel);
+        return !accountIsBlocked(acct.token)
+          && !inScopedCooldown(acct.token, sessionModel)
+          && (preserveBudget ? isLiveSession(session) : isUsableSession(session))
+          ? [{ acct, session }] : [];
+      });
+      if (!active.length) break;
+      const idle = active.find(({ acct }) => !tokenBusy(acct.token));
+      if (idle) {
+        if (!preserveBudget) break;
+        if (acquireToken(idle.acct.token)) return idle.acct;
+        continue;
+      }
+
+      // 活跃 session 都被占用时，先利用没有该模型 session 的空闲账号。
+      // 这让 concurrency>1 真正扩展到账号池，而不是让所有请求一起占着 Key
+      // 槽位等待同一个账号；只有没有预算或没有空闲账号时才等待旧 session。
+      if (preserveBudget) {
+        const st = clientStat(client);
+        const budgetAvailable = st.daySessions.size + st.pendingSessions.size < client.dailyLimit;
+        if (budgetAvailable) {
+          const fresh = accounts.find((acct) => {
+            if (accountIsBlocked(acct.token) || inScopedCooldown(acct.token, sessionModel)) return false;
+            if (tokenBusy(acct.token)) return false;
+            const session = sessCache.get(acct.token + ":" + sessionModel);
+            return !isLiveSession(session);
+          });
+          if (fresh && acquireToken(fresh.token)) return fresh;
+        }
+      }
+
+      const activeWaitMs = preserveBudget
+        ? Math.min(...active.map(({ session }) => (
+            Math.max(0, sessionRemainingMs(session))
+          )))
+        : waitMs;
+      if (!(activeWaitMs > 0)) break;
+      await waitForAnyTokenRelease(active.map(({ acct }) => acct.token), activeWaitMs, signal);
+      if (!preserveBudget) break;
     }
   }
   return pickToken(env, sessionModel, attempted);
@@ -1730,6 +1764,11 @@ function normalizeSession(data, requestedModel, now = Date.now()) {
 function isUsableSession(session, now = Date.now()) {
   const expiryMs = Date.parse(session?.expiresAt || "");
   return Boolean(session?.instanceId) && Number.isFinite(expiryMs) && expiryMs > now + 60000;
+}
+
+function isLiveSession(session, now = Date.now()) {
+  const expiryMs = Date.parse(session?.expiresAt || "");
+  return Boolean(session?.instanceId) && Number.isFinite(expiryMs) && expiryMs > now;
 }
 
 function accountSlot(pool, token) {
@@ -2225,6 +2264,122 @@ class EmptyUpstreamStreamError extends Error {
   }
 }
 
+// 上游始终以 SSE 返回，即使客户端请求的是非流式响应。HTTP 200 或首个字节
+// 本身并不代表模型真的开始输出：角色、usage、finish-only 和 [DONE] 都可能
+// 在额度/会话异常时单独出现。预读到首个有意义增量后再把原始字节重放给下游，
+// 这样空流可以在建会话重试循环内恢复，而不会先把 200 错误交给客户端。
+function ssePayloadHasMeaningfulOutput(payload) {
+  if (!payload || payload === "[DONE]") return false;
+  let obj;
+  try { obj = unwrapData(JSON.parse(payload)); } catch { return false; }
+  const delta = obj?.choices?.[0]?.delta;
+  if (!delta || typeof delta !== "object") return false;
+  if (typeof delta.content === "string" && delta.content.length > 0) return true;
+  if (collectReasoningTexts(delta.reasoning_content).length > 0) return true;
+  if (Array.isArray(delta.tool_calls)) {
+    return delta.tool_calls.some((call) => {
+      if (!call || typeof call !== "object") return false;
+      const fn = call.function;
+      return !!(call.id || (fn && typeof fn === "object" && (fn.name || fn.arguments)));
+    });
+  }
+  return false;
+}
+
+function scanSseForMeaningfulOutput(state, text, final = false) {
+  state.pending += text || "";
+  const lines = state.pending.split("\n");
+  state.pending = final ? "" : (lines.pop() || "");
+  for (const rawLine of lines) {
+    const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+    if (!line.startsWith("data:")) continue;
+    const payload = line.slice(5).trim();
+    if (payload === "[DONE]") {
+      state.doneSeen = true;
+      return false;
+    }
+    if (ssePayloadHasMeaningfulOutput(payload)) {
+      state.meaningful = true;
+      return true;
+    }
+  }
+  return state.meaningful;
+}
+
+function preflightErrorShouldPropagate(error) {
+  if (!error) return false;
+  if (error instanceof EmptyUpstreamStreamError || error instanceof QuotaExhaustedError) return true;
+  if (error.name === "AbortError") return true;
+  return /request aborted|client disconnected/i.test(String(error.message || error));
+}
+
+async function preflightMeaningfulSseResponse(response, readNext = null, hooks = {}) {
+  if (!response?.body) throw new EmptyUpstreamStreamError();
+  const reader = response.body.getReader();
+  const buffered = [];
+  const scanner = { pending: "", meaningful: false, doneSeen: false };
+  const decoder = new TextDecoder();
+  let readError = null;
+  try {
+    while (!scanner.meaningful) {
+      let next;
+      try {
+        next = await (readNext ? readNext(reader) : reader.read());
+      } catch (error) {
+        readError = error;
+        break;
+      }
+      if (next.done) {
+        scanSseForMeaningfulOutput(scanner, decoder.decode(), true);
+        break;
+      }
+      if (next.value && next.value.byteLength) {
+        const copy = new Uint8Array(next.value);
+        buffered.push(copy);
+        scanSseForMeaningfulOutput(scanner, decoder.decode(copy, { stream: true }));
+        if (scanner.doneSeen) break;
+      }
+    }
+
+    if (!scanner.meaningful) {
+      try { await reader.cancel(readError || new EmptyUpstreamStreamError()); } catch {}
+      if (readError && preflightErrorShouldPropagate(readError)) throw readError;
+      throw new EmptyUpstreamStreamError();
+    }
+
+    const replay = new ReadableStream({
+      async start(controller) {
+        try {
+          for (const chunk of buffered) controller.enqueue(chunk);
+          while (true) {
+            const next = await reader.read();
+            if (next.done) break;
+            if (next.value && next.value.byteLength) controller.enqueue(next.value);
+          }
+          controller.close();
+        } catch (error) {
+          controller.error(error);
+        } finally {
+          try { reader.releaseLock(); } catch {}
+          try { hooks.onDone?.(); } catch {}
+        }
+      },
+      cancel(reason) {
+        try { hooks.onCancel?.(reason); } catch {}
+        return reader.cancel(reason);
+      },
+    });
+    return new Response(replay, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    });
+  } catch (error) {
+    try { await reader.cancel(error); } catch {}
+    throw error;
+  }
+}
+
 function isExpectedFlowError(error) {
   return error instanceof TerminalAccountStateError
     || error instanceof TransientAccountAuthError
@@ -2487,42 +2642,28 @@ async function fetchStreamWithQuotaGuard(url, init, token, sessionModel, request
     if (!response.ok) return response;
     if (!response.body) throw new EmptyUpstreamStreamError();
 
-    reader = response.body.getReader();
-    const first = await raceWithRequestAbort([reader.read(), armProbe()]);
-    clearProbe();
-    if (first.done) {
-      try { reader.releaseLock(); } catch {}
-      throw new EmptyUpstreamStreamError();
-    }
-
-    // 首个 chunk 已到达，交还给正常 SSE 转发逻辑；不再设置固定总时长。
-    const body = new ReadableStream({
-      start(streamController) {
-        streamController.enqueue(first.value);
-        (async () => {
-          try {
-            while (true) {
-              const next = await reader.read();
-              if (next.done) break;
-              streamController.enqueue(next.value);
-            }
-            streamController.close();
-          } catch (error) {
-            streamController.error(error);
-          } finally {
-            try { reader.releaseLock(); } catch {}
-            cleanupRequestAbort();
-          }
-        })();
+    // 首个有效增量前持续做额度保护；角色/usage/[DONE] 等元数据不能提前
+    // 让请求进入 200 成功态。预检返回的 body 会重放已读字节，再继续消费原 reader。
+    const prepared = await preflightMeaningfulSseResponse(
+      response,
+      async (activeReader) => {
+        reader = activeReader;
+        try {
+          return await raceWithRequestAbort([activeReader.read(), armProbe()]);
+        } finally {
+          clearProbe();
+        }
       },
-      cancel(reason) {
-        cleanupRequestAbort();
-        try { controller.abort(reason); } catch { controller.abort(); }
-        return reader.cancel(reason);
+      {
+        onDone: cleanupRequestAbort,
+        onCancel(reason) {
+          cleanupRequestAbort();
+          try { controller.abort(reason); } catch { controller.abort(); }
+        },
       },
-    });
+    );
     transferred = true;
-    return new Response(body, { status: response.status, headers: response.headers });
+    return prepared;
   } catch (error) {
     clearProbe();
     cleanupRequestAbort();
@@ -2671,6 +2812,14 @@ async function createSession(token, sessionModel, forceCreate = false, client = 
     const cached = sessCache.get(key);
     if (cached) {
       const remain = sessionRemainingMs(cached);
+      const preserveBudget = client?.owner !== true && Number(client?.dailyLimit) > 0;
+      if (preserveBudget && remain > 0) {
+        if (remain >= SESSION_REUSE_SAFE_MS - SESSION_VERIFY_WINDOW_MS
+          && remain < SESSION_REUSE_SAFE_MS) {
+          verifySessionInBackground(token, sessionModel).catch(() => {});
+        }
+        return claimClientSession(client, token, sessionModel, cached);
+      }
       if (remain >= SESSION_REUSE_SAFE_MS) return claimClientSession(client, token, sessionModel, cached);
       if (remain > 0 && remain >= SESSION_REUSE_SAFE_MS - SESSION_VERIFY_WINDOW_MS) {
         // 临界区：先复用，同时后台验证（验证失败删缓存，下次请求重建）
@@ -2742,7 +2891,6 @@ async function createSession(token, sessionModel, forceCreate = false, client = 
     }
     if (r.status === 200 && r.data?.status === "queued" && r.data?.instanceId) {
       const inst = r.data.instanceId;
-      reservation?.commit(token, sessionModel, normalizeSession(r.data, sessionModel));
       for (let i = 0; i < 8; i++) {
         await sleep(1500);
         const q = await enqueueUp("GET", "/api/v1/freebuff/session", token, undefined, { "x-freebuff-instance-id": inst }, SESSION_TIMEOUT_MS);
@@ -2758,6 +2906,7 @@ async function createSession(token, sessionModel, forceCreate = false, client = 
         if (q.status === 200 && q.data?.status === "active") {
           const s = normalizeSession({ ...q.data, instanceId: q.data.instanceId || inst }, sessionModel);
           sessCache.set(key, s);
+          reservation?.commit(token, sessionModel, s);
           return s;
         }
       }
@@ -3209,6 +3358,7 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode, requestSig
 
   let lastErrMsg = "";
   let lastWaitingRetryAfter = null;
+  let lastEgressUnavailable = false;
   const attempted = new Set();
   let pinnedToken = null; // 上游抖动后待重试的同一个号
   let sameAccountRetries = 0;
@@ -3221,12 +3371,15 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode, requestSig
       acct = await pickTokenWithSessionWait(
         env, mc.session, attempted, requestSignal,
         attempted.size === 0 ? sessionLeaseWaitMs(env) : 0,
+        client,
       );
     }
     const token = acct ? acct.token : null;
     if (!token) {
       recordRequest(mc && mc.id ? mc.id : "", null, false);
-      return lastWaitingRetryAfter ? waitingRoomResponse(lastWaitingRetryAfter) : poolExhaustionResponse(env, mc.session);
+      if (lastWaitingRetryAfter) return waitingRoomResponse(lastWaitingRetryAfter);
+      if (lastEgressUnavailable) return egressRejectedResponse("egress_unavailable");
+      return poolExhaustionResponse(env, mc.session);
     }
     attempted.add(token);
     logAccountRoute(debug, pool, token, mc.session, acctTry + 1,
@@ -3268,13 +3421,15 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode, requestSig
         "Content-Type": "application/json",
         "x-freebuff-instance-id": sess.instanceId,
       };
-      const resp = await authenticatedUpstreamFetch(token, CODEBUFF_API + "/api/v1/chat/completions", {
+      let resp = await authenticatedUpstreamFetch(token, CODEBUFF_API + "/api/v1/chat/completions", {
         method: "POST",
         headers,
         body: JSON.stringify(payload),
         signal: isStream ? requestSignal : AbortSignal.timeout(NONSTREAM_TIMEOUT_MS),
       });
+      if (resp.ok) resp = await preflightMeaningfulSseResponse(resp);
       if (!resp.ok) {
+        lastEgressUnavailable = false;
         const text = await resp.text();
         recordAccountObservation(token, resp.status, text, { headers: resp.headers, model: mc.session });
         throwIfTerminalResponse(token, resp.status, text);
@@ -3335,8 +3490,13 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode, requestSig
       if (!isExpectedFlowError(e)) console.error("[code_review]", e);
       lastErrMsg = String(e.message || e);
       if (e instanceof EgressRejectedError) {
-        recordRequest(mc && mc.id ? mc.id : "", null, false);
-        return egressRejectedResponse(e.state);
+        if (e.state !== "egress_unavailable") {
+          recordRequest(mc && mc.id ? mc.id : "", null, false);
+          return egressRejectedResponse(e.state);
+        }
+        lastEgressUnavailable = true;
+      } else {
+        lastEgressUnavailable = false;
       }
       if (e instanceof ClientSessionLimitError) return clientSessionLimitResponse(e);
       if (e instanceof WaitingRoomError || /session stayed queued|waiting.room/i.test(lastErrMsg)) {
@@ -3373,6 +3533,10 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode, requestSig
   if (lastWaitingRetryAfter) {
     recordRequest(mc && mc.id ? mc.id : "", null, false);
     return waitingRoomResponse(lastWaitingRetryAfter);
+  }
+  if (lastEgressUnavailable) {
+    recordRequest(mc && mc.id ? mc.id : "", null, false);
+    return egressRejectedResponse("egress_unavailable");
   }
   recordRequest(mc && mc.id ? mc.id : "", null, false);
   if (accountPoolExhaustion(env, mc.session).allUnavailable) return poolExhaustionResponse(env, mc.session);
@@ -3417,6 +3581,7 @@ async function executeChatPooled(env, chatParams, mc, isStream, mode, requestSig
   // 免费通道上游波动大（并发>1 即出问题、排队超时），单请求内换号比等客户端重试成功率高得多。
   let lastErrMsg = "";
   let lastWaitingRetryAfter = null;
+  let lastEgressUnavailable = false;
   const attempted = new Set();
   let pinnedToken = null; // 上游抖动后待重试的同一个号
   let sameAccountRetries = 0;
@@ -3429,12 +3594,15 @@ async function executeChatPooled(env, chatParams, mc, isStream, mode, requestSig
       acct = await pickTokenWithSessionWait(
         env, mc.session, attempted, requestSignal,
         attempted.size === 0 ? sessionLeaseWaitMs(env) : 0,
+        client,
       );
     }
     const token = acct ? acct.token : null;
     if (!token) {
       recordRequest(mc && mc.id ? mc.id : "", null, false);
-      return lastWaitingRetryAfter ? waitingRoomResponse(lastWaitingRetryAfter) : poolExhaustionResponse(env, mc.session);
+      if (lastWaitingRetryAfter) return waitingRoomResponse(lastWaitingRetryAfter);
+      if (lastEgressUnavailable) return egressRejectedResponse("egress_unavailable");
+      return poolExhaustionResponse(env, mc.session);
     }
     attempted.add(token);
     logAccountRoute(debug, pool, token, mc.session, acctTry + 1,
@@ -3505,6 +3673,7 @@ async function executeChatPooled(env, chatParams, mc, isStream, mode, requestSig
                 ...chatInit,
                 signal: AbortSignal.timeout(NONSTREAM_TIMEOUT_MS),
               });
+          if (!isStream && resp.ok) resp = await preflightMeaningfulSseResponse(resp);
         } catch (error) {
           // 空流只视为当前账号的同模型 session 疑似脏状态：
           // 删除上游旧实例，重建同模型 session，再重试一次；绝不改成别的模型。
@@ -3563,6 +3732,7 @@ async function executeChatPooled(env, chatParams, mc, isStream, mode, requestSig
         break;
       }
       if (!resp.ok) {
+        lastEgressUnavailable = false;
         // 累计口径：429 记限流，其余上游失败记错误（超时走 catch 分支单独计）。
         if (resp.status === 429) callTotals.rateLimited++;
         else callTotals.upstreamError++;
@@ -3606,8 +3776,13 @@ async function executeChatPooled(env, chatParams, mc, isStream, mode, requestSig
       if (!isExpectedFlowError(e)) console.error("[" + mode + "]", e);
       const msg = String(e.message || e);
       if (e instanceof EgressRejectedError) {
-        recordRequest(mc && mc.id ? mc.id : "", null, false);
-        return egressRejectedResponse(e.state);
+        if (e.state !== "egress_unavailable") {
+          recordRequest(mc && mc.id ? mc.id : "", null, false);
+          return egressRejectedResponse(e.state);
+        }
+        lastEgressUnavailable = true;
+      } else {
+        lastEgressUnavailable = false;
       }
       if (e instanceof ClientSessionLimitError) return clientSessionLimitResponse(e);
       if (e instanceof WaitingRoomError || /session stayed queued|waiting.room/i.test(msg)) {
@@ -3668,6 +3843,10 @@ async function executeChatPooled(env, chatParams, mc, isStream, mode, requestSig
   if (lastWaitingRetryAfter) {
     recordRequest(mc && mc.id ? mc.id : "", null, false);
     return waitingRoomResponse(lastWaitingRetryAfter);
+  }
+  if (lastEgressUnavailable) {
+    recordRequest(mc && mc.id ? mc.id : "", null, false);
+    return egressRejectedResponse("egress_unavailable");
   }
   // 全池换号仍失败：该请求的失败终态，记一次失败（每个客户端请求只落一次）。
   recordRequest(mc && mc.id ? mc.id : "", null, false);

@@ -89,7 +89,11 @@
       <div class="card-head account-head">
         <div class="card-title">
           <p class="eyebrow">账号管理</p>
-          <h2 id="h-accounts">账号池 <span class="count" id="acctCount"></span></h2>
+          <div class="account-title-row">
+            <h2 id="h-accounts">账号池 <span class="count" id="acctCount"></span></h2>
+            <button type="button" class="account-priority-toggle active" id="accountPriorityToggle"
+                    aria-pressed="true" title="当前优先选择高级授权节点，点击切换为优先未用">优先高级</button>
+          </div>
         </div>
         <nav class="seg" role="tablist" aria-label="账号池视图">
           <button type="button" class="seg-btn active" id="tab-manage" data-pane="manage" role="tab"

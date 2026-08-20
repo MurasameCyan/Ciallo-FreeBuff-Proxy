@@ -193,6 +193,31 @@ test('概况统计持久化 API 契约', async (t) => {
   });
 });
 
+test('账号自动出站优先级 API 可切换并持久化', async (t) => {
+  const s = await startServer();
+  t.after(() => stopServer(s));
+
+  const switched = await fetch(s.base + '/_api/proxy/account-priority', {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ priority: 'unused' }),
+  });
+  assert.equal(switched.status, 200);
+  const switchedBody = await switched.json();
+  assert.equal(switchedBody.proxy.accountSelectionPriority, 'unused');
+
+  const current = await fetch(s.base + '/_api/proxy');
+  assert.equal(current.status, 200);
+  assert.equal((await current.json()).accountSelectionPriority, 'unused');
+
+  const invalid = await fetch(s.base + '/_api/proxy/account-priority', {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ priority: 'random' }),
+  });
+  assert.equal(invalid.status, 400);
+});
+
 test('概况开关关闭时，分享 Key 统计仍从 usage-stats.json 恢复到面板', async (t) => {
   const key = 'fbk-server-key-stats-restore';
   const fingerprint = workerFingerprint(key);
@@ -469,6 +494,7 @@ test('管理员探测按明确结果持久隔离，自动候选验证不修改�
     assert.equal(method, 'GET');
     assert.equal(path, '/api/v1/freebuff/session');
     assert.equal(fetchOverride, expectedFetch, '管理员探测必须使用调用方给定的账号 lane fetch');
+    assert.equal(timeout, expectedTimeout, '账号探测必须使用调用方指定的超时');
     return { ...upstreamResult, text: JSON.stringify(upstreamResult.data), headers: new Headers() };
   };
   const probeAccount = new Function(
@@ -477,6 +503,7 @@ test('管理员探测按明确结果持久隔离，自动候选验证不修改�
     `${source.slice(start, end)}; return probeAccount;`,
   )(enqueueUpstream, accountStateStore);
   const token = 'server-probe-terminal-token-123456';
+  let expectedTimeout = 15000;
 
   const banned = await probeAccount(token, { upstreamFetch: expectedFetch });
   assert.equal(banned.state, 'banned');
@@ -487,7 +514,16 @@ test('管理员探测按明确结果持久隔离，自动候选验证不修改�
   assert.match(bannedRaw, /"until":\s*null/);
   assert.doesNotMatch(bannedRaw, new RegExp(token));
 
-  upstreamResult = { status: 200, data: { status: 'active' } };
+  upstreamResult = {
+    status: 200,
+    data: {
+      status: 'active',
+      rateLimitsByModel: {
+        'openai/gpt-5.6-luna': { limit: 5, remaining: 2 },
+        'mimo/mimo-v2.5': { limit: 6 },
+      },
+    },
+  };
   const healthy = await probeAccount(token, { upstreamFetch: expectedFetch });
   assert.equal(healthy.state, 'ok');
   assert.equal(healthy.isolatedPermanent, false);
@@ -498,14 +534,83 @@ test('管理员探测按明确结果持久隔离，自动候选验证不修改�
   assert.equal(nested.state, 'banned');
   assert.equal(nested.isolatedPermanent, true);
 
-  upstreamResult = { status: 200, data: { status: 'active' } };
+  upstreamResult = {
+    status: 200,
+    data: {
+      status: 'active',
+      rateLimitsByModel: {
+        'openai/gpt-5.6-luna': { limit: 5, remaining: 2 },
+        'mimo/mimo-v2.5': { limit: 6 },
+      },
+    },
+  };
+  expectedTimeout = 5000;
   const verification = await probeAccount(token, {
     upstreamFetch: expectedFetch,
     updateIsolation: false,
+    timeoutMs: 5000,
   });
   assert.equal(verification.state, 'ok');
+  assert.deepEqual(verification.quota, [
+    { model: 'openai/gpt-5.6-luna', used: null, limit: 5, remaining: 2, resetAt: null },
+    { model: 'mimo/mimo-v2.5', used: null, limit: 6, remaining: null, resetAt: null },
+  ], '模型行即使没有 recentCount 也必须保留，供 Free 授权和 remaining 判定使用');
   assert.equal(verification.isolatedPermanent, true,
     '自动选点模型验证成功不能清除管理员持久隔离');
+});
+
+test('自动节点授权探测使用五秒超时，避免坏节点长时间阻塞队列', () => {
+  const source = readFileSync(new URL('../server.js', import.meta.url), 'utf8');
+  assert.match(source, /const ACCOUNT_EGRESS_PROBE_TIMEOUT_MS = 5000;/);
+  const start = source.indexOf('async function configureAccountEgress(');
+  const end = source.indexOf('\nfunction scheduleAccountEgress(', start);
+  const body = source.slice(start, end);
+  assert.match(body,
+    /probeAccount\(account\.token, \{[\s\S]*?timeoutMs: ACCOUNT_EGRESS_PROBE_TIMEOUT_MS[\s\S]*?\}\)/,
+    '自动候选验证必须显式使用短超时');
+});
+
+test('账号探测同账号串行、不同账号并发且总并发有界', async () => {
+  const source = readFileSync(new URL('../server.js', import.meta.url), 'utf8');
+  const start = source.indexOf('const ACCOUNT_EGRESS_PROBE_CONCURRENCY');
+  const end = source.indexOf('\nasync function upstreamJson(', start);
+  assert.ok(start >= 0 && end > start, '应存在账号探测有限并发队列');
+  const { enqueueAccountProbe, limit } = new Function(
+    `${source.slice(start, end)}; return { enqueueAccountProbe, limit: ACCOUNT_EGRESS_PROBE_CONCURRENCY };`,
+  )();
+  assert.equal(limit, 8);
+
+  const releases = [];
+  const started = [];
+  const blocked = (name) => enqueueAccountProbe(name, async () => {
+    started.push(name);
+    await new Promise((resolve) => { releases.push({ name, resolve }); });
+  });
+  const firstA = blocked('a');
+  const secondA = blocked('a');
+  const firstB = blocked('b');
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(started, ['a', 'b'], '同账号必须排队，不同账号必须立即并发');
+  releases.find((entry) => entry.name === 'a').resolve();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(started, ['a', 'b', 'a'], '前一项完成后同账号下一项才可开始');
+  for (const entry of releases) entry.resolve();
+  await Promise.all([firstA, secondA, firstB]);
+
+  let active = 0;
+  let peak = 0;
+  let releaseWave;
+  const wave = new Promise((resolve) => { releaseWave = resolve; });
+  const tasks = Array.from({ length: 9 }, (_, index) => enqueueAccountProbe(`lane-${index}`, async () => {
+    active++;
+    peak = Math.max(peak, active);
+    await wave;
+    active--;
+  }));
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(peak, 8, '账号探测总并发不得超过八路');
+  releaseWave();
+  await Promise.all(tasks);
 });
 
 test('OAuth poll 不返回 authToken，token-only 账号使用 opaque key', async (t) => {
@@ -778,6 +883,73 @@ test('自动节点验证过期时沿用已验证 lane 并后台刷新，不中�
     '缓存过期应后台重验并继续使用上次已验证 fetch');
 });
 
+test('账号出口初始化并发启动全部有效账号，不被首个慢任务阻塞', async () => {
+  const source = readFileSync(new URL('../server.js', import.meta.url), 'utf8');
+  const start = source.indexOf('async function initializeAccountEgress(');
+  const end = source.indexOf('\nfunction handleEgressReject(', start);
+  assert.ok(start >= 0 && end > start, '应存在可隔离验证的账号出口初始化函数');
+  const initializeAccountEgress = new Function(
+    'getConfiguredSubscription',
+    'listAccounts',
+    'scheduleAccountEgress',
+    `${source.slice(start, end)}; return initializeAccountEgress;`,
+  )(
+    () => 'https://subscription.example.test',
+    () => [
+      { key: 'slow', hasToken: true, egressLane: 1 },
+      { key: 'without-token', hasToken: false, egressLane: 2 },
+      { key: 'fast', hasToken: true, egressLane: 3 },
+    ],
+    (account) => {
+      started.push(account.key);
+      return account.key === 'slow' ? slowTask : Promise.resolve();
+    },
+  );
+  const started = [];
+  let releaseSlow;
+  const slowTask = new Promise((resolve) => { releaseSlow = resolve; });
+
+  const initialization = initializeAccountEgress();
+  await Promise.resolve();
+  assert.deepEqual(started, ['slow', 'fast'],
+    '慢账号的后台验证不得延迟后续有效账号的启动');
+  releaseSlow();
+  await initialization;
+});
+
+test('stale 自动验证路由在后台复验期间仍显示 ready', () => {
+  const source = readFileSync(new URL('../server.js', import.meta.url), 'utf8');
+  const start = source.indexOf('function accountEgressStatus(');
+  const end = source.indexOf('\nasync function configureAccountEgress(', start);
+  assert.ok(start >= 0 && end > start, '应存在可隔离验证的账号出口状态函数');
+  const accountEgressStatus = new Function(
+    'getAccountProxyNode',
+    'getAccountEgressReject',
+    'accountEgressIdentity',
+    'getAccountUpstreamFetch',
+    'getAccountAutoUpstreamFetch',
+    'getConfiguredSubscription',
+    'ACCOUNT_EGRESS_LANE_COUNT',
+    'accountEgressTaskActive',
+    'inferNodeRegion',
+    `${source.slice(start, end)}; return accountEgressStatus;`,
+  )(
+    () => 'US-A',
+    () => null,
+    () => 'account-identity',
+    () => () => {},
+    (_lane, options) => options.allowStale ? (() => {}) : null,
+    () => 'https://subscription.example.test',
+    64,
+    () => true,
+    () => 'US',
+  );
+
+  const status = accountEgressStatus({ egressLane: 1, egressMode: 'auto', token: 'token' });
+  assert.equal(status.state, 'ready');
+  assert.equal(status.verified, true);
+});
+
 test('后台账号出站刷新只更新运行态，不能用旧快照覆盖持久化配置', () => {
   const source = readFileSync(new URL('../server.js', import.meta.url), 'utf8');
   const start = source.indexOf('function scheduleAccountEgress(');
@@ -863,8 +1035,8 @@ test('新增账号首次凭据探测显式使用账号 lane，禁止回落共享
     '保存后必须重新读取带 lane 的账号');
   assert.match(post, /const upstreamFetch = accountEgressFetch\(account\)/,
     '首次探测必须取得该账号专属 fetch；未就绪时由该 fetch fail closed');
-  assert.match(post, /probeAccount\(authToken, \{\s*upstreamFetch,?\s*\}\)/,
-    'Bearer 凭据不得交给 probeAccount 的共享出口 fallback');
+  assert.match(post, /probeAccount\(authToken, \{\s*upstreamFetch,\s*queueKey:\s*key\s*\}\)/,
+    'Bearer 凭据必须走账号专属 fetch 和账号级探测队列，不得回落共享出口');
   assert.match(post, /upstreamFetch === accountEgressUnavailableFetch[\s\S]*?state:\s*'egress_unavailable'/,
     '账号已保存但 lane 尚未就绪时应返回可识别状态，不能把成功保存伪装成 502');
   assert.doesNotMatch(post, /probeAccount\(authToken\)\s*;/,

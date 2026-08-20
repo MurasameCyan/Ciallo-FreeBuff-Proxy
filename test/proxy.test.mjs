@@ -137,11 +137,13 @@ test('自动更新间隔拒绝过短或非整数值并按小时粒度保存', as
 test('启用自动更新按间隔注册定时刷新，关闭后清除', async () => {
   const timers = [];
   let seq = 0;
+  let accountRefreshes = 0;
   const { service } = fakeService({
     settings: { autoHealthCheck: false },
     service: {
       setIntervalFn: (fn, ms) => { const id = ++seq; timers.push({ id, fn, ms }); return id; },
       clearIntervalFn: (id) => { const i = timers.findIndex((t) => t.id === id); if (i >= 0) timers.splice(i, 1); },
+      onAutoRefresh: () => { accountRefreshes++; },
     },
   });
   await service.setSubscription('https://sub.example.com/list');
@@ -150,8 +152,92 @@ test('启用自动更新按间隔注册定时刷新，关闭后清除', async ()
   assert.equal(armed.autoUpdate, true);
   assert.equal(timers.length, 1, '启用自动更新应注册一个定时器');
   assert.equal(timers[0].ms, 3600 * 1000);
+  await timers[0].fn();
+  assert.equal(accountRefreshes, 1, '定时刷新拓扑后必须通知账号路由主动恢复');
   await service.setUpdate({ enabled: false, interval: 3600 });
   assert.equal(timers.length, 0, '关闭自动更新应清除定时器');
+});
+
+test('定时订阅刷新失败时不启动账号路由重建', async () => {
+  let timerFn = null;
+  let failRefresh = false;
+  let accountRefreshes = 0;
+  const nodes = ['US-A'];
+  const { service } = fakeService({
+    settings: { autoHealthCheck: false },
+    controller: {
+      async request(path, method = 'GET') {
+        if (failRefresh && method === 'PUT' && path.includes('/providers/proxies/')) {
+          throw new Error('provider refresh failed');
+        }
+        if (path === '/proxies/freebuff-pool') return { all: nodes, now: nodes[0] };
+        if (path === '/proxies/freebuff-auto') return { now: nodes[0], all: nodes };
+        if (path.startsWith('/group/freebuff-pool/delay')) return { 'US-A': 30 };
+        return {};
+      },
+    },
+    service: {
+      setIntervalFn: (fn) => { timerFn = fn; return 1; },
+      clearIntervalFn: () => {},
+      onAutoRefresh: () => { accountRefreshes++; },
+    },
+  });
+  await service.setSubscription('https://sub.example.com/list');
+  await service.setUpdate({ enabled: true, interval: 3600 });
+  failRefresh = true;
+  await timerFn();
+  assert.equal(accountRefreshes, 0, '代理已经进入 error 时不得再批量启动账号探测');
+});
+
+test('provider 刷新失败时保留 last-good US/SG 候选和已有账号路由', async () => {
+  const nodes = ['US-A', 'SG-B'];
+  let providerPuts = 0;
+  const { service } = fakeService({
+    settings: { autoHealthCheck: false },
+    controller: {
+      async request(path, method = 'GET') {
+        if (method === 'PUT' && path.includes('/providers/proxies/')) {
+          providerPuts++;
+          if (providerPuts > 1) throw new Error('provider refresh failed');
+          return {};
+        }
+        if (path === '/proxies/freebuff-pool') return { all: nodes, now: nodes[0] };
+        if (path === '/proxies/freebuff-auto') return { now: nodes[0], all: nodes };
+        if (path.startsWith('/group/freebuff-pool/delay')) return { 'US-A': 30, 'SG-B': 50 };
+        return {};
+      },
+    },
+    service: {
+      buildFetch: async ({ lane }) => ({
+        fetch: async () => new Response(String(lane)),
+        close: async () => {},
+      }),
+    },
+  });
+  await service.setSubscription('https://sub.example.com/list');
+  await service.selectAccountNodeAuto({
+    lane: 5,
+    identity: 'account-a',
+    verify: async () => ({ tier: 'advanced', model: 'openai/gpt-5.6-luna' }),
+  });
+  const lastGoodCandidates = service.getAccountAutoCandidates();
+  const lastGoodFetch = service.getAccountAutoFetch(5, { identity: 'account-a' });
+  assert.equal(typeof lastGoodFetch, 'function');
+
+  await service.refresh();
+
+  const stableCandidateFields = (entries) => entries
+    .map(({ name, region, delay }) => ({ name, region, delay }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+  assert.deepEqual(
+    stableCandidateFields(service.getAccountAutoCandidates()),
+    stableCandidateFields(lastGoodCandidates),
+    '刷新失败不得清空或改写上次成功的 US/SG 候选快照');
+  assert.equal(
+    service.getAccountAutoFetch(5, { allowStale: true, identity: 'account-a' }),
+    lastGoodFetch,
+    '刷新失败时已验证账号应继续使用上次成功的出站路由',
+  );
 });
 
 test('测活更新节点失败时返回安全状态而不是向调用方抛出', async () => {
@@ -317,8 +403,7 @@ test('账号 lane 可同时固定到不同节点并使用不同本地端口', as
         if (path === '/proxies/freebuff-pool') return { all: nodes, now: nodes[0] };
         if (path === '/proxies/freebuff-auto') return { now: nodes[0], all: nodes };
         if (path.startsWith('/group/freebuff-pool/delay')) return { 'US-A': 40, 'SG-B': 60 };
-        if (method === 'PUT' && path.startsWith('/proxies/freebuff-account-')
-          && !path.endsWith('freebuff-account-probe')) {
+        if (method === 'PUT' && /^\/proxies\/freebuff-account-\d+$/.test(path)) {
           switches.push({ path, node: body?.name });
           return {};
         }
@@ -372,37 +457,103 @@ test('账号自动出站候选只包含测活成功的 US/SG 节点', async () =
   assert.equal(proxyModule.inferNodeRegion('🇸🇬 JP¹-SG⁰_singapore'), 'sg');
 });
 
-test('账号自动节点必须有可用的 gpt-5.6-luna 额度', () => {
-  assert.equal(typeof proxyModule.accountProbeSupportsLuna, 'function');
-  assert.equal(proxyModule.accountProbeSupportsLuna({ state: 'ok', accessTier: 'full', quota: null }), false,
-    '只有 full 标签但额度表没列出 Luna，不能当作验证成功');
-  assert.equal(proxyModule.accountProbeSupportsLuna({
+test('账号授权优先选择有可用额度的高级模型', () => {
+  assert.equal(typeof proxyModule.classifyAccountProbeAuthorization, 'function');
+  assert.deepEqual(proxyModule.classifyAccountProbeAuthorization({
     state: 'ok',
-    accessTier: 'standard',
-    quota: [{ model: 'openai/gpt-5.6-luna', used: 4, limit: 5 }],
-  }), true);
-  assert.equal(proxyModule.accountProbeSupportsLuna({
+    quota: [
+      { model: 'openai/gpt-5.6-luna', used: 0, limit: 5 },
+      { model: 'deepseek/deepseek-v4-pro', used: 1, limit: 5 },
+    ],
+  }), { tier: 'advanced', model: 'deepseek/deepseek-v4-pro' });
+  assert.deepEqual(proxyModule.classifyAccountProbeAuthorization({
     state: 'ok',
-    accessTier: 'standard',
-    quota: [{ model: 'openai/gpt-5.6-luna', used: 5, limit: 5 }],
-  }), false, 'Luna 已用尽时不能当作可用节点');
-  assert.equal(proxyModule.accountProbeSupportsLuna({
+    quota: [
+      { model: 'deepseek/deepseek-v4-pro', used: 5, limit: 5 },
+      { model: 'openai/gpt-5.6-luna', used: 4, limit: 5 },
+    ],
+  }), { tier: 'advanced', model: 'openai/gpt-5.6-luna' },
+  '高级模型按 Pro、Luna 顺序选择，但必须仍有可用额度');
+});
+
+test('高级额度不可用时回落免费授权且不按 used 判断免费额度', () => {
+  assert.deepEqual(proxyModule.classifyAccountProbeAuthorization({
     state: 'ok',
-    accessTier: 'standard',
-    quota: [{ model: 'openai/gpt-5.6-luna', remaining: 0, limit: 10 }],
-  }), false, '上游明确返回 remaining=0 时不能当作可用节点');
-  assert.equal(proxyModule.accountProbeSupportsLuna({
+    quota: [
+      { model: 'openai/gpt-5.6-luna', used: 5, limit: 5 },
+      { model: 'mimo/mimo-v2.5', used: 0, limit: 6 },
+      { model: 'deepseek/deepseek-v4-flash', used: 6, limit: 6 },
+    ],
+  }), { tier: 'free', model: 'deepseek/deepseek-v4-flash' },
+  '免费模型按 Flash、MiMo 顺序选择，used 达到 limit 仍表示具备免费授权');
+  assert.equal(proxyModule.classifyAccountProbeAuthorization({
     state: 'ok',
-    accessTier: 'standard',
-    quota: [{ model: 'deepseek/deepseek-v4-pro', used: 0, limit: 5 }],
-  }), false, 'DS4P 有额度不能替代 Luna 能力检查');
-  for (const state of ['ip_capped', 'rate_limited', 'spend_limited']) {
-    assert.equal(proxyModule.accountProbeSupportsLuna({
-      state,
-      statusCode: state === 'spend_limited' ? 200 : 429,
-      quota: [{ model: 'openai/gpt-5.6-luna', used: 0, limit: 10 }],
-    }), false, `${state} 即使携带正额度也不能当作节点验证成功`);
-  }
+    quota: [{ model: 'mimo/mimo-v2.5', used: 0, limit: 0 }],
+  }), null, '免费模型必须有正 limit');
+  assert.equal(proxyModule.classifyAccountProbeAuthorization({
+    state: 'banned',
+    quota: [{ model: 'mimo/mimo-v2.5', used: 0, limit: 6 }],
+  }), null, '非存活账号不能仅凭额度表获得授权');
+});
+
+test('账号自动出站优先级可持久化并切换', async () => {
+  assert.equal(proxyModule.resolveProxySettings({}).accountSelectionPriority, 'advanced');
+  assert.equal(proxyModule.resolveProxySettings({ saved: { accountSelectionPriority: 'unused' } }).accountSelectionPriority, 'unused');
+
+  let refreshOptions = null;
+  const { service, settings } = fakeService({
+    service: { onAutoRefresh: (options) => { refreshOptions = options; } },
+  });
+  await service.setSubscription('https://sub.example.com/list');
+  const advanced = await service.setAccountSelectionPriority('advanced');
+  assert.equal(advanced.accountSelectionPriority, 'advanced');
+  assert.equal(settings.accountSelectionPriority, 'advanced');
+  const unused = await service.setAccountSelectionPriority('unused');
+  assert.equal(unused.accountSelectionPriority, 'unused');
+  assert.equal(settings.accountSelectionPriority, 'unused');
+  assert.deepEqual(refreshOptions, { force: true }, '切换策略必须强制重新选择已验证账号');
+  await assert.rejects(() => service.setAccountSelectionPriority('random'), /优先级/);
+});
+
+test('优先高级会跳过 Free 节点，优先未用保留首个未占用节点', async () => {
+  const nodes = ['US-free', 'SG-advanced'];
+  const verified = [];
+  const { service } = fakeService({
+    controller: {
+      async request(path) {
+        if (path === '/proxies/freebuff-pool') return { all: nodes, now: nodes[0] };
+        if (path === '/proxies/freebuff-auto') return { now: nodes[0], all: nodes };
+        if (path.startsWith('/group/freebuff-pool/delay')) return { 'US-free': 10, 'SG-advanced': 20 };
+        return {};
+      },
+    },
+    service: {
+      buildFetch: async () => ({ fetch: async () => new Response('ok'), close: async () => {} }),
+    },
+  });
+  await service.setSubscription('https://sub.example.com/list');
+
+  await service.setAccountSelectionPriority('advanced');
+  const advanced = await service.selectAccountNodeAuto({
+    lane: 0,
+    identity: 'target-account',
+    verify: async ({ node }) => {
+      verified.push(node);
+      return node === 'US-free'
+        ? { tier: 'free', model: 'mimo/mimo-v2.5' }
+        : { tier: 'advanced', model: 'openai/gpt-5.6-luna' };
+    },
+  });
+  assert.equal(advanced.node, 'SG-advanced');
+  assert.deepEqual(verified, ['US-free', 'SG-advanced']);
+
+  await service.setAccountSelectionPriority('unused');
+  const unused = await service.selectAccountNodeAuto({
+    lane: 1,
+    identity: 'unused-account',
+    verify: async ({ node }) => ({ tier: 'free', model: node === 'US-free' ? 'mimo/mimo-v2.5' : 'deepseek/deepseek-v4-flash' }),
+  });
+  assert.equal(unused.node, 'US-free');
 });
 
 test('账号自动节点验证结果会缓存，出口拒绝后避开原节点重选', async () => {
@@ -438,8 +589,8 @@ test('账号自动节点验证结果会缓存，出口拒绝后避开原节点�
   };
 
   const first = await service.selectAccountNodeAuto({ lane: 3, verify });
-  assert.equal(first.node, 'US-A');
-  assert.equal(first.cached, false);
+  assert.deepEqual(first, { lane: 3, node: 'US-A', port: 17903, cached: false },
+    '旧布尔验证器应保持原返回结构');
   const cached = await service.selectAccountNodeAuto({ lane: 3, verify });
   assert.equal(cached.node, 'US-A');
   assert.equal(cached.cached, true);
@@ -472,7 +623,10 @@ test('账号自动节点验证缓存过期后重新以该账号探测', async ()
     },
   });
   await service.setSubscription('https://sub.example.com/list');
-  const verify = async () => { verified++; return true; };
+  const verify = async () => {
+    verified++;
+    return { tier: 'advanced', model: 'openai/gpt-5.6-luna' };
+  };
   await service.selectAccountNodeAuto({ lane: 2, verify });
   const activeFetch = service.getAccountFetch(2);
   clock += 10 * 60 * 1000 + 1;
@@ -488,10 +642,143 @@ test('账号自动节点验证缓存过期后重新以该账号探测', async ()
     '明确被上游拒绝后，历史验证必须立刻失效，不能再走 stale 节点');
 });
 
+test('免费授权验证缓存恰好十五分钟', async () => {
+  let clock = 20_000;
+  let verified = 0;
+  const nodes = ['US-A'];
+  const { service } = fakeService({
+    controller: {
+      async request(path) {
+        if (path === '/proxies/freebuff-pool') return { all: nodes, now: nodes[0] };
+        if (path === '/proxies/freebuff-auto') return { now: nodes[0], all: nodes };
+        if (path.startsWith('/group/freebuff-pool/delay')) return { 'US-A': 40 };
+        return {};
+      },
+    },
+    service: {
+      now: () => clock,
+      buildFetch: async () => ({ fetch: async () => new Response('ok'), close: async () => {} }),
+    },
+  });
+  await service.setSubscription('https://sub.example.com/list');
+  const verify = async () => {
+    verified++;
+    return { tier: 'free', model: 'mimo/mimo-v2.5' };
+  };
+
+  const first = await service.selectAccountNodeAuto({ lane: 2, verify });
+  assert.equal(first.tier, 'free');
+  assert.equal(first.model, 'mimo/mimo-v2.5');
+  clock += 15 * 60 * 1000 - 1;
+  assert.ok(service.getAccountAutoFetch(2), '十五分钟届满前仍应 fresh');
+  assert.deepEqual(
+    await service.selectAccountNodeAuto({ lane: 2, verify }),
+    { lane: 2, node: 'US-A', port: 17902, cached: true, tier: 'free', model: 'mimo/mimo-v2.5' },
+    '缓存命中应保留授权层级与验证模型',
+  );
+  assert.equal(verified, 1);
+
+  clock += 1;
+  assert.equal(service.getAccountAutoFetch(2), null, '十五分钟届满时必须过期');
+  const refreshed = await service.selectAccountNodeAuto({ lane: 2, verify });
+  assert.equal(refreshed.cached, false);
+  assert.equal(refreshed.tier, 'free');
+  assert.equal(verified, 2);
+});
+
+test('节点测活失败只让账号验证过期，旧路由继续承载后台重验', async () => {
+  let selectedNodeHealthy = true;
+  let accountRefreshes = 0;
+  const nodes = ['US-A', 'US-B'];
+  const { service } = fakeService({
+    controller: {
+      async request(path) {
+        if (path === '/proxies/freebuff-pool') return { all: nodes, now: nodes[0] };
+        if (path === '/proxies/freebuff-auto') return { now: nodes[0], all: nodes };
+        if (path.startsWith('/group/freebuff-pool/delay')) {
+          return selectedNodeHealthy ? { 'US-A': 30, 'US-B': 40 } : { 'US-B': 40 };
+        }
+        return {};
+      },
+    },
+    service: {
+      now: () => 50_000,
+      buildFetch: async () => ({ fetch: async () => new Response('ok'), close: async () => {} }),
+      onAutoRefresh: () => { accountRefreshes++; },
+    },
+  });
+  await service.setSubscription('https://sub.example.com/list');
+  await service.selectAccountNodeAuto({
+    lane: 3,
+    verify: async () => ({ tier: 'free', model: 'mimo/mimo-v2.5' }),
+  });
+  const activeFetch = service.getAccountAutoFetch(3);
+  assert.equal(typeof activeFetch, 'function');
+
+  selectedNodeHealthy = false;
+  await service.testHealth();
+  assert.equal(accountRefreshes, 1, '测活使旧验证过期后应立即调度后台重验');
+  assert.equal(service.getAccountAutoFetch(3), null, '测活失败后必须触发后台重验');
+  assert.equal(service.getAccountAutoFetch(3, { allowStale: true }), activeFetch,
+    '测活的瞬时失败不能删除旧业务路由并把账号直接变成不可用');
+});
+
+test('后台授权复验异常时保留旧路由并一分钟后重试', async () => {
+  let clock = 100_000;
+  let selectedNodeHealthy = true;
+  let accountRefreshes = 0;
+  const nodes = ['US-A'];
+  const { service } = fakeService({
+    controller: {
+      async request(path) {
+        if (path === '/proxies/freebuff-pool') return { all: nodes, now: nodes[0] };
+        if (path === '/proxies/freebuff-auto') return { now: nodes[0], all: nodes };
+        if (path.startsWith('/group/freebuff-pool/delay')) {
+          return selectedNodeHealthy ? { 'US-A': 30 } : {};
+        }
+        return {};
+      },
+    },
+    service: {
+      now: () => clock,
+      buildFetch: async () => ({ fetch: async () => new Response('ok'), close: async () => {} }),
+      onAutoRefresh: () => { accountRefreshes++; },
+    },
+  });
+  await service.setSubscription('https://sub.example.com/list');
+  await service.selectAccountNodeAuto({
+    lane: 4,
+    verify: async () => ({ tier: 'advanced', model: 'openai/gpt-5.6-luna' }),
+  });
+  const activeFetch = service.getAccountAutoFetch(4);
+  clock += 10 * 60 * 1000 + 1;
+
+  await assert.rejects(
+    () => service.selectAccountNodeAuto({ lane: 4, verify: async () => { throw new Error('probe timeout'); } }),
+    /没有可用账号授权/,
+  );
+  assert.equal(service.getAccountAutoFetch(4), activeFetch,
+    '探测异常后的短退避期内旧路由应继续可用');
+  selectedNodeHealthy = false;
+  clock += 60 * 1000 - 1;
+  await service.testHealth();
+  assert.equal(accountRefreshes, 0,
+    '持续失败的节点测活不能覆盖授权探测的一分钟退避');
+  clock += 1;
+  await service.testHealth();
+  assert.equal(accountRefreshes, 1,
+    '一分钟退避届满后，节点仍不健康时应重新调度账号验证');
+  assert.equal(service.getAccountAutoFetch(4), null, '一分钟后必须再次进入后台复验');
+  assert.equal(service.getAccountAutoFetch(4, { allowStale: true }), activeFetch);
+});
+
 test('多个账号并发自动选点优先分散，节点不足时才复用', async () => {
   const nodes = ['US-A', 'US-B', 'SG-C'];
   const verified = [];
   const switches = [];
+  const probeSwitches = [];
+  const probePorts = [];
+  const closedProbePorts = [];
   let releaseFirst;
   let firstStarted;
   const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
@@ -502,15 +789,23 @@ test('多个账号并发自动选点优先分散，节点不足时才复用', as
         if (path === '/proxies/freebuff-pool') return { all: nodes, now: nodes[0] };
         if (path === '/proxies/freebuff-auto') return { now: nodes[0], all: nodes };
         if (path.startsWith('/group/freebuff-pool/delay')) return { 'US-A': 10, 'US-B': 20, 'SG-C': 30 };
-        if (method === 'PUT' && path.startsWith('/proxies/freebuff-account-')
-          && path !== '/proxies/freebuff-account-probe') {
+        if (method === 'PUT' && /^\/proxies\/freebuff-account-probe-\d+$/.test(path)) {
+          probeSwitches.push({ lane: path.split('-').at(-1), node: body?.name });
+        } else if (method === 'PUT' && /^\/proxies\/freebuff-account-\d+$/.test(path)) {
           switches.push({ lane: path.split('-').at(-1), node: body?.name });
         }
         return {};
       },
     },
     service: {
-      buildFetch: async () => ({ fetch: async () => new Response('ok'), close: async () => {} }),
+      buildFetch: async ({ port, lane }) => {
+        if (lane !== 'probe') return { fetch: async () => new Response('ok'), close: async () => {} };
+        probePorts.push(port);
+        return {
+          fetch: async () => new Response('ok'),
+          close: async () => { closedProbePorts.push(port); },
+        };
+      },
     },
   });
   await service.setSubscription('https://sub.example.com/list');
@@ -528,11 +823,17 @@ test('多个账号并发自动选点优先分散，节点不足时才复用', as
   const second = service.selectAccountNodeAuto({ lane: 1, identity: 'b', verify });
   const third = service.selectAccountNodeAuto({ lane: 2, identity: 'c', verify });
   await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(verified.length, 3,
+    '不同账号必须通过独立 probe lane 同时验证，不能排在首个慢账号后面');
   releaseFirst();
   const selected = await Promise.all([first, second, third]);
   assert.equal(new Set(selected.map((entry) => entry.node)).size, 3,
     '有三个可用节点时，三个并发账号不得共享同一节点');
   assert.deepEqual(selected.map((entry) => entry.node).sort(), nodes.slice().sort());
+  assert.deepEqual(probeSwitches.map((entry) => entry.lane).sort(), ['0', '1', '2'],
+    '每个账号必须使用自己的 probe selector');
+  assert.deepEqual(probePorts.slice().sort((a, b) => a - b), [17964, 17965, 17966],
+    '每个账号必须使用自己的 probe listener 端口');
 
   const fourth = await service.selectAccountNodeAuto({ lane: 3, identity: 'd', verify });
   assert.ok(nodes.includes(fourth.node), '节点不足时允许复用已有节点');
@@ -542,6 +843,42 @@ test('多个账号并发自动选点优先分散，节点不足时才复用', as
   const cachedShared = await service.selectAccountNodeAuto({ lane: 0, identity: 'a', verify });
   assert.equal(cachedShared.cached, true, '所有候选均已占用时，共享节点仍应命中有效缓存');
   assert.equal(verified.length, verifiedBeforeCacheHit, '合法共享不得反复探测模型目录');
+  await service.stop();
+  assert.deepEqual(closedProbePorts.slice().sort((a, b) => a - b), [17964, 17965, 17966, 17967],
+    '停止服务时必须关闭所有账号 probe dispatcher');
+});
+
+test('候选快照建立后多账号自动验证不重复读取全局节点池', async () => {
+  const nodes = ['US-A', 'US-B', 'SG-C'];
+  let poolReads = 0;
+  const { service } = fakeService({
+    controller: {
+      async request(path) {
+        if (path === '/proxies/freebuff-pool') {
+          poolReads++;
+          return { all: nodes, now: nodes[0] };
+        }
+        if (path === '/proxies/freebuff-auto') return { now: nodes[0], all: nodes };
+        if (path.startsWith('/group/freebuff-pool/delay')) return { 'US-A': 10, 'US-B': 20, 'SG-C': 30 };
+        return {};
+      },
+    },
+    service: {
+      buildFetch: async () => ({ fetch: async () => new Response('ok'), close: async () => {} }),
+    },
+  });
+  await service.setSubscription('https://sub.example.com/list');
+  assert.equal(service.getAccountAutoCandidates().length, 3, '订阅刷新应先建立可用候选快照');
+  poolReads = 0;
+
+  await Promise.all([
+    service.selectAccountNodeAuto({ lane: 0, identity: 'account-a', verify: async () => true }),
+    service.selectAccountNodeAuto({ lane: 1, identity: 'account-b', verify: async () => true }),
+    service.selectAccountNodeAuto({ lane: 2, identity: 'account-c', verify: async () => true }),
+  ]);
+
+  assert.equal(poolReads, 0,
+    '账号验证应只读内存候选快照，不应按账号重复 GET /proxies/freebuff-pool');
 });
 
 test('自动选点优先避开手动账号已占用的节点', async () => {
@@ -615,7 +952,7 @@ test('账号自动验证使用隔离 probe lane，切换节点时重建业务 di
   assert.equal(selected.node, 'SG-B');
   assert.notEqual(service.getAccountFetch(6, { identity: 'token-a' }), firstBusinessFetch,
     '业务 selector 真正换节点后必须使用新的 ProxyAgent，不能复用旧 CONNECT');
-  assert.ok(switches.some((entry) => entry.path === '/proxies/freebuff-account-probe' && entry.node === 'SG-B'),
+  assert.ok(switches.some((entry) => entry.path === '/proxies/freebuff-account-probe-6' && entry.node === 'SG-B'),
     '候选节点必须经隔离 probe selector 验证');
   assert.deepEqual(switches.filter((entry) => entry.path === '/proxies/freebuff-account-6').map((entry) => entry.node),
     ['US-A', 'SG-B'], '业务 selector 每次只切到已验证通过的节点');
@@ -911,7 +1248,7 @@ test('状态查询的迟到 selector 响应不得清除并发完成的新节点'
   assert.ok(service.getAccountFetch(14, { identity: 'account-a' }));
 });
 
-test('provider 刷新后同名节点仍必须重新验证账号模型能力', async () => {
+test('provider 成功刷新原子替换同名候选，旧业务路由可 stale 使用到后台复验', async () => {
   const nodes = ['US-A'];
   let accountNow = '';
   let verified = 0;
@@ -952,8 +1289,11 @@ test('provider 刷新后同名节点仍必须重新验证账号模型能力', as
   const firstGeneration = service.getAccountGeneration(15);
 
   await service.refresh();
-  assert.equal(service.getAccountFetch(15, { identity: 'account-a' }), null,
-    'provider topology 刷新后旧业务 dispatcher 必须立即失效');
+  assert.equal(
+    service.getAccountAutoFetch(15, { allowStale: true, identity: 'account-a' }),
+    firstFetch,
+    '同名节点的新候选快照就绪后，旧业务路由应继续 stale 承载到后台复验完成',
+  );
   const selected = await service.selectAccountNodeAuto({ lane: 15, identity: 'account-a', verify });
   assert.equal(selected.cached, false, 'provider 拓扑刷新后不得命中刷新前验证缓存');
   assert.equal(verified, 2, '同名节点也必须重新读取该账号可见的模型目录');
@@ -999,7 +1339,7 @@ test('后台重验期间收到出口拒绝时不得把旧节点重新标成有�
   await started;
   service.noteEgressReject({ lane: 4, state: 'country_blocked', status: 403 });
   releaseVerify(true);
-  await assert.rejects(revalidating, /没有可访问 openai\/gpt-5\.6-luna/);
+  await assert.rejects(revalidating, /没有可用账号授权/);
   assert.equal(service.getAccountAutoFetch(4, { allowStale: true }), null);
 });
 
@@ -1218,7 +1558,7 @@ test('probe selector PUT 期间切换拓扑时旧操作不得继续构建', asyn
         if (path === '/proxies/freebuff-pool') return { all: nodes, now: nodes[0] };
         if (path === '/proxies/freebuff-auto') return { now: nodes[0], all: nodes };
         if (path.startsWith('/group/freebuff-pool/delay')) return { 'US-A': 40 };
-        if (path === '/proxies/freebuff-account-probe' && method === 'PUT') {
+        if (path === '/proxies/freebuff-account-probe-7' && method === 'PUT') {
           probePuts++;
           if (probePuts === 1) {
             signalPut();
@@ -1274,7 +1614,7 @@ test('仅刷新 provider 后同名 probe 节点也必须重建连接', async () 
         if (path === '/proxies/freebuff-auto') return { now: nodes[0], all: nodes };
         if (path.startsWith('/group/freebuff-pool/delay')) return { 'US-A': 40 };
         if (path === '/proxies/freebuff-account-8') return { all: nodes, now: 'US-A' };
-        if (path === '/proxies/freebuff-account-probe' && method === 'PUT') probePuts++;
+        if (path === '/proxies/freebuff-account-probe-8' && method === 'PUT') probePuts++;
         return {};
       },
     },
@@ -1323,7 +1663,7 @@ test('probe dispatcher 构建结果无 fetch 时仍关闭未提交资源', async
   await service.setSubscription('https://sub.example.com/list');
   await assert.rejects(
     service.selectAccountNodeAuto({ lane: 9, verify: async () => true }),
-    /没有可访问 openai\/gpt-5\.6-luna/,
+    /没有可用账号授权/,
   );
   assert.equal(closed, 1, '无有效 fetch 的 probe dispatcher 也必须释放');
 });
