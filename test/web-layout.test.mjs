@@ -157,6 +157,11 @@ assert.match(css, /@media\s*\(max-width:\s*660px\)/,
 assert.ok(html.includes('aria-live="polite"'), 'OAuth 状态变化必须可被辅助技术播报');
 assert.match(html, /<th id="quotaHead">可用模型\(重置时间\)<\/th>/,
   '额度列标题必须带 id 以便脚本改写为“可用模型 (重置 …)”，并保留静态回落文案');
+assert.match(html,
+  /<th>账号 [\s\S]*?id="maskEmail"[\s\S]*?<\/th><th>状态<\/th><th>出站节点<\/th><th id="quotaHead">可用模型\(重置时间\)<\/th><th>操作<\/th>/s,
+  '账号池必须按账号、状态、出站节点、可用模型、操作排列');
+assert.match(html, /id="acctBody"><tr><td colspan="5" class="empty">加载中…<\/td>/,
+  '账号池新增出站节点列后，初始空态必须横跨 5 列');
 assert.ok(app.includes('function poolResetAt') && app.includes('function renderQuotaHead'),
   '重置时间必须提到列标题（池级统一，逐行重复无信息量）');
 assert.ok(app.includes('`可用模型 (重置 ${formatResetAt(reset)})`'),
@@ -192,6 +197,66 @@ assert.match(html, /id="tab-manage"[^>]*aria-controls="pane-manage"/s,
   '账号管理标签必须关联面板');
 assert.match(html, /id="tab-add"[^>]*aria-controls="pane-add"/s,
   '账号添加标签必须关联面板');
+
+// ── 每账号独立出站节点 ──────────────────────────────────
+for (const id of ['accountEgressDialog', 'accountEgressTitle', 'accountEgressAccount',
+  'accountEgressModeAuto', 'accountEgressModeManual', 'accountEgressNodeField',
+  'accountEgressNode', 'accountEgressStatus', 'accountEgressError',
+  'accountEgressCancel', 'accountEgressSave']) {
+  assert.match(html, new RegExp(`id=["']${id}["']`), `账号出站弹窗丢失 DOM 绑定 #${id}`);
+}
+assert.match(html, /<dialog class="modal account-egress-modal" id="accountEgressDialog"/,
+  '账号出站设置必须使用独立原生 dialog，不与删除确认框复用');
+assert.match(html, /id="accountEgressModeAuto"[^>]*aria-pressed="true"[^>]*>自动<\/button>/s,
+  '出站弹窗必须提供默认选中的自动模式按钮');
+assert.match(html, /id="accountEgressModeManual"[^>]*aria-pressed="false"[^>]*>手动<\/button>/s,
+  '出站弹窗必须提供手动模式按钮');
+assert.match(html, /id="accountEgressStatus"[^>]*aria-live="polite"/s,
+  '自动选点状态必须可被辅助技术播报');
+assert.match(html, /id="accountEgressError"[^>]*aria-live="polite"/s,
+  '账号出站保存或选点错误必须留在弹窗内并可播报');
+
+assert.match(app, /route:\s*'<[\s\S]*?'/,
+  '账号出站操作必须使用统一图标集里的 route 线框图标');
+assert.match(app, /iconButton\('route',\s*'设置出站节点',[^\n]*data-egress=/,
+  '每个账号必须有纯图标出站设置按钮');
+assert.match(app, /S\.readonly\s*\?\s*'disabled'/,
+  '账号池只读模式必须禁用出站设置按钮');
+assert.ok(app.includes('function normalizeAccountEgress'),
+  '账号行和弹窗必须统一读取账号配置与运行态出站状态');
+assert.match(app, /S\.accountEgress\s*=\s*acc\.egress\s*\|\|\s*\{\}/,
+  'GET /accounts 顶层 egress 状态映射必须随账号列表一起保存');
+assert.match(app, /S\.accountEgress\?\.\[account\.key\]/,
+  '账号实际节点必须按 account key 从顶层 egress 映射读取');
+assert.ok(app.includes('function openAccountEgress'),
+  '点击账号出站图标必须打开专用设置弹窗');
+assert.ok(app.includes('function fillAccountEgressNodes'),
+  '手动节点选项必须来自 GET /_api/proxy 的节点列表');
+assert.match(app, /configuredNode[\s\S]*?!nodes\.some\([\s\S]*?unshift/s,
+  '手动已配置节点即使不在当前候选列表，也必须保留并显示');
+assert.match(app, /api\('\/accounts\/'\s*\+\s*encodeURIComponent\(key\),\s*\{[\s\S]*?method:\s*'PATCH'[\s\S]*?JSON\.stringify\(\{\s*egressMode:\s*mode,\s*egressNode:/s,
+  '保存必须 PATCH /_api/accounts/:key，并只提交 egressMode/egressNode');
+assert.match(app, /if \(r\?\.egress[\s\S]*?S\.accountEgress\[key\]\s*=\s*r\.egress/,
+  'PATCH 成功必须立即用响应里的单账号 egress 状态更新行摘要');
+assert.match(app, /let accountEgressSaving\s*=\s*false/,
+  '账号出站弹窗必须记录保存中的互斥状态');
+assert.match(app, /function openAccountEgress\([^)]*\)\s*\{\s*if \(accountEgressSaving\) return;/,
+  '旧账号保存完成前不得为另一个账号重用同一弹窗');
+assert.match(app, /accountEgressDialog[\s\S]*?addEventListener\('cancel',[\s\S]*?accountEgressSaving[\s\S]*?preventDefault/s,
+  '账号出站保存期间按 Esc 不得关闭弹窗并制造迟到结果竞态');
+assert.match(app, /accountEgressSaving\s*=\s*true[\s\S]*?finally\s*\{[\s\S]*?accountEgressSaving\s*=\s*false/s,
+  '账号出站保存互斥必须在 finally 中释放');
+for (const state of ['ready', 'probing', 'unavailable', 'proxy_offline', 'rejected']) {
+  assert.ok(app.includes(`${state}:`), `账号出站状态必须明确处理 ${state}`);
+}
+assert.match(app, /const node = egress\.currentNode \|\| \(egress\.mode === 'manual' \? '未设置' : accountEgressStateLabel\(egress\.state\)\)/,
+  '自动模式没有实际节点时，行摘要必须显示真实运行态，不能把不可用误写成“选择中”');
+assert.match(app, /account\.egressMode[\s\S]*?account\.egressNode[\s\S]*?currentNode/s,
+  '账号出站摘要必须展示配置模式，并优先呈现自动实际节点');
+assert.match(css, /\.account-egress-summary\s*\{[^}]*display:\s*grid/s,
+  '账号行出站摘要必须紧凑分两行，不能挤占可用模型列');
+assert.match(css, /\.account-egress-modal \.modal-box\s*\{[^}]*width:\s*min\(/s,
+  '账号出站弹窗必须有稳定的响应式宽度');
 // 授权链接显示框：框内是「可点开的链接文字 + 纯图标复制按钮」两颗 button，
 // 框自身必须是 div —— button 套 button 是非法 HTML，浏览器会把内层拆出去。
 assert.match(html, /<div class="login-url" id="loginUrl" hidden>/,
@@ -542,7 +607,8 @@ for (const id of ['confirmDialog', 'confirmTitle', 'confirmText', 'confirmOk']) 
 }
 assert.match(html, /<dialog class="modal" id="confirmDialog"[\s\S]*?<form method="dialog"/s,
   '确认框必须是原生 <dialog> + method="dialog" 的表单（Esc/焦点圈定/遮罩交给浏览器）');
-const confirmBox = html.slice(html.indexOf('<dialog class="modal"'), html.indexOf('</dialog>'));
+const confirmStart = html.indexOf('<dialog class="modal" id="confirmDialog"');
+const confirmBox = html.slice(confirmStart, html.indexOf('</dialog>', confirmStart));
 assert.match(confirmBox, /value=""[^>]*>取消[\s\S]*value="ok"[\s\S]*id="confirmOk"/s,
   '「取消」必须排在「确认」之前：dialog 自动聚焦第一个可聚焦元素，危险操作默认落在取消上');
 assert.match(css, /\.modal\s*\{[^}]*padding:\s*0[^}]*border:\s*0/s,

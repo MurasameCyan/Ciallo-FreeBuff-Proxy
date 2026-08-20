@@ -102,8 +102,8 @@
       <div class="pane" id="pane-manage" data-pane="manage" role="tabpanel" aria-labelledby="tab-manage">
         <div class="table-scroll" role="region" tabindex="0" aria-label="账号列表，可横向滚动">
           <table class="tbl account-table is-empty">
-            <thead><tr><th>账号 <button type="button" class="mask-toggle" id="maskEmail" aria-pressed="true"></button></th><th>状态</th><th id="quotaHead">可用模型(重置时间)</th><th>操作</th></tr></thead>
-            <tbody id="acctBody"><tr><td colspan="4" class="empty">加载中…</td></tr></tbody>
+            <thead><tr><th>账号 <button type="button" class="mask-toggle" id="maskEmail" aria-pressed="true"></button></th><th>状态</th><th>出站节点</th><th id="quotaHead">可用模型(重置时间)</th><th>操作</th></tr></thead>
+            <tbody id="acctBody"><tr><td colspan="5" class="empty">加载中…</td></tr></tbody>
           </table>
         </div>
       </div>
@@ -434,6 +434,30 @@
 </main>
 
 <div class="toasts" id="toasts" aria-live="polite" aria-atomic="false"></div>
+
+<!-- 每个账号独立设置出站。节点目录复用代理订阅卡已加载的数据；保存由 PATCH accounts/:key 完成。 -->
+<dialog class="modal account-egress-modal" id="accountEgressDialog" aria-labelledby="accountEgressTitle" aria-describedby="accountEgressStatus accountEgressError">
+  <form class="modal-box account-egress-form" id="accountEgressForm">
+    <div>
+      <h2 id="accountEgressTitle">出站节点</h2>
+      <p class="account-egress-account" id="accountEgressAccount"></p>
+    </div>
+    <div class="seg account-egress-mode" role="group" aria-label="出站节点模式">
+      <button type="button" class="seg-btn active" id="accountEgressModeAuto" aria-pressed="true">自动</button>
+      <button type="button" class="seg-btn" id="accountEgressModeManual" aria-pressed="false">手动</button>
+    </div>
+    <label class="account-egress-field" id="accountEgressNodeField" for="accountEgressNode" hidden>
+      <span class="lbl">节点</span>
+      <select id="accountEgressNode" aria-label="账号出站节点"></select>
+    </label>
+    <p class="account-egress-status" id="accountEgressStatus" aria-live="polite"></p>
+    <p class="account-egress-error" id="accountEgressError" aria-live="polite"></p>
+    <div class="modal-actions">
+      <button type="button" class="btn ghost" id="accountEgressCancel">取消</button>
+      <button type="submit" class="btn primary" id="accountEgressSave">保存</button>
+    </div>
+  </form>
+</dialog>
 
 <!-- 页内确认框。method="dialog" 的提交会把按钮 value 写进 returnValue 并关闭;
      Esc 关闭时 returnValue 是空串,所以「取消」和 Esc 走同一条路。

@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { createServer, request as httpRequest } from 'node:http';
-import { createProxyService, maskSubscriptionUrl, resolveProxySettings } from '../server/proxy.mjs';
+import * as proxyModule from '../server/proxy.mjs';
+
+const { createProxyService, maskSubscriptionUrl, resolveProxySettings } = proxyModule;
 
 const tests = [];
 function test(name, fn) { tests.push({ name, fn }); }
@@ -303,6 +305,1017 @@ test('订阅里没有 US/SG 节点时沿用 mihomo 的延迟选点', async () =>
   });
   const status = await service.setSubscription('https://sub.example.com/list');
   assert.equal(status.currentNode, nodes[1], '没有偏好地区可选时不应改变原有行为');
+});
+
+test('账号 lane 可同时固定到不同节点并使用不同本地端口', async () => {
+  const nodes = ['US-A', 'SG-B'];
+  const switches = [];
+  const built = [];
+  const { service } = fakeService({
+    controller: {
+      async request(path, method = 'GET', body) {
+        if (path === '/proxies/freebuff-pool') return { all: nodes, now: nodes[0] };
+        if (path === '/proxies/freebuff-auto') return { now: nodes[0], all: nodes };
+        if (path.startsWith('/group/freebuff-pool/delay')) return { 'US-A': 40, 'SG-B': 60 };
+        if (method === 'PUT' && path.startsWith('/proxies/freebuff-account-')
+          && !path.endsWith('freebuff-account-probe')) {
+          switches.push({ path, node: body?.name });
+          return {};
+        }
+        return {};
+      },
+    },
+    service: {
+      buildFetch: async ({ port, lane } = {}) => {
+        const marker = async () => new Response(`${lane}:${port}`);
+        built.push({ port, lane, marker });
+        return { fetch: marker, close: async () => {} };
+      },
+    },
+  });
+  await service.setSubscription('https://sub.example.com/list');
+  await service.setAccountNode({ lane: 0, node: nodes[0] });
+  await service.setAccountNode({ lane: 1, node: nodes[1] });
+
+  assert.deepEqual(switches, [
+    { path: '/proxies/freebuff-account-0', node: nodes[0] },
+    { path: '/proxies/freebuff-account-1', node: nodes[1] },
+  ]);
+  assert.notEqual(service.getAccountFetch(0), service.getAccountFetch(1));
+  assert.ok(built.some((entry) => entry.lane === 0 && entry.port === 17900));
+  assert.ok(built.some((entry) => entry.lane === 1 && entry.port === 17901));
+});
+
+test('账号自动出站候选只包含测活成功的 US/SG 节点', async () => {
+  const nodes = ['US-fast', 'SG-slow', 'US-dead', 'JP-fast', '🇯🇵 JP¹-SG⁰_tokyo'];
+  const { service } = fakeService({
+    controller: {
+      async request(path) {
+        if (path === '/proxies/freebuff-pool') return { all: nodes, now: nodes[3] };
+        if (path === '/proxies/freebuff-auto') return { now: nodes[3], all: nodes };
+        if (path.startsWith('/group/freebuff-pool/delay')) {
+          return { 'US-fast': 50, 'SG-slow': 90, 'US-dead': 0, 'JP-fast': 20, '🇯🇵 JP¹-SG⁰_tokyo': 15 };
+        }
+        return {};
+      },
+    },
+  });
+  await service.setSubscription('https://sub.example.com/list');
+  assert.deepEqual(service.getAccountAutoCandidates().map((entry) => [entry.name, entry.region]), [
+    ['US-fast', 'us'],
+    ['SG-slow', 'sg'],
+  ]);
+  assert.equal(proxyModule.inferNodeRegion('🇯🇵 JP¹-SG⁰_tokyo'), null,
+    '开头日本旗帜必须压过名称后半段的 SG 标记');
+  assert.equal(proxyModule.inferNodeRegion('JP¹-SG⁰_tokyo'), null,
+    '开头日本国家前缀必须压过名称后半段的 SG 标记');
+  assert.equal(proxyModule.inferNodeRegion('🇸🇬 JP¹-SG⁰_singapore'), 'sg');
+});
+
+test('账号自动节点必须能取得 deepseek-v4-pro', () => {
+  assert.equal(typeof proxyModule.accountProbeSupportsDeepseekV4Pro, 'function');
+  assert.equal(proxyModule.accountProbeSupportsDeepseekV4Pro({ state: 'ok', accessTier: 'full', quota: null }), false,
+    '只有 full 标签但模型目录没列出 V4 Pro，不能当作验证成功');
+  assert.equal(proxyModule.accountProbeSupportsDeepseekV4Pro({
+    state: 'ok',
+    accessTier: 'standard',
+    quota: [{ model: 'deepseek/deepseek-v4-pro', used: 4, limit: 5 }],
+  }), true);
+  assert.equal(proxyModule.accountProbeSupportsDeepseekV4Pro({
+    state: 'ok',
+    accessTier: 'standard',
+    quota: [{ model: 'mimo/mimo-v2.5', used: 0, limit: 5 }],
+  }), false);
+  for (const state of ['ip_capped', 'rate_limited', 'spend_limited']) {
+    assert.equal(proxyModule.accountProbeSupportsDeepseekV4Pro({
+      state,
+      statusCode: state === 'spend_limited' ? 200 : 429,
+      quota: [{ model: 'deepseek/deepseek-v4-pro', used: 0, limit: 10 }],
+    }), false, `${state} 即使携带正额度也不能当作节点验证成功`);
+  }
+});
+
+test('账号自动节点验证结果会缓存，出口拒绝后避开原节点重选', async () => {
+  let clock = 1000;
+  const nodes = ['US-A', 'SG-B', 'JP-C'];
+  const switches = [];
+  const verified = [];
+  const { service } = fakeService({
+    controller: {
+      async request(path, method = 'GET', body) {
+        if (path === '/proxies/freebuff-pool') return { all: nodes, now: nodes[2] };
+        if (path === '/proxies/freebuff-auto') return { now: nodes[2], all: nodes };
+        if (path.startsWith('/group/freebuff-pool/delay')) return { 'US-A': 40, 'SG-B': 70, 'JP-C': 10 };
+        if (method === 'PUT' && path === '/proxies/freebuff-account-3') {
+          switches.push(body?.name);
+          return {};
+        }
+        return {};
+      },
+    },
+    service: {
+      now: () => clock,
+      buildFetch: async ({ port, lane } = {}) => ({
+        fetch: async () => new Response(`${lane}:${port}`),
+        close: async () => {},
+      }),
+    },
+  });
+  await service.setSubscription('https://sub.example.com/list');
+  const verify = async ({ node }) => {
+    verified.push(node);
+    return true;
+  };
+
+  const first = await service.selectAccountNodeAuto({ lane: 3, verify });
+  assert.equal(first.node, 'US-A');
+  assert.equal(first.cached, false);
+  const cached = await service.selectAccountNodeAuto({ lane: 3, verify });
+  assert.equal(cached.node, 'US-A');
+  assert.equal(cached.cached, true);
+  assert.deepEqual(verified, ['US-A'], '缓存命中不得重复探测上游模型目录');
+
+  service.noteEgressReject({ lane: 3, state: 'country_blocked', status: 403 });
+  clock += 1;
+  const reselected = await service.selectAccountNodeAuto({ lane: 3, verify });
+  assert.equal(reselected.node, 'SG-B', '被拒节点冷却期间必须换下一个健康 US/SG');
+  assert.deepEqual(verified, ['US-A', 'SG-B']);
+  assert.deepEqual(switches, ['US-A', 'SG-B']);
+});
+
+test('账号自动节点验证缓存过期后重新以该账号探测', async () => {
+  let clock = 10_000;
+  let verified = 0;
+  const nodes = ['US-A'];
+  const { service } = fakeService({
+    controller: {
+      async request(path) {
+        if (path === '/proxies/freebuff-pool') return { all: nodes, now: nodes[0] };
+        if (path === '/proxies/freebuff-auto') return { now: nodes[0], all: nodes };
+        if (path.startsWith('/group/freebuff-pool/delay')) return { 'US-A': 40 };
+        return {};
+      },
+    },
+    service: {
+      now: () => clock,
+      buildFetch: async () => ({ fetch: async () => new Response('ok'), close: async () => {} }),
+    },
+  });
+  await service.setSubscription('https://sub.example.com/list');
+  const verify = async () => { verified++; return true; };
+  await service.selectAccountNodeAuto({ lane: 2, verify });
+  const activeFetch = service.getAccountFetch(2);
+  clock += 10 * 60 * 1000 + 1;
+  assert.equal(service.getAccountAutoFetch(2), null, '过期验证不能继续伪装成 fresh');
+  assert.equal(service.getAccountAutoFetch(2, { allowStale: true }), activeFetch,
+    '缓存过期但历史验证与当前节点仍一致时，应提供 stale fetch 给首个业务请求');
+  const afterExpiry = await service.selectAccountNodeAuto({ lane: 2, verify });
+  assert.equal(afterExpiry.cached, false);
+  assert.equal(verified, 2, '十分钟缓存过期后必须重新访问模型目录');
+
+  service.noteEgressReject({ lane: 2, state: 'country_blocked', status: 403 });
+  assert.equal(service.getAccountAutoFetch(2, { allowStale: true }), null,
+    '明确被上游拒绝后，历史验证必须立刻失效，不能再走 stale 节点');
+});
+
+test('多个账号并发自动选点优先分散，节点不足时才复用', async () => {
+  const nodes = ['US-A', 'US-B', 'SG-C'];
+  const verified = [];
+  const switches = [];
+  let releaseFirst;
+  let firstStarted;
+  const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
+  const firstProbe = new Promise((resolve) => { firstStarted = resolve; });
+  const { service } = fakeService({
+    controller: {
+      async request(path, method = 'GET', body) {
+        if (path === '/proxies/freebuff-pool') return { all: nodes, now: nodes[0] };
+        if (path === '/proxies/freebuff-auto') return { now: nodes[0], all: nodes };
+        if (path.startsWith('/group/freebuff-pool/delay')) return { 'US-A': 10, 'US-B': 20, 'SG-C': 30 };
+        if (method === 'PUT' && path.startsWith('/proxies/freebuff-account-')
+          && path !== '/proxies/freebuff-account-probe') {
+          switches.push({ lane: path.split('-').at(-1), node: body?.name });
+        }
+        return {};
+      },
+    },
+    service: {
+      buildFetch: async () => ({ fetch: async () => new Response('ok'), close: async () => {} }),
+    },
+  });
+  await service.setSubscription('https://sub.example.com/list');
+  const verify = async ({ node }) => {
+    verified.push(node);
+    if (verified.length === 1) {
+      firstStarted();
+      await firstGate;
+    }
+    return true;
+  };
+
+  const first = service.selectAccountNodeAuto({ lane: 0, identity: 'a', verify });
+  await firstProbe;
+  const second = service.selectAccountNodeAuto({ lane: 1, identity: 'b', verify });
+  const third = service.selectAccountNodeAuto({ lane: 2, identity: 'c', verify });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  releaseFirst();
+  const selected = await Promise.all([first, second, third]);
+  assert.equal(new Set(selected.map((entry) => entry.node)).size, 3,
+    '有三个可用节点时，三个并发账号不得共享同一节点');
+  assert.deepEqual(selected.map((entry) => entry.node).sort(), nodes.slice().sort());
+
+  const fourth = await service.selectAccountNodeAuto({ lane: 3, identity: 'd', verify });
+  assert.ok(nodes.includes(fourth.node), '节点不足时允许复用已有节点');
+  assert.equal(switches.length, 4);
+
+  const verifiedBeforeCacheHit = verified.length;
+  const cachedShared = await service.selectAccountNodeAuto({ lane: 0, identity: 'a', verify });
+  assert.equal(cachedShared.cached, true, '所有候选均已占用时，共享节点仍应命中有效缓存');
+  assert.equal(verified.length, verifiedBeforeCacheHit, '合法共享不得反复探测模型目录');
+});
+
+test('自动选点优先避开手动账号已占用的节点', async () => {
+  const nodes = ['US-A', 'US-B'];
+  const { service } = fakeService({
+    controller: {
+      async request(path, method = 'GET', body) {
+        if (path === '/proxies/freebuff-pool') return { all: nodes, now: nodes[0] };
+        if (path === '/proxies/freebuff-auto') return { now: nodes[0], all: nodes };
+        if (path.startsWith('/group/freebuff-pool/delay')) return { 'US-A': 10, 'US-B': 50 };
+        return method === 'PUT' ? {} : {};
+      },
+    },
+    service: {
+      buildFetch: async () => ({ fetch: async () => new Response('ok'), close: async () => {} }),
+    },
+  });
+  await service.setSubscription('https://sub.example.com/list');
+  await service.setAccountNode({ lane: 0, identity: 'manual', node: 'US-A' });
+  const selected = await service.selectAccountNodeAuto({ lane: 1, identity: 'auto', verify: async () => true });
+  assert.equal(selected.node, 'US-B', '自动账号应优先选择没有被其他账号占用的节点');
+});
+
+test('账号自动验证使用隔离 probe lane，切换节点时重建业务 dispatcher', async () => {
+  let clock = 20_000;
+  let delays = { 'US-A': 40, 'SG-B': 70 };
+  const nodes = ['US-A', 'SG-B'];
+  const switches = [];
+  const built = [];
+  const closed = [];
+  const { service } = fakeService({
+    controller: {
+      async request(path, method = 'GET', body) {
+        if (path === '/proxies/freebuff-pool') return { all: nodes, now: nodes[0] };
+        if (path === '/proxies/freebuff-auto') return { now: nodes[0], all: nodes };
+        if (path.startsWith('/group/freebuff-pool/delay')) return delays;
+        if (method === 'PUT') switches.push({ path, node: body?.name });
+        return {};
+      },
+    },
+    service: {
+      now: () => clock,
+      buildFetch: async ({ port, lane } = {}) => {
+        const id = built.length;
+        const fetch = async () => new Response(`${String(lane)}:${port}:${id}`);
+        built.push({ lane, port, fetch });
+        return { fetch, close: async () => { closed.push({ lane, id }); } };
+      },
+    },
+  });
+  await service.setSubscription('https://sub.example.com/list');
+  await service.selectAccountNodeAuto({ lane: 6, identity: 'token-a', verify: async () => true });
+  const firstBusinessFetch = service.getAccountFetch(6, { identity: 'token-a' });
+  const firstGeneration = service.getAccountGeneration(6);
+  assert.equal(service.getAccountNode(6), 'US-A');
+
+  clock += 10 * 60 * 1000 + 1;
+  delays = { 'US-A': 40, 'SG-B': 10 };
+  const selected = await service.selectAccountNodeAuto({
+    lane: 6,
+    identity: 'token-a',
+    verify: async ({ node }) => {
+      assert.equal(service.getAccountNode(6), 'US-A',
+        '候选验证期间业务 lane 必须继续固定在旧节点');
+      assert.equal(service.getAccountFetch(6, { identity: 'token-a' }), firstBusinessFetch,
+        '候选验证不能替换正在承载业务的 dispatcher');
+      return node === 'SG-B';
+    },
+  });
+
+  assert.equal(selected.node, 'SG-B');
+  assert.notEqual(service.getAccountFetch(6, { identity: 'token-a' }), firstBusinessFetch,
+    '业务 selector 真正换节点后必须使用新的 ProxyAgent，不能复用旧 CONNECT');
+  assert.ok(switches.some((entry) => entry.path === '/proxies/freebuff-account-probe' && entry.node === 'SG-B'),
+    '候选节点必须经隔离 probe selector 验证');
+  assert.deepEqual(switches.filter((entry) => entry.path === '/proxies/freebuff-account-6').map((entry) => entry.node),
+    ['US-A', 'SG-B'], '业务 selector 每次只切到已验证通过的节点');
+  assert.ok(closed.some((entry) => entry.lane === 6), '换业务节点后必须关闭旧 dispatcher');
+  assert.notEqual(service.getAccountGeneration(6), firstGeneration);
+
+  service.noteEgressReject({
+    lane: 6,
+    node: 'US-A',
+    generation: firstGeneration,
+    state: 'country_blocked',
+    status: 403,
+  });
+  assert.equal(service.getAccountReject(6), null,
+    '旧代际请求的迟到拒绝不得归因到已经切换后的 SG-B');
+  assert.ok(service.getAccountAutoFetch(6, { identity: 'token-a' }),
+    '旧节点迟到拒绝不得使当前已验证节点失效');
+});
+
+test('账号自动验证缓存绑定 token 身份，换 token 后必须重新验证', async () => {
+  const nodes = ['US-A'];
+  let verified = 0;
+  const { service } = fakeService({
+    controller: {
+      async request(path) {
+        if (path === '/proxies/freebuff-pool') return { all: nodes, now: nodes[0] };
+        if (path === '/proxies/freebuff-auto') return { now: nodes[0], all: nodes };
+        if (path.startsWith('/group/freebuff-pool/delay')) return { 'US-A': 40 };
+        return {};
+      },
+    },
+    service: {
+      buildFetch: async () => ({ fetch: async () => new Response('ok'), close: async () => {} }),
+    },
+  });
+  await service.setSubscription('https://sub.example.com/list');
+  const verify = async () => { verified++; return true; };
+  await service.selectAccountNodeAuto({ lane: 7, identity: 'token-a', verify });
+  assert.ok(service.getAccountAutoFetch(7, { identity: 'token-a' }));
+  assert.equal(service.getAccountAutoFetch(7, { identity: 'token-b', allowStale: true }), null,
+    '旧 token 的验证结果不得授权新 token 使用该 lane');
+  const changed = await service.selectAccountNodeAuto({ lane: 7, identity: 'token-b', verify });
+  assert.equal(changed.cached, false);
+  assert.equal(verified, 2, 'token 轮换后必须重新访问模型目录');
+});
+
+test('lane 复用同名节点后忽略旧身份的迟到拒绝', async () => {
+  const nodes = ['US-A'];
+  const { service } = fakeService({
+    controller: {
+      async request(path) {
+        if (path === '/proxies/freebuff-pool') return { all: nodes, now: nodes[0] };
+        if (path === '/proxies/freebuff-auto') return { now: nodes[0], all: nodes };
+        if (path.startsWith('/group/freebuff-pool/delay')) return { 'US-A': 40 };
+        return {};
+      },
+    },
+    service: {
+      buildFetch: async () => ({ fetch: async () => new Response('ok'), close: async () => {} }),
+    },
+  });
+  await service.setSubscription('https://sub.example.com/list');
+  await service.selectAccountNodeAuto({ lane: 12, identity: 'account-a', verify: async () => true });
+  const oldGeneration = service.getAccountGeneration(12);
+
+  await service.releaseAccountLane(12);
+  await service.selectAccountNodeAuto({ lane: 12, identity: 'account-b', verify: async () => true });
+  assert.ok(service.getAccountAutoFetch(12, { identity: 'account-b' }));
+
+  service.noteEgressReject({
+    lane: 12,
+    node: 'US-A',
+    generation: oldGeneration,
+    state: 'country_blocked',
+    status: 403,
+  });
+
+  assert.ok(service.getAccountAutoFetch(12, { identity: 'account-b' }),
+    '旧身份的拒绝不得删除复用 lane 上新身份的验证结果');
+  assert.equal(service.getAccountReject(12), null,
+    '旧身份的拒绝不得归因到复用 lane 上的新账号');
+});
+
+test('节点切换完成后收到拒绝时不得提交该节点的自动验证', async () => {
+  const nodes = ['US-A', 'SG-B'];
+  let blockUsSwitch = false;
+  let releaseUsSwitch;
+  let signalUsSwitch;
+  const usSwitchStarted = new Promise((resolve) => { signalUsSwitch = resolve; });
+  const usSwitchGate = new Promise((resolve) => { releaseUsSwitch = resolve; });
+  const { service } = fakeService({
+    controller: {
+      async request(path, method = 'GET', body) {
+        if (path === '/proxies/freebuff-pool') return { all: nodes, now: nodes[0] };
+        if (path === '/proxies/freebuff-auto') return { now: nodes[0], all: nodes };
+        if (path.startsWith('/group/freebuff-pool/delay')) return { 'US-A': 40, 'SG-B': 50 };
+        if (method === 'PUT' && path === '/proxies/freebuff-account-13'
+          && body?.name === 'US-A' && blockUsSwitch) {
+          signalUsSwitch();
+          await usSwitchGate;
+        }
+        return {};
+      },
+    },
+    service: {
+      buildFetch: async () => ({ fetch: async () => new Response('ok'), close: async () => {} }),
+    },
+  });
+  await service.setSubscription('https://sub.example.com/list');
+  await service.setAccountNode({ lane: 13, node: 'SG-B', identity: 'account-a' });
+  const previousGeneration = service.getAccountGeneration(13);
+
+  blockUsSwitch = true;
+  const selecting = service.selectAccountNodeAuto({
+    lane: 13,
+    identity: 'account-a',
+    force: true,
+    verify: async () => true,
+  });
+  await usSwitchStarted;
+
+  let watchCount = 0;
+  const rejectedDuringCommit = new Promise((resolve, reject) => {
+    const watch = () => {
+      const generation = service.getAccountGeneration(13);
+      if (service.getAccountNode(13) === 'US-A' && generation !== previousGeneration) {
+        service.noteEgressReject({
+          lane: 13,
+          node: 'US-A',
+          generation,
+          state: 'country_blocked',
+          status: 403,
+        });
+        resolve();
+        return;
+      }
+      if (++watchCount > 1000) {
+        reject(new Error('未观察到 US-A 切换提交窗口'));
+        return;
+      }
+      queueMicrotask(watch);
+    };
+    queueMicrotask(watch);
+  });
+  releaseUsSwitch();
+
+  const [selected] = await Promise.all([selecting, rejectedDuringCommit]);
+  assert.equal(selected.node, 'SG-B', '提交前被拒的 US-A 必须跳过并继续尝试下一候选');
+  assert.equal(service.getAccountNode(13), 'SG-B');
+  assert.ok(service.getAccountAutoFetch(13, { identity: 'account-a' }),
+    '最终只允许未被拒的候选作为自动业务出口');
+});
+
+test('provider 刷新移除已选节点后立即让账号 lane 失效', async () => {
+  let nodes = ['US-A', 'SG-B'];
+  const { service } = fakeService({
+    controller: {
+      async request(path) {
+        if (path === '/proxies/freebuff-pool') return { all: nodes, now: nodes[0] };
+        if (path === '/proxies/freebuff-auto') return { now: nodes[0], all: nodes };
+        if (path.startsWith('/group/freebuff-pool/delay')) {
+          return Object.fromEntries(nodes.map((node, index) => [node, 40 + index * 10]));
+        }
+        return {};
+      },
+    },
+    service: {
+      buildFetch: async () => ({ fetch: async () => new Response('ok'), close: async () => {} }),
+    },
+  });
+  await service.setSubscription('https://sub.example.com/list');
+  await service.setAccountNode({ lane: 8, node: 'US-A' });
+  assert.ok(service.getAccountFetch(8));
+
+  nodes = ['SG-B'];
+  await service.refresh();
+  assert.equal(service.getAccountNode(8), null);
+  assert.equal(service.getAccountFetch(8), null,
+    '已从 provider 删除的节点不能静默回退后继续显示 ready');
+});
+
+test('自动重选同步 provider 时移除旧节点，当前恢复操作仍可提交新节点', async () => {
+  let nodes = ['US-A', 'SG-B'];
+  const { service } = fakeService({
+    controller: {
+      async request(path) {
+        if (path === '/proxies/freebuff-pool') return { all: nodes, now: nodes[0] };
+        if (path === '/proxies/freebuff-auto') return { now: nodes[0], all: nodes };
+        if (path.startsWith('/group/freebuff-pool/delay')) {
+          return Object.fromEntries(nodes.map((node, index) => [node, 40 + index * 10]));
+        }
+        return {};
+      },
+    },
+    service: {
+      buildFetch: async () => ({ fetch: async () => new Response('ok'), close: async () => {} }),
+    },
+  });
+  await service.setSubscription('https://sub.example.com/list');
+  await service.selectAccountNodeAuto({ lane: 10, identity: 'account-a', verify: async () => true });
+  assert.equal(service.getAccountNode(10), 'US-A');
+
+  nodes = ['SG-B'];
+  const selected = await service.selectAccountNodeAuto({
+    lane: 10,
+    identity: 'account-a',
+    force: true,
+    verify: async () => true,
+  });
+  assert.equal(selected.node, 'SG-B');
+  assert.equal(service.getAccountNode(10), 'SG-B');
+});
+
+test('provider 刷新后 selector 实际节点与记录不一致时 lane 失效', async () => {
+  const nodes = ['US-A', 'SG-B'];
+  let accountNow = 'US-A';
+  const { service } = fakeService({
+    controller: {
+      async request(path, method = 'GET', body) {
+        if (path === '/proxies/freebuff-pool') return { all: nodes, now: nodes[0] };
+        if (path === '/proxies/freebuff-auto') return { now: nodes[0], all: nodes };
+        if (path === '/proxies/freebuff-account-9') {
+          if (method === 'PUT') accountNow = body?.name;
+          return { now: accountNow, all: nodes };
+        }
+        if (path.startsWith('/group/freebuff-pool/delay')) return { 'US-A': 40, 'SG-B': 50 };
+        return {};
+      },
+    },
+    service: {
+      buildFetch: async () => ({ fetch: async () => new Response('ok'), close: async () => {} }),
+    },
+  });
+  await service.setSubscription('https://sub.example.com/list');
+  await service.setAccountNode({ lane: 9, node: 'US-A' });
+  assert.ok(service.getAccountFetch(9));
+
+  accountNow = 'SG-B';
+  await service.refresh();
+  assert.equal(service.getAccountNode(9), null);
+  assert.equal(service.getAccountFetch(9), null,
+    'mihomo selector 回退到其他节点后不能继续报告旧节点 ready');
+});
+
+test('状态查询的迟到 selector 响应不得清除并发完成的新节点', async () => {
+  const nodes = ['US-A', 'SG-B'];
+  let accountNow = 'US-A';
+  let holdStatusRead = false;
+  let signalStatusRead;
+  let releaseStatusRead;
+  const statusReadStarted = new Promise((resolve) => { signalStatusRead = resolve; });
+  const statusReadGate = new Promise((resolve) => { releaseStatusRead = resolve; });
+  const { service } = fakeService({
+    controller: {
+      async request(path, method = 'GET', body) {
+        if (path === '/proxies/freebuff-pool') return { all: nodes, now: nodes[0] };
+        if (path === '/proxies/freebuff-auto') return { now: nodes[0], all: nodes };
+        if (path.startsWith('/group/freebuff-pool/delay')) return { 'US-A': 40, 'SG-B': 50 };
+        if (path === '/proxies/freebuff-account-14') {
+          if (method === 'PUT') {
+            accountNow = body?.name;
+            return {};
+          }
+          if (holdStatusRead) {
+            signalStatusRead();
+            await statusReadGate;
+          }
+          return { now: accountNow, all: nodes };
+        }
+        return {};
+      },
+    },
+    service: {
+      buildFetch: async () => ({ fetch: async () => new Response('ok'), close: async () => {} }),
+    },
+  });
+  await service.setSubscription('https://sub.example.com/list');
+  await service.setAccountNode({ lane: 14, node: 'US-A', identity: 'account-a' });
+
+  holdStatusRead = true;
+  const status = service.status();
+  await statusReadStarted;
+  const manual = service.setAccountNode({ lane: 14, node: 'SG-B', identity: 'account-a' });
+  await Promise.race([
+    manual,
+    new Promise((resolve) => setImmediate(resolve)),
+  ]);
+  releaseStatusRead();
+  await Promise.all([status, manual]);
+
+  assert.equal(service.getAccountNode(14), 'SG-B',
+    '较早开始的状态查询不能在 await 后清除较晚完成的手动切换');
+  assert.ok(service.getAccountFetch(14, { identity: 'account-a' }));
+});
+
+test('provider 刷新后同名节点仍必须重新验证账号模型能力', async () => {
+  const nodes = ['US-A'];
+  let accountNow = '';
+  let verified = 0;
+  let businessBuilds = 0;
+  const closedBusiness = [];
+  const { service } = fakeService({
+    controller: {
+      async request(path, method = 'GET', body) {
+        if (path === '/proxies/freebuff-pool') return { all: nodes, now: nodes[0] };
+        if (path === '/proxies/freebuff-auto') return { now: nodes[0], all: nodes };
+        if (path.startsWith('/group/freebuff-pool/delay')) return { 'US-A': 40 };
+        if (path === '/proxies/freebuff-account-15') {
+          if (method === 'PUT') accountNow = body?.name || '';
+          return { now: accountNow, all: nodes };
+        }
+        return {};
+      },
+    },
+    service: {
+      buildFetch: async ({ lane }) => {
+        if (lane === 'probe') return { fetch: async () => new Response('ok'), close: async () => {} };
+        if (lane == null) return { fetch: async () => new Response('ok'), close: async () => {} };
+        const buildId = ++businessBuilds;
+        const accountFetch = async () => new Response(String(buildId));
+        accountFetch.buildId = buildId;
+        return {
+          fetch: accountFetch,
+          close: async () => { closedBusiness.push(buildId); },
+        };
+      },
+    },
+  });
+  const verify = async () => { verified++; return true; };
+  await service.setSubscription('https://sub.example.com/list');
+  await service.selectAccountNodeAuto({ lane: 15, identity: 'account-a', verify });
+  assert.equal(verified, 1);
+  const firstFetch = service.getAccountFetch(15, { identity: 'account-a' });
+  const firstGeneration = service.getAccountGeneration(15);
+
+  await service.refresh();
+  assert.equal(service.getAccountFetch(15, { identity: 'account-a' }), null,
+    'provider topology 刷新后旧业务 dispatcher 必须立即失效');
+  const selected = await service.selectAccountNodeAuto({ lane: 15, identity: 'account-a', verify });
+  assert.equal(selected.cached, false, 'provider 拓扑刷新后不得命中刷新前验证缓存');
+  assert.equal(verified, 2, '同名节点也必须重新读取该账号可见的模型目录');
+  const secondFetch = service.getAccountFetch(15, { identity: 'account-a' });
+  assert.notEqual(secondFetch, firstFetch, '同名节点也必须重建业务 dispatcher');
+  assert.notEqual(service.getAccountGeneration(15), firstGeneration,
+    '业务 dispatcher 换代必须分配新 generation，隔离刷新前迟到拒绝');
+  assert.equal(businessBuilds, 2);
+  assert.deepEqual(closedBusiness, [1]);
+});
+
+test('后台重验期间收到出口拒绝时不得把旧节点重新标成有效', async () => {
+  let clock = 10_000;
+  let releaseVerify;
+  let verifyStarted;
+  const started = new Promise((resolve) => { verifyStarted = resolve; });
+  const nodes = ['US-A'];
+  const { service } = fakeService({
+    controller: {
+      async request(path) {
+        if (path === '/proxies/freebuff-pool') return { all: nodes, now: nodes[0] };
+        if (path === '/proxies/freebuff-auto') return { now: nodes[0], all: nodes };
+        if (path.startsWith('/group/freebuff-pool/delay')) return { 'US-A': 40 };
+        return {};
+      },
+    },
+    service: {
+      now: () => clock,
+      buildFetch: async () => ({ fetch: async () => new Response('ok'), close: async () => {} }),
+    },
+  });
+  await service.setSubscription('https://sub.example.com/list');
+  await service.selectAccountNodeAuto({ lane: 4, verify: async () => true });
+  clock += 10 * 60 * 1000 + 1;
+
+  const revalidating = service.selectAccountNodeAuto({
+    lane: 4,
+    verify: async () => {
+      verifyStarted();
+      return new Promise((resolve) => { releaseVerify = resolve; });
+    },
+  });
+  await started;
+  service.noteEgressReject({ lane: 4, state: 'country_blocked', status: 403 });
+  releaseVerify(true);
+  await assert.rejects(revalidating, /没有可访问 deepseek\/deepseek-v4-pro/);
+  assert.equal(service.getAccountAutoFetch(4, { allowStale: true }), null);
+});
+
+test('mihomo 重启后账号 selector 必须重新钉节点，不能复用旧内存状态', async () => {
+  const nodes = ['US-A'];
+  const switches = [];
+  let verified = 0;
+  const { service } = fakeService({
+    controller: {
+      async request(path, method = 'GET', body) {
+        if (path === '/proxies/freebuff-pool') return { all: nodes, now: nodes[0] };
+        if (path === '/proxies/freebuff-auto') return { now: nodes[0], all: nodes };
+        if (path.startsWith('/group/freebuff-pool/delay')) return { 'US-A': 40 };
+        if (method === 'PUT' && path === '/proxies/freebuff-account-5') {
+          switches.push(body?.name);
+        }
+        return {};
+      },
+    },
+    service: {
+      buildFetch: async () => ({ fetch: async () => new Response('ok'), close: async () => {} }),
+    },
+  });
+  const verify = async () => { verified++; return true; };
+  await service.setSubscription('https://sub.example.com/one');
+  await service.selectAccountNodeAuto({ lane: 5, verify });
+
+  await service.setSubscription('https://sub.example.com/two');
+  await service.selectAccountNodeAuto({ lane: 5, verify });
+
+  assert.deepEqual(switches, ['US-A', 'US-A'], '新内核的 selector 必须重新 PUT');
+  assert.equal(verified, 2, '内核重启后必须重新按账号验证模型能力');
+});
+
+test('释放一个账号 lane 不影响其他账号 dispatcher', async () => {
+  const nodes = ['US-A', 'SG-B'];
+  const closed = [];
+  const { service } = fakeService({
+    controller: {
+      async request(path) {
+        if (path === '/proxies/freebuff-pool') return { all: nodes, now: nodes[0] };
+        if (path === '/proxies/freebuff-auto') return { now: nodes[0], all: nodes };
+        if (path.startsWith('/group/freebuff-pool/delay')) return { 'US-A': 40, 'SG-B': 50 };
+        return {};
+      },
+    },
+    service: {
+      buildFetch: async ({ lane }) => ({
+        fetch: async () => new Response(String(lane)),
+        close: async () => { closed.push(lane); },
+      }),
+    },
+  });
+  await service.setSubscription('https://sub.example.com/list');
+  await service.setAccountNode({ lane: 0, node: 'US-A' });
+  await service.setAccountNode({ lane: 1, node: 'SG-B' });
+  const laneOneFetch = service.getAccountFetch(1);
+
+  await service.releaseAccountLane(0);
+  assert.equal(service.getAccountFetch(0), null);
+  assert.equal(service.getAccountFetch(1), laneOneFetch);
+  assert.deepEqual(closed, [0]);
+});
+
+test('释放账号 lane 不等待活跃长流关闭，也不阻塞其他控制操作', async () => {
+  const nodes = ['US-A', 'SG-B'];
+  let releaseClose;
+  const closeStarted = new Promise((resolve) => { releaseClose = resolve; });
+  const { service } = fakeService({
+    controller: {
+      async request(path) {
+        if (path === '/proxies/freebuff-pool') return { all: nodes, now: nodes[0] };
+        if (path === '/proxies/freebuff-auto') return { now: nodes[0], all: nodes };
+        if (path.startsWith('/group/freebuff-pool/delay')) return { 'US-A': 40, 'SG-B': 50 };
+        return {};
+      },
+    },
+    service: {
+      buildFetch: async ({ lane }) => ({
+        fetch: async () => new Response(String(lane)),
+        close: lane === 0 ? () => closeStarted : async () => {},
+      }),
+    },
+  });
+  await service.setSubscription('https://sub.example.com/list');
+  await service.setAccountNode({ lane: 0, node: 'US-A' });
+  await service.setAccountNode({ lane: 1, node: 'SG-B' });
+
+  const released = service.releaseAccountLane(0);
+  const outcome = await Promise.race([
+    released.then(() => 'released'),
+    new Promise((resolve) => setTimeout(() => resolve('blocked'), 50)),
+  ]);
+  assert.equal(outcome, 'released', 'release 不得等待 ProxyAgent.close 的活跃请求 drain');
+  assert.equal(service.getAccountFetch(0), null);
+  assert.ok(service.getAccountFetch(1));
+  releaseClose();
+});
+
+test('慢自动探测不阻塞手动 lane，迟到结果不得覆盖手动节点', async () => {
+  const nodes = ['US-A', 'SG-B'];
+  let releaseVerify;
+  let verifyStarted;
+  const started = new Promise((resolve) => { verifyStarted = resolve; });
+  const { service } = fakeService({
+    controller: {
+      async request(path) {
+        if (path === '/proxies/freebuff-pool') return { all: nodes, now: nodes[0] };
+        if (path === '/proxies/freebuff-auto') return { now: nodes[0], all: nodes };
+        if (path.startsWith('/group/freebuff-pool/delay')) return { 'US-A': 40, 'SG-B': 50 };
+        return {};
+      },
+    },
+    service: {
+      buildFetch: async ({ lane }) => ({
+        fetch: async () => new Response(String(lane)),
+        close: async () => {},
+      }),
+    },
+  });
+  await service.setSubscription('https://sub.example.com/list');
+
+  const automatic = service.selectAccountNodeAuto({
+    lane: 0,
+    identity: 'account-a',
+    verify: async () => {
+      verifyStarted();
+      return new Promise((resolve) => { releaseVerify = resolve; });
+    },
+  });
+  await started;
+
+  const manual = service.setAccountNode({ lane: 0, node: 'SG-B', identity: 'account-a' });
+  const outcome = await Promise.race([
+    manual.then(() => 'manual-ready'),
+    new Promise((resolve) => setTimeout(() => resolve('blocked'), 50)),
+  ]);
+  assert.equal(outcome, 'manual-ready', '自动模型探测不得持有整个代理控制锁');
+  releaseVerify(true);
+  await assert.rejects(automatic, (error) => error?.code === 'ACCOUNT_EGRESS_SUPERSEDED');
+  assert.equal(service.getAccountNode(0), 'SG-B', '迟到的自动探测不得覆盖后来的手动选择');
+});
+
+test('拓扑切换后迟到的 probe dispatcher 不得跨拓扑复用', async () => {
+  const nodes = ['US-A'];
+  let probeBuilds = 0;
+  const closedProbeIds = [];
+  const verifiedProbeIds = [];
+  let probeStarted;
+  const started = new Promise((resolve) => { probeStarted = resolve; });
+  let releaseProbe;
+  const probeGate = new Promise((resolve) => { releaseProbe = resolve; });
+  const { service } = fakeService({
+    controller: {
+      async request(path) {
+        if (path === '/proxies/freebuff-pool') return { all: nodes, now: nodes[0] };
+        if (path === '/proxies/freebuff-auto') return { now: nodes[0], all: nodes };
+        if (path.startsWith('/group/freebuff-pool/delay')) return { 'US-A': 40 };
+        return {};
+      },
+    },
+    service: {
+      buildFetch: async ({ lane }) => {
+        if (lane === 'probe') {
+          const probeId = ++probeBuilds;
+          probeStarted();
+          await probeGate;
+          const probeFetch = async () => new Response('ok');
+          probeFetch.probeId = probeId;
+          return {
+            fetch: probeFetch,
+            close: async () => { closedProbeIds.push(probeId); },
+          };
+        }
+        return { fetch: async () => new Response('ok'), close: async () => {} };
+      },
+    },
+  });
+  await service.setSubscription('https://sub.example.com/list');
+  const selecting = service.selectAccountNodeAuto({
+    lane: 6,
+    identity: 'account-a',
+    verify: async ({ fetch }) => { verifiedProbeIds.push(fetch.probeId); return true; },
+  });
+  await started;
+
+  await service.stop();
+  releaseProbe();
+  await assert.rejects(selecting, (error) => error?.code === 'ACCOUNT_EGRESS_SUPERSEDED');
+  assert.deepEqual(verifiedProbeIds, [], '旧拓扑 dispatcher 不得执行账号模型验证');
+  assert.deepEqual(closedProbeIds, [1], '未提交的旧 topology dispatcher 必须关闭且只关闭一次');
+
+  await service.setSubscription('https://sub.example.com/list');
+  await service.selectAccountNodeAuto({
+    lane: 6,
+    identity: 'account-a',
+    force: true,
+    verify: async ({ fetch }) => { verifiedProbeIds.push(fetch.probeId); return true; },
+  });
+  assert.equal(probeBuilds, 2, '拓扑切换后必须重建 probe dispatcher，不能复用迟到的旧连接');
+  assert.deepEqual(verifiedProbeIds, [2], '新拓扑只能使用新构建的 probe dispatcher 验证');
+});
+
+test('probe selector PUT 期间切换拓扑时旧操作不得继续构建', async () => {
+  const nodes = ['US-A'];
+  let probePuts = 0;
+  let probeBuilds = 0;
+  let verifies = 0;
+  let signalPut;
+  const putStarted = new Promise((resolve) => { signalPut = resolve; });
+  let releasePut;
+  const putGate = new Promise((resolve) => { releasePut = resolve; });
+  const { service } = fakeService({
+    controller: {
+      async request(path, method) {
+        if (path === '/proxies/freebuff-pool') return { all: nodes, now: nodes[0] };
+        if (path === '/proxies/freebuff-auto') return { now: nodes[0], all: nodes };
+        if (path.startsWith('/group/freebuff-pool/delay')) return { 'US-A': 40 };
+        if (path === '/proxies/freebuff-account-probe' && method === 'PUT') {
+          probePuts++;
+          if (probePuts === 1) {
+            signalPut();
+            await putGate;
+          }
+        }
+        return {};
+      },
+    },
+    service: {
+      buildFetch: async ({ lane }) => {
+        if (lane === 'probe') probeBuilds++;
+        return { fetch: async () => new Response('ok'), close: async () => {} };
+      },
+    },
+  });
+  await service.setSubscription('https://sub.example.com/list');
+  const selecting = service.selectAccountNodeAuto({
+    lane: 7,
+    identity: 'account-a',
+    verify: async () => { verifies++; return true; },
+  });
+  await putStarted;
+
+  await service.stop();
+  releasePut();
+  await assert.rejects(selecting, (error) => error?.code === 'ACCOUNT_EGRESS_SUPERSEDED');
+  assert.equal(probeBuilds, 0, '过期 PUT 完成后不得继续构建 dispatcher');
+  assert.equal(verifies, 0, '过期 PUT 不得进入账号模型验证');
+
+  await service.setSubscription('https://sub.example.com/list');
+  await service.selectAccountNodeAuto({
+    lane: 7,
+    identity: 'account-a',
+    force: true,
+    verify: async () => { verifies++; return true; },
+  });
+  assert.equal(probePuts, 2, '新拓扑必须重新切换 probe selector');
+  assert.equal(probeBuilds, 1);
+  assert.equal(verifies, 1);
+});
+
+test('仅刷新 provider 后同名 probe 节点也必须重建连接', async () => {
+  const nodes = ['US-A'];
+  let probePuts = 0;
+  let probeBuilds = 0;
+  const closedProbeIds = [];
+  const verifiedProbeIds = [];
+  const { service } = fakeService({
+    controller: {
+      async request(path, method) {
+        if (path === '/proxies/freebuff-pool') return { all: nodes, now: nodes[0] };
+        if (path === '/proxies/freebuff-auto') return { now: nodes[0], all: nodes };
+        if (path.startsWith('/group/freebuff-pool/delay')) return { 'US-A': 40 };
+        if (path === '/proxies/freebuff-account-8') return { all: nodes, now: 'US-A' };
+        if (path === '/proxies/freebuff-account-probe' && method === 'PUT') probePuts++;
+        return {};
+      },
+    },
+    service: {
+      buildFetch: async ({ lane }) => {
+        if (lane !== 'probe') return { fetch: async () => new Response('ok'), close: async () => {} };
+        const probeId = ++probeBuilds;
+        const probeFetch = async () => new Response('ok');
+        probeFetch.probeId = probeId;
+        return {
+          fetch: probeFetch,
+          close: async () => { closedProbeIds.push(probeId); },
+        };
+      },
+    },
+  });
+  const verify = async ({ fetch }) => { verifiedProbeIds.push(fetch.probeId); return true; };
+  await service.setSubscription('https://sub.example.com/list');
+  await service.selectAccountNodeAuto({ lane: 8, identity: 'account-a', verify });
+  await service.refresh();
+  await service.selectAccountNodeAuto({ lane: 8, identity: 'account-a', verify });
+
+  assert.equal(probePuts, 2, 'refresh 后同名节点也要重新 PUT');
+  assert.equal(probeBuilds, 2, 'refresh 后不得复用旧 topology 的 probe dispatcher');
+  assert.deepEqual(verifiedProbeIds, [1, 2]);
+  assert.deepEqual(closedProbeIds, [1], '刷新前的 probe dispatcher 必须在重建时关闭');
+});
+
+test('probe dispatcher 构建结果无 fetch 时仍关闭未提交资源', async () => {
+  let closed = 0;
+  const { service } = fakeService({
+    controller: {
+      async request(path) {
+        if (path === '/proxies/freebuff-pool') return { all: ['US-A'], now: 'US-A' };
+        if (path === '/proxies/freebuff-auto') return { now: 'US-A', all: ['US-A'] };
+        if (path.startsWith('/group/freebuff-pool/delay')) return { 'US-A': 40 };
+        return {};
+      },
+    },
+    service: {
+      buildFetch: async ({ lane }) => lane === 'probe'
+        ? { close: async () => { closed++; } }
+        : { fetch: async () => new Response('ok'), close: async () => {} },
+    },
+  });
+  await service.setSubscription('https://sub.example.com/list');
+  await assert.rejects(
+    service.selectAccountNodeAuto({ lane: 9, verify: async () => true }),
+    /没有可访问 deepseek\/deepseek-v4-pro/,
+  );
+  assert.equal(closed, 1, '无有效 fetch 的 probe dispatcher 也必须释放');
 });
 
 test('管理 API 暴露订阅、刷新、节点、测活与更新设置路由', () => {

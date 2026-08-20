@@ -443,18 +443,28 @@ export default {
   restoreUsageSnapshot,
   restoreKeyUsageSnapshot,
   usageSnapshot,
+  // Node 服务启动时只配置一次。避免并发请求各自携带的 env 函数互相覆盖
+  // 模块级出站状态；Cloudflare Worker 不调用此入口，仍使用每请求 env。
+  configureUpstreamRouting({ getUpstreamFetch, resolveAccountFetch, onReject } = {}) {
+    configuredUpstreamFetch = typeof getUpstreamFetch === "function" ? getUpstreamFetch : null;
+    upstreamFetchForAccount = typeof resolveAccountFetch === "function" ? resolveAccountFetch : null;
+    onEgressReject = typeof onReject === "function" ? onReject : null;
+    upstreamRoutingConfigured = true;
+  },
   // 只用于服务端迁移尚未发布版本写过的旧 FNV 快照；新分享 Key 使用服务端 SHA-256 指纹。
   keyFingerprint(token) { return stableFingerprint(String(token || "")); },
   async fetch(request, env) {
     // 上游出站 fetch 注入（Node adapter 配了订阅时传入走 mihomo 的 fetch）。
     // env 可放函数（Node 的 env 是普通对象）；Cloudflare Worker 的 env 是 KV 型
     // 对象拿不到函数，保持默认全局 fetch 直连。
-    if (env && typeof env.FREEBUFF_UPSTREAM_FETCH === "function") {
-      upstreamFetch = env.FREEBUFF_UPSTREAM_FETCH;
-    }
-    // 出站 IP 被上游拒绝时的回调（同上，只有 Node adapter 能注入函数）。
-    if (env && typeof env.FREEBUFF_ON_EGRESS_REJECT === "function") {
-      onEgressReject = env.FREEBUFF_ON_EGRESS_REJECT;
+    if (!upstreamRoutingConfigured) {
+      upstreamFetch = env && typeof env.FREEBUFF_UPSTREAM_FETCH === "function"
+        ? env.FREEBUFF_UPSTREAM_FETCH : defaultUpstreamFetch;
+      upstreamFetchForAccount = env && typeof env.FREEBUFF_UPSTREAM_FETCH_FOR_ACCOUNT === "function"
+        ? env.FREEBUFF_UPSTREAM_FETCH_FOR_ACCOUNT : null;
+      // 出站 IP 被上游拒绝时的回调（同上，只有 Node adapter 能注入函数）。
+      onEgressReject = env && typeof env.FREEBUFF_ON_EGRESS_REJECT === "function"
+        ? env.FREEBUFF_ON_EGRESS_REJECT : null;
     }
     const url = new URL(request.url);
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders() });
@@ -795,7 +805,8 @@ function recordAccountObservation(token, status, dataOrText, extra = {}) {
   const ipLevel = state === "country_blocked" || state === "ip_capped"
     || (state === "blocked" && !upstreamState);
   if (onEgressReject && ipLevel) {
-    try { onEgressReject({ state, status }); } catch {}
+    const egress = extra.headers ? upstreamEgressByHeaders.get(extra.headers) : null;
+    try { onEgressReject({ token, state, status, ...(egress || {}) }); } catch {}
   }
 
   // 只有账号级的明确结果才进入持久隔离；出口节点级拒绝继续交给代理层处理。
@@ -2300,14 +2311,33 @@ function jitterMs() {
 // Node adapter（server.js）可注入 env.FREEBUFF_UPSTREAM_FETCH：
 // 配置了订阅时 server/proxy.mjs 会构造一个「带 undici ProxyAgent 指向本地
 // mihomo mixed-port」的 fetch 传进来，上游流量就经代理节点出站。
-let upstreamFetch = typeof fetch === "function" ? fetch : globalThis.fetch;
+const defaultUpstreamFetch = typeof fetch === "function" ? fetch : globalThis.fetch;
+let upstreamFetch = defaultUpstreamFetch;
+let upstreamFetchForAccount = null;
+let configuredUpstreamFetch = null;
+let upstreamRoutingConfigured = false;
+const upstreamEgressByHeaders = new WeakMap();
 
 async function authenticatedUpstreamFetch(token, url, init = {}) {
   if (token && accountIsBlocked(token)) {
     const state = durableAccountState(token)?.state || "blocked";
     throw new TerminalAccountStateError(state, 403);
   }
-  return upstreamFetch(url, init);
+  const accountRoute = token && upstreamFetchForAccount ? upstreamFetchForAccount(token) : null;
+  const accountFetch = typeof accountRoute === "function" ? accountRoute : accountRoute?.fetch;
+  const globalFetch = configuredUpstreamFetch?.() || upstreamFetch || defaultUpstreamFetch;
+  try {
+    const response = await (typeof accountFetch === "function" ? accountFetch : globalFetch)(url, init);
+    if (response?.headers && accountRoute?.egress && typeof accountRoute.egress === "object") {
+      upstreamEgressByHeaders.set(response.headers, accountRoute.egress);
+    }
+    return response;
+  } catch (error) {
+    if (error?.code === "ACCOUNT_EGRESS_UNAVAILABLE") {
+      throw new EgressRejectedError({ state: "egress_unavailable" }, 503);
+    }
+    throw error;
+  }
 }
 
 // 出站 IP 被上游拒绝时的回调（env.FREEBUFF_ON_EGRESS_REJECT）。这里只知道「被拒了、

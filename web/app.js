@@ -12,7 +12,7 @@ const POLL_MS = 3600000; // 默认 1 小时自动刷新；需要即时数据可�
 const LOG_POLL_MS = 3000;
 
 const S = {
-  accounts: [], health: {}, aliases: {},
+  accounts: [], health: {}, accountEgress: {}, aliases: {},
   models: [], proxy: null, usage: null,
   // 分享 key：keys 是配置，keyStats 是 worker 进程内的归账（按备注名 join）
   keys: [], keyStats: {}, ownerName: '主 Key', keysLocked: false,
@@ -65,6 +65,7 @@ const ICONS = {
   mobius: '<path d="M12 12c-1.8-2.5-3.6-3.8-5.5-3.8a3.8 3.8 0 0 0 0 7.6c1.9 0 3.7-1.3 5.5-3.8"/><path d="M12 12c1.8 2.5 3.6 3.8 5.5 3.8a3.8 3.8 0 0 0 0-7.6c-1.9 0-3.7 1.3-5.5 3.8"/>',
   eye: '<path d="M1.5 12S5 5.5 12 5.5 22.5 12 22.5 12 19 18.5 12 18.5 1.5 12 1.5 12Z"/><circle cx="12" cy="12" r="3"/>',
   eyeOff: '<path d="M4 4l16 16"/><path d="M9.9 5.9A9.6 9.6 0 0 1 12 5.5c7 0 10.5 6.5 10.5 6.5a18 18 0 0 1-3.3 4.1"/><path d="M6.4 7.7A17.8 17.8 0 0 0 1.5 12S5 18.5 12 18.5a9.7 9.7 0 0 0 3.6-.66"/><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2"/>',
+  route: '<circle cx="6" cy="19" r="3"/><path d="M9 19h8.5a3.5 3.5 0 0 0 0-7h-11a3.5 3.5 0 0 1 0-7H15"/><circle cx="18" cy="5" r="3"/>',
 };
 
 function iconSvg(icon, size = 15) {
@@ -395,6 +396,126 @@ function renderMaskToggle() {
   btn.setAttribute('aria-label', label);
 }
 
+function normalizeAccountEgress(account = {}) {
+  const inline = account.egress && typeof account.egress === 'object' ? account.egress : {};
+  const runtime = S.accountEgress?.[account.key];
+  const detail = runtime && typeof runtime === 'object' ? { ...inline, ...runtime } : inline;
+  const mode = String(account.egressMode ?? detail.mode ?? 'auto').toLowerCase() === 'manual'
+    ? 'manual' : 'auto';
+  const configuredNode = String(account.egressNode ?? detail.configuredNode ?? '').trim();
+  const currentNode = String(account.egressCurrentNode ?? detail.currentNode ?? detail.selectedNode ?? configuredNode).trim();
+  const state = String(account.egressState ?? detail.state ?? (currentNode ? 'ready' : 'pending')).toLowerCase();
+  const error = String(account.egressError ?? detail.error ?? '').trim();
+  const reject = detail.reject && typeof detail.reject === 'object' ? detail.reject : null;
+  return { mode, configuredNode, currentNode, state, error, reject };
+}
+
+const ACCOUNT_EGRESS_STATE_LABELS = {
+  ready: '已就绪', probing: '验证中', pending: '选择中', starting: '选择中', configuring: '选择中',
+  error: '异常', failed: '异常', unavailable: '暂无正常节点',
+  proxy_offline: '代理未就绪', rejected: '节点被拒绝',
+};
+
+function accountEgressStateLabel(state) {
+  return ACCOUNT_EGRESS_STATE_LABELS[state] || '等待选择';
+}
+
+function accountEgressSummary(account) {
+  const egress = normalizeAccountEgress(account);
+  const mode = egress.mode === 'manual' ? '手动' : '自动';
+  const node = egress.currentNode || (egress.mode === 'manual' ? '未设置' : accountEgressStateLabel(egress.state));
+  const failed = egress.error || ['error', 'failed', 'unavailable', 'proxy_offline', 'rejected'].includes(egress.state);
+  const title = [mode, egress.currentNode, egress.error || egress.reject?.state].filter(Boolean).join(' · ');
+  return `<div class="account-egress-summary ${failed ? 'error' : egress.currentNode ? 'ready' : 'pending'}" title="${esc(title || `${mode} · ${node}`)}">
+    <span class="account-egress-mode-label">${mode}</span>
+    <span class="account-egress-node mono">${esc(node)}</span>
+  </div>`;
+}
+
+function proxyNodesForAccount() {
+  return (Array.isArray(S.proxy?.nodes) ? S.proxy.nodes : []).map((node) => typeof node === 'string'
+    ? { name: node, healthy: null, delay: null }
+    : {
+        name: String(node?.name || node?.id || ''),
+        healthy: node?.healthy ?? null,
+        delay: Number.isFinite(Number(node?.delay)) ? Number(node.delay) : null,
+      }
+  ).filter((node) => node.name);
+}
+
+function fillAccountEgressNodes(configuredNode = '') {
+  const select = $('accountEgressNode');
+  const nodes = proxyNodesForAccount();
+  if (configuredNode && !nodes.some((node) => node.name === configuredNode)) {
+    nodes.unshift({ name: configuredNode, healthy: null, delay: null, missing: true });
+  }
+  const values = nodes.length ? nodes : [{ name: '', healthy: null, delay: null }];
+  select.replaceChildren(...values.map((node) => {
+    const option = document.createElement('option');
+    option.value = node.name;
+    const health = node.healthy === true ? '● ' : node.healthy === false ? '○ ' : '';
+    const delay = Number.isFinite(node.delay) && node.delay > 0 ? ` · ${node.delay}ms` : '';
+    option.textContent = node.name
+      ? `${health}${node.name}${node.missing ? ' · 当前列表缺失' : delay}`
+      : '暂无可用节点';
+    return option;
+  }));
+  if (configuredNode) select.value = configuredNode;
+}
+
+let accountEgressEditing = null;
+let accountEgressSaving = false;
+
+function setAccountEgressMode(mode) {
+  const normalized = mode === 'manual' ? 'manual' : 'auto';
+  const dialog = $('accountEgressDialog');
+  dialog.dataset.mode = normalized;
+  for (const [id, active] of [
+    ['accountEgressModeAuto', normalized === 'auto'],
+    ['accountEgressModeManual', normalized === 'manual'],
+  ]) {
+    const button = $(id);
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-pressed', String(active));
+    button.disabled = Boolean(S.readonly) || accountEgressSaving;
+  }
+  $('accountEgressNodeField').hidden = normalized !== 'manual';
+  const hasNode = Boolean($('accountEgressNode').value);
+  $('accountEgressNode').disabled = Boolean(S.readonly) || accountEgressSaving
+    || normalized !== 'manual' || !hasNode;
+  $('accountEgressSave').disabled = Boolean(S.readonly) || accountEgressSaving
+    || (normalized === 'manual' && !hasNode);
+  $('accountEgressCancel').disabled = accountEgressSaving;
+}
+
+function renderAccountEgressStatus(account) {
+  const egress = normalizeAccountEgress(account);
+  const mode = egress.mode === 'manual' ? '手动' : '自动';
+  const state = accountEgressStateLabel(egress.state);
+  const failed = egress.error || ['error', 'failed', 'unavailable', 'proxy_offline', 'rejected'].includes(egress.state);
+  $('accountEgressStatus').textContent = `${mode} · ${state}${egress.currentNode ? ` · ${egress.currentNode}` : ''}`;
+  $('accountEgressStatus').className = `account-egress-status ${failed ? 'error' : egress.currentNode ? 'ready' : 'pending'}`;
+  $('accountEgressError').textContent = egress.error || (egress.reject?.state ? `拒绝原因：${egress.reject.state}` : '');
+}
+
+function openAccountEgress(key) {
+  if (accountEgressSaving) return;
+  const account = S.accounts.find((item) => item.key === key);
+  if (!account || S.readonly) return;
+  accountEgressEditing = key;
+  const egress = normalizeAccountEgress(account);
+  $('accountEgressAccount').textContent = maskEmail(account.name || account.email || account.key);
+  $('accountEgressError').textContent = '';
+  fillAccountEgressNodes(egress.configuredNode || egress.currentNode);
+  setAccountEgressMode(egress.mode);
+  renderAccountEgressStatus(account);
+  const dialog = $('accountEgressDialog');
+  dialog.onclick = (event) => {
+    if (event.target === dialog && !accountEgressSaving) dialog.close();
+  };
+  dialog.showModal();
+}
+
 function renderAccounts() {
   const table = document.querySelector('.account-table');
   table.classList.toggle('is-empty', S.accounts.length === 0);
@@ -402,7 +523,7 @@ function renderAccounts() {
   renderQuotaHead();
   renderMaskToggle();
   if (!S.accounts.length) {
-    $('acctBody').innerHTML = '<tr><td colspan="4" class="empty">暂无账号，请切换到「添加」</td></tr>';
+    $('acctBody').innerHTML = '<tr><td colspan="5" class="empty">暂无账号，请切换到「添加」</td></tr>';
     return;
   }
   $('acctBody').innerHTML = S.accounts.map(a => {
@@ -414,15 +535,18 @@ function renderAccounts() {
     // 主行=备注名(或邮箱)+池级用量，次行=邮箱。
     const label = a.name || a.email || a.key;
     const secondary = a.email && a.email !== label ? a.email : '';
+    const egressDisabled = S.readonly ? 'disabled' : '';
     return `<tr>
       <td>
         <div class="nm">${esc(maskEmail(label))}${usageHtml}</div>
         ${secondary ? `<div class="mono">${esc(maskEmail(secondary))}</div>` : ''}
       </td>
       <td>${h ? stateDot(h.state, h.label) : stateDot('unknown', '未探测')}</td>
+      <td>${accountEgressSummary(a)}</td>
       <td>${modelsCellHtml(h)}</td>
       <td class="action-col">
         <div class="actions icon-actions">
+          ${iconButton('route', '设置出站节点', `data-egress="${esc(a.key)}" ${egressDisabled}`)}
           ${S.readonly ? '' : iconButton('trash', '删除账号', `data-del="${esc(a.key)}"`, 'danger')}
         </div>
       </td>
@@ -431,6 +555,8 @@ function renderAccounts() {
 
   // 没有「探测」按钮：GET /_api/accounts 每次都会在服务端逐个探测，状态与额度随
   // 轮询（每小时）和概况区的立即刷新一起更新，手动逐个探测是多余的一层
+  $('acctBody').querySelectorAll('[data-egress]').forEach((button) =>
+    button.addEventListener('click', () => openAccountEgress(button.dataset.egress)));
   $('acctBody').querySelectorAll('[data-del]').forEach(b =>
     b.addEventListener('click', async () => {
       const key = b.dataset.del;
@@ -1000,7 +1126,12 @@ async function refresh() {
       $('key-mask').textContent = S.apiKey.slice(0, 8) + '…';
       renderBuild();
     }
-    if (acc) { S.accounts = acc.accounts || []; S.health = acc.health || {}; S.readonly = acc.readonly; }
+    if (acc) {
+      S.accounts = acc.accounts || [];
+      S.health = acc.health || {};
+      S.accountEgress = acc.egress || {};
+      S.readonly = acc.readonly;
+    }
     if (proxy) S.proxy = proxy.proxy || proxy;
     if (usage) S.usage = usage;
     if (usagePersistence) {
@@ -1152,6 +1283,63 @@ function wire() {
     renderAccounts();
   });
   renderMaskToggle();
+
+  $('accountEgressModeAuto')?.addEventListener('click', () => setAccountEgressMode('auto'));
+  $('accountEgressModeManual')?.addEventListener('click', () => setAccountEgressMode('manual'));
+  $('accountEgressNode')?.addEventListener('change', () => setAccountEgressMode('manual'));
+  $('accountEgressCancel')?.addEventListener('click', () => {
+    if (!accountEgressSaving) $('accountEgressDialog').close();
+  });
+  $('accountEgressDialog')?.addEventListener('cancel', (event) => {
+    if (accountEgressSaving) event.preventDefault();
+  });
+  $('accountEgressForm')?.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    if (accountEgressSaving) return;
+    const key = accountEgressEditing;
+    const account = S.accounts.find((item) => item.key === key);
+    if (!key || !account || S.readonly) return;
+    const mode = $('accountEgressDialog').dataset.mode === 'manual' ? 'manual' : 'auto';
+    const node = $('accountEgressNode').value;
+    if (mode === 'manual' && !node) {
+      $('accountEgressError').textContent = '请选择节点';
+      return;
+    }
+    const save = $('accountEgressSave');
+    accountEgressSaving = true;
+    save.textContent = '保存中…';
+    setAccountEgressMode(mode);
+    $('accountEgressError').textContent = '';
+    let succeeded = false;
+    try {
+      const r = await api('/accounts/' + encodeURIComponent(key), {
+        method: 'PATCH',
+        body: JSON.stringify({ egressMode: mode, egressNode: mode === 'manual' ? node : '' }),
+      });
+      const saved = r?.account || r?.user || r;
+      account.egressMode = saved?.egressMode === 'manual' ? 'manual' : saved?.egressMode === 'auto' ? 'auto' : mode;
+      account.egressNode = String(saved?.egressNode ?? (mode === 'manual' ? node : ''));
+      if (r?.egress && typeof r.egress === 'object') S.accountEgress[key] = r.egress;
+      else if (saved?.egress && typeof saved.egress === 'object') S.accountEgress[key] = saved.egress;
+      for (const field of ['egressCurrentNode', 'egressState', 'egressError']) {
+        if (saved && Object.hasOwn(saved, field)) account[field] = saved[field];
+      }
+      renderAccounts();
+      succeeded = true;
+      toast('出站节点已保存', 'ok');
+    } catch (error) {
+      $('accountEgressError').textContent = error.message;
+    } finally {
+      accountEgressSaving = false;
+      save.textContent = '保存';
+      setAccountEgressMode(mode);
+      if (succeeded) {
+        $('accountEgressDialog').close();
+        accountEgressEditing = null;
+        refresh();
+      }
+    }
+  });
 
   // 接入地址:各协议复制自己的 base URL
   for (const btn of document.querySelectorAll('[data-copy-proto]')) {

@@ -21,6 +21,18 @@ import {
   isProxyEnvLocked,
   mihomo,
   noteEgressReject,
+  ACCOUNT_EGRESS_LANE_COUNT,
+  setAccountProxyNode,
+  selectAccountProxyNodeAuto,
+  releaseAccountProxyLane,
+  getAccountUpstreamFetch,
+  getAccountAutoUpstreamFetch,
+  getAccountProxyNode,
+  getAccountProxyGeneration,
+  isAccountAutoEgressReady,
+  getAccountEgressReject,
+  inferNodeRegion,
+  accountProbeSupportsDeepseekV4Pro,
 } from './server/proxy.mjs';
 import { createUsagePersistence } from './server/usage-persistence.mjs';
 import { createApiKeyStore, OWNER_KEY_NAME } from './server/api-keys.mjs';
@@ -115,13 +127,13 @@ function loadAccounts() {
     const raw = readFileSync(CFG.credFile, 'utf-8');
     const obj = JSON.parse(raw);
     if (!obj || typeof obj !== 'object') return { accounts: {} };
-    if (obj.accounts && typeof obj.accounts === 'object') return migrateAccountKeys(obj);
+    if (obj.accounts && typeof obj.accounts === 'object') return migrateAccountEgress(migrateAccountKeys(obj));
     // 兼容单账号顶层格式 {authToken, email, id, name}
     if (obj.authToken) {
       const key = accountKey(obj);
       const converted = { accounts: { [key]: { ...obj, id: obj.id || key } } };
       try { if (!CFG.readonlyAccounts) saveAccounts(converted); } catch (e) { console.error('[server] migrate credentials failed:', e.message); }
-      return converted;
+      return migrateAccountEgress(converted);
     }
     return { accounts: {} };
   } catch (e) {
@@ -141,6 +153,7 @@ function opaqueAccountKey(seed = '') {
 
 function migrateAccountKeys(obj) {
   const accounts = {};
+  const tokenOwners = new Map();
   let changed = false;
   for (const [rawKey, rawUser] of Object.entries(obj.accounts || {})) {
     const key = String(rawKey);
@@ -153,7 +166,17 @@ function migrateAccountKeys(obj) {
       if (!user.id || user.id === key || String(user.id).startsWith('token-')) user.id = nextKey;
       changed = true;
     }
+    const token = String(user.authToken || '').trim();
+    if (token !== String(user.authToken || '')) changed = true;
+    if (token) user.authToken = token;
+    else if (Object.hasOwn(user, 'authToken')) user.authToken = '';
+    if (token && tokenOwners.has(token)) {
+      changed = true;
+      console.warn('[server] credentials migration removed a duplicate account token');
+      continue;
+    }
     accounts[nextKey] = user;
+    if (token) tokenOwners.set(token, nextKey);
   }
   if (!changed) return obj;
   const migrated = { ...obj, accounts };
@@ -162,6 +185,57 @@ function migrateAccountKeys(obj) {
   } catch (e) {
     // Read-only or temporarily unwritable stores still get the in-memory opaque DTO.
     console.error('[server] migrate credentials failed:', e.message);
+  }
+  return migrated;
+}
+
+function nextAccountEgressLane(accounts, excludedKey = '') {
+  const used = new Set();
+  for (const [key, user] of Object.entries(accounts || {})) {
+    if (key === excludedKey) continue;
+    const lane = Number(user?.egressLane);
+    if (Number.isInteger(lane) && lane >= 0 && lane < ACCOUNT_EGRESS_LANE_COUNT) used.add(lane);
+  }
+  for (let lane = 0; lane < ACCOUNT_EGRESS_LANE_COUNT; lane++) if (!used.has(lane)) return lane;
+  return null;
+}
+
+function migrateAccountEgress(obj) {
+  const accounts = {};
+  const claimed = new Set();
+  let changed = false;
+  for (const [key, rawUser] of Object.entries(obj.accounts || {})) {
+    const user = rawUser && typeof rawUser === 'object' ? { ...rawUser } : {};
+    const mode = user.egressMode === 'manual' ? 'manual' : 'auto';
+    const node = String(user.egressNode || '').trim();
+    const lane = Number(user.egressLane);
+    if (mode !== user.egressMode || node !== user.egressNode) changed = true;
+    user.egressMode = mode;
+    user.egressNode = node;
+    if (Number.isInteger(lane) && lane >= 0 && lane < ACCOUNT_EGRESS_LANE_COUNT && !claimed.has(lane)) {
+      user.egressLane = lane;
+      claimed.add(lane);
+    } else {
+      user.egressLane = null;
+      changed = true;
+    }
+    accounts[key] = user;
+  }
+  for (const user of Object.values(accounts)) {
+    if (user.egressLane !== null) continue;
+    let lane = 0;
+    while (claimed.has(lane) && lane < ACCOUNT_EGRESS_LANE_COUNT) lane++;
+    if (lane >= ACCOUNT_EGRESS_LANE_COUNT) continue;
+    user.egressLane = lane;
+    claimed.add(lane);
+  }
+  const migrated = { ...obj, accounts };
+  if (changed) {
+    try {
+      if (!CFG.readonlyAccounts) saveAccounts(migrated);
+    } catch (e) {
+      console.error('[server] migrate account egress failed:', e.message);
+    }
   }
   return migrated;
 }
@@ -199,12 +273,15 @@ function listAccounts() {
     token: u.authToken || '',
     tokenShort: (u.authToken || '').slice(0, 8) + '...',
     fingerprintId: u.fingerprintId || '',
+    egressMode: u.egressMode === 'manual' ? 'manual' : 'auto',
+    egressNode: String(u.egressNode || ''),
+    egressLane: Number.isInteger(u.egressLane) ? u.egressLane : null,
     hasToken: Boolean(u.authToken),
   }));
 }
 
 function publicAccountDto(account) {
-  const { token, tokenShort, ...publicAccount } = account;
+  const { token, tokenShort, egressLane, ...publicAccount } = account;
   return publicAccount;
 }
 
@@ -301,7 +378,7 @@ function enqueueUp(fn) {
   return run;
 }
 
-async function upstreamJson(method, path, token, body, extraHeaders = {}, timeoutMs = 15000) {
+async function upstreamJson(method, path, token, body, extraHeaders = {}, timeoutMs = 15000, fetchOverride = null) {
   const headers = {};
   if (token) headers.Authorization = `Bearer ${token}`;
   if (body !== undefined) headers['Content-Type'] = 'application/json';
@@ -309,7 +386,7 @@ async function upstreamJson(method, path, token, body, extraHeaders = {}, timeou
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   // 走代理（配了订阅时）或直连：getUpstreamFetch() 无代理返回 null → 用全局 fetch
-  const upstreamFetch = getUpstreamFetch() || fetch;
+  const upstreamFetch = fetchOverride || getUpstreamFetch() || fetch;
   try {
     const resp = await upstreamFetch(CFG.codebuffApi + path, {
       method, headers, body: body !== undefined ? JSON.stringify(body) : undefined, signal: ctrl.signal,
@@ -319,14 +396,15 @@ async function upstreamJson(method, path, token, body, extraHeaders = {}, timeou
     try { data = text ? JSON.parse(text) : null; } catch { data = text; }
     return { status: resp.status, data, text, headers: resp.headers };
   } catch (e) {
+    if (e?.code === 'ACCOUNT_EGRESS_UNAVAILABLE') throw e;
     return { status: 0, data: null, text: String(e.message || e) };
   } finally {
     clearTimeout(timer);
   }
 }
 
-function enqueueUpstream(method, path, token, body, extraHeaders, timeoutMs) {
-  return enqueueUp(() => upstreamJson(method, path, token, body, extraHeaders, timeoutMs));
+function enqueueUpstream(method, path, token, body, extraHeaders, timeoutMs, fetchOverride = null) {
+  return enqueueUp(() => upstreamJson(method, path, token, body, extraHeaders, timeoutMs, fetchOverride));
 }
 
 function findProbeState(value, depth = 0) {
@@ -357,9 +435,9 @@ function findProbeState(value, depth = 0) {
 
 // 账号健康探测：GET /api/v1/freebuff/session（0 消耗，不创建 session）
 // 判定规则与 extract_freebuff.py _check_one 一致
-async function probeAccount(token) {
+async function probeAccount(token, { upstreamFetch = null, updateIsolation = true } = {}) {
   const r = await enqueueUpstream('GET', '/api/v1/freebuff/session', token, undefined,
-    { 'x-freebuff-include-unused-rate-limits': '1' });
+    { 'x-freebuff-include-unused-rate-limits': '1' }, undefined, upstreamFetch);
   const data = r.data && typeof r.data === 'object' ? r.data : {};
   let state = 'unknown', label = '未知', quota = null, retryAfterMs = null;
   const fmtQuota = () => {
@@ -407,12 +485,14 @@ async function probeAccount(token) {
   };
   // 只有管理员主动探测得到明确存活结果时才清除持久隔离；业务成功响应
   // 不自动清除，避免上游短暂异常造成封禁状态抖动。
-  const existingState = accountStateStore.snapshot([token])[token] || null;
-  if (result.state === 'ok') accountStateStore.clear(token);
-  else if (result.state === 'banned' && existingState?.state !== 'banned') {
-    accountStateStore.set(token, { state: 'banned', until: null, reason: 'upstream_banned' });
-  } else if (result.state === 'token_invalid' && existingState?.state !== 'token_invalid') {
-    accountStateStore.set(token, { state: 'token_invalid', until: null, reason: 'upstream_auth_rejected' });
+  if (updateIsolation) {
+    const existingState = accountStateStore.snapshot([token])[token] || null;
+    if (result.state === 'ok') accountStateStore.clear(token);
+    else if (result.state === 'banned' && existingState?.state !== 'banned') {
+      accountStateStore.set(token, { state: 'banned', until: null, reason: 'upstream_banned' });
+    } else if (result.state === 'token_invalid' && existingState?.state !== 'token_invalid') {
+      accountStateStore.set(token, { state: 'token_invalid', until: null, reason: 'upstream_auth_rejected' });
+    }
   }
   // 官方 banned 没有恢复时间；永久隔离只由管理员成功探测或 clear 解除。
   const isolation = accountStateStore.snapshot([token])[token];
@@ -422,6 +502,260 @@ async function probeAccount(token) {
       && ['banned', 'token_invalid', 'manual_disabled'].includes(isolation.state),
   );
   return result;
+}
+
+const accountEgressTasks = new Map();
+const accountEgressMutations = new Map();
+
+function beginAccountEgressMutation(key) {
+  accountEgressMutations.set(key, (accountEgressMutations.get(key) || 0) + 1);
+}
+
+function endAccountEgressMutation(key) {
+  const remaining = (accountEgressMutations.get(key) || 0) - 1;
+  if (remaining > 0) accountEgressMutations.set(key, remaining);
+  else accountEgressMutations.delete(key);
+}
+
+function accountEgressMutationActive(key) {
+  return accountEgressMutations.has(key);
+}
+
+const managedAccountTokenHistory = new Set();
+
+function accountEgressIdentity(account) {
+  const token = String(account?.token || account?.authToken || '').trim();
+  return token ? crypto.createHash('sha256').update(token).digest('hex') : '';
+}
+
+function accountEgressTaskKey(account) {
+  return `${String(account?.key || '')}\0${accountEgressIdentity(account)}`;
+}
+
+function accountEgressTaskActive(account) {
+  return accountEgressTasks.has(accountEgressTaskKey(account));
+}
+
+function cancelAccountEgressTasks(accountKey) {
+  const prefix = `${String(accountKey || '')}\0`;
+  for (const [key, record] of accountEgressTasks) {
+    if (!key.startsWith(prefix)) continue;
+    record.cancelled = true;
+    accountEgressTasks.delete(key);
+  }
+}
+
+function accountByToken(token) {
+  const wanted = String(token || '').trim();
+  let found = null;
+  for (const account of listAccounts()) {
+    if (account.token.trim() === wanted) found = account;
+  }
+  return found;
+}
+
+function accountByKey(key) {
+  return listAccounts().find((account) => account.key === key) || null;
+}
+
+function accountEgressUnavailableFetch() {
+  const error = new Error('账号出站节点尚未就绪');
+  error.code = 'ACCOUNT_EGRESS_UNAVAILABLE';
+  return Promise.reject(error);
+}
+
+function resolveAccountUpstreamRoute(token) {
+  const wanted = String(token || '').trim();
+  if (!wanted) return null;
+  const account = accountByToken(wanted);
+  if (account) {
+    managedAccountTokenHistory.add(wanted);
+    return accountEgressFetch(account, { withRoute: true });
+  }
+  const envTokens = (env.FREEBUFF_TOKEN || '').split(/[\n,]/).map((value) => value.trim()).filter(Boolean);
+  if (envTokens.includes(wanted)) return null;
+  return managedAccountTokenHistory.has(wanted) ? accountEgressUnavailableFetch : null;
+}
+
+function accountEgressFetch(account, { schedule = true, withRoute = false } = {}) {
+  if (!account) return null;
+  const route = (selectedFetch) => {
+    if (!withRoute) return selectedFetch;
+    return {
+      fetch: selectedFetch,
+      egress: {
+        lane: account.egressLane,
+        node: getAccountProxyNode(account.egressLane),
+        generation: getAccountProxyGeneration(account.egressLane),
+      },
+    };
+  };
+  if (!getConfiguredSubscription()) return route(accountEgressUnavailableFetch);
+  const identity = accountEgressIdentity(account);
+  const fetchForLane = getAccountUpstreamFetch(account.egressLane, { identity });
+  if (account.egressMode === 'manual') {
+    const ready = Boolean(fetchForLane && account.egressNode
+      && getAccountProxyNode(account.egressLane) === account.egressNode);
+    if (ready) return route(fetchForLane);
+  } else {
+    const freshFetch = getAccountAutoUpstreamFetch(account.egressLane, { identity });
+    if (freshFetch) return route(freshFetch);
+    const staleFetch = getAccountAutoUpstreamFetch(account.egressLane, { allowStale: true, identity });
+    if (staleFetch) {
+      if (schedule) scheduleAccountEgress(account, { force: false });
+      return route(staleFetch);
+    }
+  }
+  if (schedule) scheduleAccountEgress(account, { force: false });
+  return route(accountEgressUnavailableFetch);
+}
+
+function accountEgressStatus(account) {
+  const currentNode = Number.isInteger(account?.egressLane)
+    ? getAccountProxyNode(account.egressLane) || null : null;
+  const reject = Number.isInteger(account?.egressLane)
+    ? getAccountEgressReject(account.egressLane) : null;
+  const identity = accountEgressIdentity(account);
+  const fetchForLane = Number.isInteger(account?.egressLane)
+    ? getAccountUpstreamFetch(account.egressLane, { identity }) : null;
+  const verified = account?.egressMode === 'manual'
+    ? Boolean(fetchForLane && currentNode && currentNode === account.egressNode)
+    : Boolean(fetchForLane && isAccountAutoEgressReady(account?.egressLane, '', identity));
+  let state = 'unavailable';
+  let error = null;
+  if (!getConfiguredSubscription()) {
+    state = 'proxy_offline';
+    error = '尚未配置出口代理订阅';
+  } else if (!Number.isInteger(account?.egressLane)) {
+    state = 'unavailable';
+    error = `账号出站通道已满（最多 ${ACCOUNT_EGRESS_LANE_COUNT} 个账号）`;
+  } else if (accountEgressTaskActive(account)) {
+    state = 'probing';
+  } else if (reject) {
+    state = 'rejected';
+    error = `节点被上游拒绝（${reject.state || 'blocked'}）`;
+  } else if (verified) {
+    state = 'ready';
+  } else if (account.egressMode === 'manual' && !account.egressNode) {
+    error = '尚未选择手动节点';
+  } else {
+    error = account.egressMode === 'auto'
+      ? '尚未找到可访问 deepseek/deepseek-v4-pro 的 US/SG 节点'
+      : '手动节点尚未就绪';
+  }
+  return {
+    state,
+    currentNode,
+    region: inferNodeRegion(currentNode),
+    verified,
+    reject,
+    error,
+  };
+}
+
+async function configureAccountEgress(account, {
+  mode = account?.egressMode,
+  node = account?.egressNode,
+  force = false,
+  persist = true,
+} = {}) {
+  if (!account || !account.hasToken) throw Object.assign(new Error('账号不存在'), { code: 'ACCOUNT_NOT_FOUND' });
+  if (!Number.isInteger(account.egressLane)) {
+    throw Object.assign(new Error(`账号出站通道已满（最多 ${ACCOUNT_EGRESS_LANE_COUNT} 个账号）`), { code: 'ACCOUNT_LANE_EXHAUSTED' });
+  }
+  const normalizedMode = mode === 'manual' ? 'manual' : mode === 'auto' ? 'auto' : '';
+  if (!normalizedMode) throw new Error('节点模式必须是 auto 或 manual');
+
+  let selected;
+  const expectedIdentity = accountEgressIdentity(account);
+  if (normalizedMode === 'manual') {
+    const selectedNode = String(node || '').trim();
+    if (!selectedNode) throw new Error('手动模式必须选择节点');
+    selected = await setAccountProxyNode({ lane: account.egressLane, node: selectedNode, identity: expectedIdentity });
+  } else {
+    selected = await selectAccountProxyNodeAuto({
+      lane: account.egressLane,
+      identity: expectedIdentity,
+      force,
+      verify: async ({ fetch: fetchForLane }) => {
+        const probe = await probeAccount(account.token, { upstreamFetch: fetchForLane, updateIsolation: false });
+        return accountProbeSupportsDeepseekV4Pro(probe);
+      },
+    });
+  }
+
+  if (persist) {
+    const obj = loadAccounts();
+    const stored = obj.accounts?.[account.key];
+    if (!stored) throw Object.assign(new Error('账号不存在'), { code: 'ACCOUNT_NOT_FOUND' });
+    if (accountEgressIdentity(stored) !== expectedIdentity || stored.egressLane !== account.egressLane) {
+      throw Object.assign(new Error('账号凭据或出站通道已变更'), { code: 'ACCOUNT_CHANGED' });
+    }
+    stored.egressMode = normalizedMode;
+    // egressNode 只保存手动选择；自动模式的实时节点属于运行态，见 egress.currentNode。
+    stored.egressNode = normalizedMode === 'manual' ? selected.node : '';
+    saveAccounts(obj);
+  }
+  return { mode: normalizedMode, node: selected.node, cached: Boolean(selected.cached) };
+}
+
+function scheduleAccountEgress(account, { force = false } = {}) {
+  if (!account || !getConfiguredSubscription() || accountEgressMutationActive(account.key)) return null;
+  const identity = accountEgressIdentity(account);
+  const taskKey = accountEgressTaskKey(account);
+  const existing = accountEgressTasks.get(taskKey);
+  if (existing) {
+    if (force) existing.pendingForce = true;
+    return existing.task;
+  }
+  const record = { task: null, pendingForce: Boolean(force), cancelled: false };
+  record.task = (async () => {
+    do {
+      const runForce = record.pendingForce;
+      record.pendingForce = false;
+      if (record.cancelled) return null;
+      const current = accountByKey(account.key);
+      if (!current || accountEgressIdentity(current) !== identity || accountEgressMutationActive(account.key)) return null;
+      try {
+        await configureAccountEgress(current, { force: runForce, persist: false });
+      } catch (error) {
+        console.error(`[server] 账号 ${account.key} 出站配置失败: ${String(error?.message || error).slice(0, 180)}`);
+      }
+    } while (!record.cancelled && record.pendingForce);
+    return null;
+  })().finally(() => {
+    if (accountEgressTasks.get(taskKey) === record) accountEgressTasks.delete(taskKey);
+  });
+  accountEgressTasks.set(taskKey, record);
+  return record.task;
+}
+
+async function initializeAccountEgress() {
+  if (!getConfiguredSubscription()) return;
+  for (const account of listAccounts()) {
+    if (!account.hasToken || !Number.isInteger(account.egressLane)) continue;
+    try {
+      await scheduleAccountEgress(account);
+    } catch (error) {
+      console.error(`[server] 账号 ${account.key} 出站初始化失败: ${String(error?.message || error).slice(0, 180)}`);
+    }
+  }
+}
+
+function handleEgressReject(info = {}) {
+  const account = info.token ? accountByToken(info.token) : null;
+  if (Number.isInteger(info.lane)) {
+    if (!account || account.egressLane !== info.lane) return;
+    noteEgressReject(info);
+    if (account?.egressMode === 'auto') scheduleAccountEgress(account, { force: true });
+    return;
+  }
+  if (!account || !Number.isInteger(account.egressLane)) {
+    noteEgressReject(info);
+    return;
+  }
+  noteEgressReject({ ...info, lane: account.egressLane });
+  if (account.egressMode === 'auto') scheduleAccountEgress(account, { force: true });
 }
 
 // === Freebuff 授权码登录（OAuth 代理） ===
@@ -542,6 +876,23 @@ function proxyApiError(res, error) {
   return err(res, 503, '代理暂不可用，请稍后重试', 'proxy_unavailable');
 }
 
+function accountEgressApiError(res, error) {
+  const code = String(error?.code || '');
+  const raw = String(error?.message || '账号出站配置失败');
+  if (code === 'ACCOUNT_NOT_FOUND') return err(res, 404, '账号不存在', 'not_found');
+  if (code === 'ACCOUNT_CHANGED') return err(res, 409, '账号配置已变更，请刷新后重试', 'account_changed');
+  if (code === 'ACCOUNT_LANE_EXHAUSTED') return err(res, 409, raw, 'egress_capacity');
+  if (code === 'ACCOUNT_EGRESS_SUPERSEDED') return err(res, 409, '账号出站配置已被更新的操作取代', 'account_changed');
+  if (code === 'ACCOUNT_EGRESS_UNAVAILABLE') return err(res, 503, raw, 'egress_unavailable');
+  if (/mihomo 未运行|内核未运行/i.test(raw)) {
+    return err(res, 409, 'mihomo 尚未运行，请先配置并刷新订阅', 'proxy_not_ready');
+  }
+  if (/节点模式必须|手动模式必须|节点不存在|lane 必须/i.test(raw)) {
+    return err(res, 400, raw.slice(0, 180), 'invalid_egress_config');
+  }
+  return err(res, 503, '账号出站配置暂不可用，请稍后重试', 'egress_unavailable');
+}
+
 async function readJsonObject(req) {
   let body;
   try {
@@ -558,6 +909,9 @@ async function readJsonObject(req) {
 // worker.js 读取的 env（含动态账号池 → FREEBUFF_TOKEN）
 function buildWorkerEnv() {
   const tokens = allTokens();
+  for (const account of listAccounts()) {
+    if (account.hasToken) managedAccountTokenHistory.add(account.token.trim());
+  }
   const envTokens = (env.FREEBUFF_TOKEN || '').split(/[\n,]/).map((s) => s.trim()).filter(Boolean);
   for (const t of envTokens) if (!tokens.includes(t)) tokens.push(t);
   const stateTokens = tokens.map((token) => {
@@ -580,8 +934,11 @@ function buildWorkerEnv() {
     FREEBUFF_ACCOUNT_LABELS: accountLabels(),
     // 出口代理注入（有订阅且 mihomo 就绪时返回走代理的 fetch；否则 undefined → worker 直连）
     FREEBUFF_UPSTREAM_FETCH: getUpstreamFetch() || undefined,
+    // 账号池里的 token 优先走自己的固定 lane；lane 验证/切换期间显式返回 503，
+    // 不能悄悄回落到全局 selector，否则两个账号会串用同一个出口。
+    FREEBUFF_UPSTREAM_FETCH_FOR_ACCOUNT: resolveAccountUpstreamRoute,
     // 上游拒绝出站 IP（地区封禁/IP 触顶/裸 403）时回调，由代理服务归因到当前节点并进面板。
-    FREEBUFF_ON_EGRESS_REJECT: noteEgressReject,
+    FREEBUFF_ON_EGRESS_REJECT: handleEgressReject,
     // worker 只拿当前账号的内存快照；落盘始终由 server 负责哈希 token。
     FREEBUFF_ACCOUNT_STATE: accountStateStore.snapshot(stateTokens),
     FREEBUFF_ACCOUNT_STATE_REVISION: accountStateStore.revision(),
@@ -649,6 +1006,7 @@ async function handleWebApi(req, res, url) {
     if (method === 'POST' && sub === 'refresh') {
       try {
         const proxy = await refreshSubscription();
+        if (proxy.ok) void initializeAccountEgress();
         return json(res, 200, { ok: proxy.ok, proxy });
       } catch (e) {
         return proxyApiError(res, e);
@@ -665,6 +1023,7 @@ async function handleWebApi(req, res, url) {
       try {
         const proxy = await setProxySubscription(value);
         CFG.subscriptionUrl = getConfiguredSubscription();
+        if (proxy.ok) void initializeAccountEgress();
         return json(res, 200, { ok: proxy.ok, proxy });
       } catch (e) {
         return proxyApiError(res, e);
@@ -726,11 +1085,25 @@ async function handleWebApi(req, res, url) {
     if (method === 'GET' && !sub) {
       const accounts = listAccounts();
       const health = {};
+      const egress = {};
       // 并发探测（受上游串行队列约束，内部自动排队）
       for (const acct of accounts) {
-        if (acct.hasToken) health[acct.key] = await probeAccount(acct.token);
+        if (!acct.hasToken) {
+          egress[acct.key] = accountEgressStatus(acct);
+          continue;
+        }
+        const upstreamFetch = accountEgressFetch(acct);
+        egress[acct.key] = accountEgressStatus(acct);
+        try {
+          health[acct.key] = await probeAccount(acct.token, {
+            upstreamFetch,
+          });
+        } catch (error) {
+          if (error?.code !== 'ACCOUNT_EGRESS_UNAVAILABLE') throw error;
+          health[acct.key] = { state: 'egress_unavailable', label: '出站节点尚未就绪' };
+        }
       }
-      return json(res, 200, { accounts: accounts.map(publicAccountDto), health, readonly: CFG.readonlyAccounts });
+      return json(res, 200, { accounts: accounts.map(publicAccountDto), health, egress, readonly: CFG.readonlyAccounts });
     }
     if (method === 'POST' && !sub) {
       if (CFG.readonlyAccounts) return err(res, 403, '账号池为只读模式', 'readonly');
@@ -744,25 +1117,74 @@ async function handleWebApi(req, res, url) {
       const key = existingAccountKey(obj, authToken)
         || accountKey({ id: body.id, email: email || undefined, authToken });
       const existing = obj.accounts[key] || {};
+      const egressLane = Number.isInteger(existing.egressLane)
+        ? existing.egressLane : nextAccountEgressLane(obj.accounts, key);
+      if (!Number.isInteger(egressLane)) {
+        return err(res, 409, `账号出站通道已满（最多 ${ACCOUNT_EGRESS_LANE_COUNT} 个账号）`, 'egress_capacity');
+      }
       obj.accounts[key] = {
+        ...(body.extra && typeof body.extra === 'object' ? body.extra : {}),
         id: body.id || existing.id || key,
         name: name || existing.name || '',
         email: email || existing.email || '',
         authToken,
         fingerprintId: body.fingerprintId || existing.fingerprintId || '',
-        ...(body.extra && typeof body.extra === 'object' ? body.extra : {}),
+        egressMode: existing.egressMode === 'manual' ? 'manual' : 'auto',
+        egressNode: String(existing.egressNode || ''),
+        egressLane,
       };
+      cancelAccountEgressTasks(key);
       saveAccounts(obj);
-      const probe = await probeAccount(authToken);
+      const account = accountByKey(key);
+      const upstreamFetch = accountEgressFetch(account);
+      const probe = upstreamFetch === accountEgressUnavailableFetch
+        ? { state: 'egress_unavailable', label: '出站节点尚未就绪' }
+        : await probeAccount(authToken, { upstreamFetch });
       return json(res, 200, { ok: true, key, probe });
+    }
+    if (method === 'PATCH' && sub) {
+      if (CFG.readonlyAccounts) return err(res, 403, '账号池为只读模式', 'readonly');
+      let body;
+      try { body = await readJsonObject(req); } catch (e) {
+        return err(res, 400, e.message, 'invalid_egress_config');
+      }
+      const key = decodeURIComponent(sub);
+      const account = accountByKey(key);
+      if (!account || !account.hasToken) return err(res, 404, '账号不存在', 'not_found');
+      const mode = body.egressMode;
+      const node = body.egressNode;
+      if (!['auto', 'manual'].includes(mode)) {
+        return err(res, 400, '节点模式必须是 auto 或 manual', 'invalid_egress_config');
+      }
+      if (mode === 'manual' && !String(node || '').trim()) {
+        return err(res, 400, '手动模式必须选择节点', 'invalid_egress_config');
+      }
+      beginAccountEgressMutation(key);
+      cancelAccountEgressTasks(key);
+      try {
+        await configureAccountEgress(account, { mode, node, force: mode === 'auto' });
+        const updated = accountByKey(key);
+        return json(res, 200, {
+          ok: true,
+          account: publicAccountDto(updated),
+          egress: accountEgressStatus(updated),
+        });
+      } catch (error) {
+        return accountEgressApiError(res, error);
+      } finally {
+        endAccountEgressMutation(key);
+      }
     }
     if (method === 'DELETE' && sub) {
       if (CFG.readonlyAccounts) return err(res, 403, '账号池为只读模式', 'readonly');
       const obj = loadAccounts();
       const key = decodeURIComponent(sub);
       if (!obj.accounts[key]) return err(res, 404, '账号不存在', 'not_found');
+      const lane = obj.accounts[key].egressLane;
       delete obj.accounts[key];
       saveAccounts(obj);
+      cancelAccountEgressTasks(key);
+      if (Number.isInteger(lane)) await releaseAccountProxyLane(lane);
       return json(res, 200, { ok: true });
     }
     if (method === 'GET' && sub) {
@@ -770,7 +1192,16 @@ async function handleWebApi(req, res, url) {
       const accounts = listAccounts();
       const acct = accounts.find((a) => a.key === decodeURIComponent(sub));
       if (!acct || !acct.hasToken) return err(res, 404, '账号不存在', 'not_found');
-      return json(res, 200, await probeAccount(acct.token));
+      try {
+        return json(res, 200, await probeAccount(acct.token, {
+          upstreamFetch: accountEgressFetch(acct),
+        }));
+      } catch (error) {
+        if (error?.code === 'ACCOUNT_EGRESS_UNAVAILABLE') {
+          return err(res, 503, '账号出站节点尚未就绪', 'egress_unavailable');
+        }
+        throw error;
+      }
     }
     return err(res, 405, 'method not allowed');
   }
@@ -853,15 +1284,27 @@ async function handleWebApi(req, res, url) {
         if (!CFG.readonlyAccounts) {
           const obj = loadAccounts();
           const user = rr.data.user;
-          const key = accountKey(user);
+          const key = existingAccountKey(obj, user.authToken) || accountKey(user);
+          const existing = obj.accounts[key] || {};
+          const egressLane = Number.isInteger(existing.egressLane)
+            ? existing.egressLane : nextAccountEgressLane(obj.accounts, key);
+          if (!Number.isInteger(egressLane)) {
+            job.done = false;
+            return err(res, 409, `账号出站通道已满（最多 ${ACCOUNT_EGRESS_LANE_COUNT} 个账号）`, 'egress_capacity');
+          }
           obj.accounts[key] = {
             id: user.id || key,
             name: user.name || '',
             email: user.email || '',
             authToken: user.authToken,
             fingerprintId,
+            egressMode: existing.egressMode === 'manual' ? 'manual' : 'auto',
+            egressNode: String(existing.egressNode || ''),
+            egressLane,
           };
+          cancelAccountEgressTasks(key);
           saveAccounts(obj);
+          scheduleAccountEgress(accountByKey(key));
         }
         return json(res, 200, { state: 'done', user: sanitizeUser(rr.data.user) });
       }
@@ -1064,6 +1507,7 @@ if (startupSubscription) {
     CFG.subscriptionUrl = getConfiguredSubscription();
     if (proxyFetch && proxyStatus.ok) {
       console.log(`[ciallo] proxy: mihomo @ mixed-port ${mihomo.mixedPort} (ctrl ${mihomo.ctrlPort})`);
+      void initializeAccountEgress();
     } else {
       console.error(`[ciallo] proxy 初始化失败(保持直连): ${proxyStatus.error || 'mihomo 未就绪'}`);
     }
@@ -1078,6 +1522,11 @@ if (startupSubscription) {
 // 加载 worker（顶层 await，Node 20+ 支持）
 const worker = await import('./worker.js');
 const handler = worker.default;
+handler.configureUpstreamRouting?.({
+  getUpstreamFetch,
+  resolveAccountFetch: resolveAccountUpstreamRoute,
+  onReject: handleEgressReject,
+});
 
 // 概况统计持久化：开关与累计文件在数据目录。默认关闭；损坏/缺失回退空统计。
 // store 只在 server 侧持有；worker 通过注入的适配器在每次 recordRequest 后触发 save。

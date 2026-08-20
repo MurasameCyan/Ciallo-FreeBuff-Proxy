@@ -10,7 +10,7 @@ import { createAccountStateStore } from '../server/account-state.mjs';
 const workerSource = readFileSync(new URL('../worker.js', import.meta.url), 'utf8');
 const workerWrapper = workerSource.replace('export default {', 'const __workerDefault__ = {')
   + '\n\nglobalThis.__workerDefault__ = __workerDefault__;\n'
-  + 'globalThis.__accountSafetyTestApi__ = { pickToken, pickTokenWithSessionWait, sessionLeaseWaitMs, releaseToken, recordAccountObservation, cooldown, parseCooldown, accountPoolExhaustion, classifyRateLimit, quotaScopeForModel, freshQuotaProbe, startRun, executeChat, executeCodeReview, createSession, clientStatsSnapshot, recordRequest, usageSnapshot, restoreUsageSnapshot, restoreKeyUsageSnapshot };\n';
+  + 'globalThis.__accountSafetyTestApi__ = { pickToken, pickTokenWithSessionWait, sessionLeaseWaitMs, releaseToken, recordAccountObservation, cooldown, parseCooldown, accountPoolExhaustion, classifyRateLimit, quotaScopeForModel, freshQuotaProbe, startRun, executeChat, executeCodeReview, createSession, clientStatsSnapshot, recordRequest, usageSnapshot, restoreUsageSnapshot, restoreKeyUsageSnapshot, authenticatedUpstreamFetch };\n';
 
 const TOKEN = 'permanent-banned-account-token-123456';
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -82,6 +82,128 @@ function envFor(store, token = TOKEN) {
 function releaseIfSelected(vmInstance, selected) {
   if (selected) vmInstance.api.releaseToken(selected.token);
 }
+
+test('上游 fetch 按账号 token 选择独立出站', async () => {
+  const workerVm = createWorkerVm();
+  const routed = [];
+  const env = {
+    FREEBUFF_TOKEN: 'token-a-12345678901234567890,token-b-12345678901234567890',
+    FREEBUFF_UPSTREAM_FETCH_FOR_ACCOUNT(token) {
+      return async (url) => {
+        routed.push({ token, url: String(url) });
+        return new Response(token, { status: 200 });
+      };
+    },
+  };
+  await workerVm.worker.fetch(new Request('http://local/healthz'), env);
+  const a = await workerVm.api.authenticatedUpstreamFetch('token-a-12345678901234567890', 'https://upstream.test/a');
+  const b = await workerVm.api.authenticatedUpstreamFetch('token-b-12345678901234567890', 'https://upstream.test/b');
+  assert.equal(await a.text(), 'token-a-12345678901234567890');
+  assert.equal(await b.text(), 'token-b-12345678901234567890');
+  assert.deepEqual(routed.map((entry) => entry.token), [
+    'token-a-12345678901234567890',
+    'token-b-12345678901234567890',
+  ]);
+});
+
+test('服务端固定账号路由器不被另一个并发请求的 env 覆盖', async () => {
+  const workerVm = createWorkerVm();
+  const token = 'stable-managed-route-token-1234567890';
+  const routed = [];
+  workerVm.worker.configureUpstreamRouting({
+    getUpstreamFetch: () => async () => new Response('configured-global', { status: 200 }),
+    resolveAccountFetch(accountToken) {
+      return async () => {
+        routed.push(accountToken);
+        return new Response('configured-account', { status: 200 });
+      };
+    },
+  });
+
+  await workerVm.worker.fetch(new Request('http://local/healthz'), {
+    FREEBUFF_TOKEN: token,
+    FREEBUFF_UPSTREAM_FETCH: async () => new Response('request-global', { status: 200 }),
+    FREEBUFF_UPSTREAM_FETCH_FOR_ACCOUNT: () => async () => new Response('request-account', { status: 200 }),
+  });
+  const response = await workerVm.api.authenticatedUpstreamFetch(token, 'https://upstream.test/stable');
+  assert.equal(await response.text(), 'configured-account');
+  assert.deepEqual(routed, [token]);
+});
+
+test('移除代理注入后全局上游 fetch 回落直连', async () => {
+  const workerVm = createWorkerVm({
+    fetchImpl: async () => new Response('direct', { status: 200 }),
+  });
+  const proxyFetch = async () => new Response('proxy', { status: 200 });
+  await workerVm.worker.fetch(new Request('http://local/healthz'), {
+    FREEBUFF_UPSTREAM_FETCH: proxyFetch,
+  });
+  assert.equal(await (await workerVm.api.authenticatedUpstreamFetch('', 'https://upstream.test/proxy')).text(), 'proxy');
+
+  await workerVm.worker.fetch(new Request('http://local/healthz'), {});
+  assert.equal(await (await workerVm.api.authenticatedUpstreamFetch('', 'https://upstream.test/direct')).text(), 'direct');
+  assert.equal(workerVm.upstreamCalls.at(-1).url, 'https://upstream.test/direct');
+});
+
+test('出站拒绝回调携带账号 token 供服务端归因 lane', async () => {
+  const workerVm = createWorkerVm();
+  const rejects = [];
+  const token = 'egress-reject-token-123456789012345';
+  await workerVm.worker.fetch(new Request('http://local/healthz'), {
+    FREEBUFF_TOKEN: token,
+    FREEBUFF_ON_EGRESS_REJECT: (info) => rejects.push(info),
+  });
+  workerVm.api.recordAccountObservation(token, 403, {});
+  assert.equal(rejects.length, 1);
+  assert.equal(rejects[0].token, token);
+  assert.equal(rejects[0].state, 'blocked');
+});
+
+test('出站拒绝回调携带请求开始时的节点代际，切换后不误伤新节点', async () => {
+  const workerVm = createWorkerVm();
+  const rejects = [];
+  const token = 'egress-generation-token-123456789012345';
+  await workerVm.worker.fetch(new Request('http://local/healthz'), {
+    FREEBUFF_TOKEN: token,
+    FREEBUFF_UPSTREAM_FETCH_FOR_ACCOUNT() {
+      return {
+        fetch: async () => new Response('{}', { status: 403 }),
+        egress: { lane: 2, node: 'US-A', generation: 7 },
+      };
+    },
+    FREEBUFF_ON_EGRESS_REJECT: (info) => rejects.push(info),
+  });
+  const response = await workerVm.api.authenticatedUpstreamFetch(token, 'https://upstream.test/rejected');
+  workerVm.api.recordAccountObservation(token, response.status, {}, { headers: response.headers });
+  assert.deepEqual(rejects.map(({ token: seenToken, state, status, lane, node, generation }) => ({
+    token: seenToken, state, status, lane, node, generation,
+  })), [{ token, state: 'blocked', status: 403, lane: 2, node: 'US-A', generation: 7 }]);
+});
+
+test('一个账号出站不可用不会污染另一账号的独立 fetch', async () => {
+  const workerVm = createWorkerVm();
+  const badToken = 'bad-egress-account-token-1234567890';
+  const goodToken = 'good-egress-account-token-123456789';
+  await workerVm.worker.fetch(new Request('http://local/healthz'), {
+    FREEBUFF_TOKEN: `${badToken},${goodToken}`,
+    FREEBUFF_UPSTREAM_FETCH_FOR_ACCOUNT(token) {
+      if (token === badToken) return async () => {
+        const error = new Error('account lane is unavailable');
+        error.code = 'ACCOUNT_EGRESS_UNAVAILABLE';
+        throw error;
+      };
+      if (token === goodToken) return async () => new Response('good', { status: 200 });
+      return null;
+    },
+  });
+
+  await assert.rejects(
+    () => workerVm.api.authenticatedUpstreamFetch(badToken, 'https://upstream.test/bad'),
+    (error) => error?.name === 'EgressRejectedError' && error?.state === 'egress_unavailable',
+  );
+  const response = await workerVm.api.authenticatedUpstreamFetch(goodToken, 'https://upstream.test/good');
+  assert.equal(await response.text(), 'good');
+});
 
 test('外部旧 banned snapshot 在 worker 同步时提升为永久隔离', () => {
   const start = Date.UTC(2030, 0, 1);

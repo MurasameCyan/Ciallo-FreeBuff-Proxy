@@ -717,6 +717,32 @@ t('关键配置项齐全', () => {
     if (!y.includes(needle)) throw new Error('缺 ' + needle);
   }
 });
+t('账号出站生成独立 selector 与 mixed listener', () => {
+  const y = buildMihomoYaml('https://sub.example.com/sub');
+  for (const [lane, port] of [[0, 17900], [1, 17901], [63, 17963]]) {
+    if (!y.includes(`name: freebuff-account-${lane}`)) throw new Error(`缺账号 selector lane ${lane}`);
+    if (!y.includes(`name: freebuff-account-in-${lane}`)) throw new Error(`缺账号 listener lane ${lane}`);
+    if (!y.includes(`port: ${port}`)) throw new Error(`缺账号 listener 端口 ${port}`);
+    if (!y.includes(`proxy: freebuff-account-${lane}`)) throw new Error(`lane ${lane} 没有钉到自己的 selector`);
+  }
+  const groups = y.match(/name: freebuff-account-\d+/g) || [];
+  const listeners = y.match(/name: freebuff-account-in-\d+/g) || [];
+  if (groups.length !== 64 || listeners.length !== 64) {
+    throw new Error(`账号 lane 数量错误: groups=${groups.length}, listeners=${listeners.length}`);
+  }
+  for (const needle of [
+    'name: freebuff-account-probe',
+    'name: freebuff-account-probe-in',
+    'port: 17964',
+    'proxy: freebuff-account-probe',
+  ]) {
+    if (!y.includes(needle)) throw new Error('缺隔离 probe 配置: ' + needle);
+  }
+  const localListeners = y.match(/listen: 127\.0\.0\.1/g) || [];
+  if (localListeners.length !== 65) {
+    throw new Error(`账号与 probe listener 必须全部仅监听本机: ${localListeners.length}/65`);
+  }
+});
 t('空订阅抛错', () => {
   let threw = false;
   try { buildMihomoYaml(''); } catch { threw = true; }

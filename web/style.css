@@ -383,7 +383,7 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
   overflow-wrap: anywhere;
 }
 .tbl .empty { color: var(--fg-2); font-size: 13px; padding: 24px 12px; text-align: center; }
-.account-table { min-width: 680px; }
+.account-table { min-width: 780px; }
 /* 模型映射表:不再硬撑 620px。容器只有 ~560,硬撑就把「操作」列顶出可视区(滚动条
    在这张卡里是隐藏的,看起来就是删除按钮被切掉一半)。 */
 .alias-table { min-width: 0; }
@@ -392,10 +392,11 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
 .alias-table th:first-child { width: 1%; white-space: nowrap; }
 .alias-table .action-col { width: 1%; white-space: nowrap; }
 .alias-table tbody td:first-child { white-space: nowrap; }
-/* 账号 / 状态 / 操作三列都按内容收窄(width:1% 让表格算法退到最小内容宽),腾出来的
+/* 账号 / 状态 / 出站节点 / 操作列都按内容收窄(width:1% 让表格算法退到最小内容宽),腾出来的
    宽度全归「可用模型」——那列条目多且模型 id 长,横向折行才摆得开 */
 .account-table thead th:first-child { width: 1%; white-space: nowrap; }
 .account-table thead th:nth-child(2) { width: 1%; white-space: nowrap; }
+.account-table thead th:nth-child(3) { width: 1%; white-space: nowrap; }
 .account-table thead th:last-child { width: 1%; white-space: nowrap; }
 .account-table tbody td:first-child { white-space: nowrap; }
 /* 空态行是整行 colspan 的长句子,不能被上面两条 nowrap 拖成一行(那句提示比表格还宽,
@@ -431,6 +432,18 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
 .mask-toggle:hover { background: var(--line); color: var(--fg); }
 .mask-toggle[aria-pressed="true"] { color: var(--fg); }
 .mask-toggle svg { pointer-events: none; }
+
+.account-egress-summary {
+  display: grid; gap: 2px; min-width: 92px; max-width: 150px;
+  line-height: 1.25;
+}
+.account-egress-mode-label { font-size: 11px; color: var(--fg); }
+.account-egress-node {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.account-egress-summary.ready .account-egress-mode-label { color: var(--mint); }
+.account-egress-summary.pending .account-egress-mode-label { color: var(--amber); }
+.account-egress-summary.error .account-egress-mode-label { color: var(--rose); }
 
 /* 状态灯 */
 .pill {
@@ -895,6 +908,26 @@ select:disabled { opacity: .5; cursor: not-allowed; }
 }
 .modal-actions { display: flex; gap: 9px; justify-content: flex-end; margin-top: 3px; }
 
+.account-egress-modal { width: min(440px, calc(100vw - 32px)); }
+.account-egress-modal .modal-box { width: min(100%, 440px); }
+.account-egress-form { gap: 14px; }
+.account-egress-account {
+  margin-top: 4px; color: var(--fg-2); font: 11px/1.4 var(--mono);
+  overflow-wrap: anywhere;
+}
+.account-egress-mode { justify-self: start; }
+.account-egress-field { display: grid; gap: 5px; }
+.account-egress-field[hidden] { display: none; }
+.account-egress-field .lbl { margin: 0; }
+.account-egress-status {
+  min-height: 18px; color: var(--fg-2); font-size: 12px; overflow-wrap: anywhere;
+}
+.account-egress-status.ready { color: var(--mint); }
+.account-egress-status.pending { color: var(--amber); }
+.account-egress-status.error, .account-egress-error { color: var(--rose); }
+.account-egress-error { min-height: 18px; font-size: 12px; overflow-wrap: anywhere; }
+.account-egress-error:empty { display: none; }
+
 @keyframes rise { from { opacity: 0; transform: translateY(8px); } }
 
 @media (prefers-reduced-motion: reduce) {
@@ -1100,4 +1133,3 @@ details[open] > .calllog-summary { margin-bottom: 14px; }
 @media (max-width: 660px) {
   .usage-card .usage-grid { grid-template-columns: minmax(0, 1fr); }
 }
-

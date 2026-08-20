@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { mkdtemp, rm, readFile, mkdir, writeFile } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import { createServer as createNetServer } from 'node:net';
 import { createServer as createHttpServer } from 'node:http';
 import { fileURLToPath } from 'node:url';
+import { createAccountStateStore } from '../server/account-state.mjs';
 
 const SERVER = fileURLToPath(new URL('../server.js', import.meta.url));
 
@@ -42,6 +43,7 @@ async function startServer(extraEnv = {}, prepare = null) {
   for (const name of [
     'FREEBUFF_TOKEN', 'FREEBUFF_API_KEY', 'FREEBUFF_CREDENTIALS_FILE', 'FREEBUFF_ACCOUNT_STATE_FILE', 'CODEBUFF_API',
     'SUBSCRIPTION_URL', 'MIHOMO_BIN', 'MIHOMO_DATA_DIR', 'MIHOMO_HEALTH_URL',
+    'MIHOMO_MIXED_PORT', 'MIHOMO_CTRL_PORT', 'MIHOMO_ACCOUNT_PORT_BASE',
     'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY', 'NODE_USE_ENV_PROXY',
   ]) delete childEnv[name];
   const child = spawn(process.execPath, [SERVER], {
@@ -79,8 +81,9 @@ async function startServer(extraEnv = {}, prepare = null) {
   return { child, dir, base, port };
 }
 
-async function startFakeProbeUpstream(getMode) {
+async function startFakeProbeUpstream(getMode, onRequest = () => {}) {
   const upstream = createHttpServer((req, res) => {
+    onRequest(req);
     if (req.url !== '/api/v1/freebuff/session') {
       res.writeHead(404, { 'content-type': 'application/json' });
       res.end('{}');
@@ -403,65 +406,106 @@ test('分享 Key：发/改/删对下一个客户端请求立刻生效', async (t
   assert.equal(body.locked, false);
 });
 
-test('管理员探测将 banned 持久化为永久状态，并由成功探测清除', async (t) => {
-  let mode = 'banned';
-  const fake = await startFakeProbeUpstream(() => mode);
+test('未配置订阅时托管账号禁止携 Bearer 回落宿主直连', async (t) => {
+  const observedBearer = [];
+  const fake = await startFakeProbeUpstream(() => 'ok', (req) => {
+    if (req.headers.authorization) observedBearer.push(req.headers.authorization);
+  });
   const s = await startServer({ CODEBUFF_API: fake.url });
   t.after(async () => {
     await stopServer(s);
     await new Promise((resolve) => fake.upstream.close(resolve));
   });
 
-  const token = 'server-probe-terminal-token-123456';
+  const token = 'managed-no-proxy-token-12345678901234567890';
   const add = await fetch(s.base + '/_api/accounts', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ authToken: token, email: 'probe@example.test' }),
+    body: JSON.stringify({ authToken: token, email: 'no-proxy@example.test' }),
   });
-  assert.equal(add.status, 200);
-  const stateFile = join(s.dir, 'credentials', 'account-state.json');
-  const bannedRaw = await readFile(stateFile, 'utf8');
+  assert.equal(add.status, 200, '账号应保存成功，但不得直连探测');
+  assert.equal((await add.json()).probe?.state, 'egress_unavailable');
+
+  const config = await fetch(s.base + '/_api/config');
+  assert.equal(config.status, 200);
+  const masterKey = (await config.json()).apiKey;
+
+  const chat = await fetch(s.base + '/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${masterKey}` },
+    body: JSON.stringify({
+      model: 'deepseek/deepseek-v4-pro',
+      messages: [{ role: 'user', content: 'ping' }],
+      stream: false,
+    }),
+  });
+  assert.equal(chat.status, 503);
+  assert.equal((await chat.json()).error?.type, 'egress_unavailable');
+
+  const accounts = await fetch(s.base + '/_api/accounts');
+  const account = (await accounts.json()).accounts[0];
+  assert.equal('token' in account, false, '账号列表 DTO 不得返回 token');
+  assert.equal('authToken' in account, false, '账号列表 DTO 不得返回 authToken');
+  assert.equal('tokenShort' in account, false, '账号列表 DTO 不得返回 token 前缀');
+  const probe = await fetch(s.base + '/_api/accounts/' + encodeURIComponent(account.key));
+  assert.equal(probe.status, 503, '管理员探测也不得绕过账号出站哨兵');
+  assert.equal((await probe.json()).error?.type, 'egress_unavailable');
+  assert.deepEqual(observedBearer, [], '托管账号没有独立出口时不得暴露宿主真实出口');
+});
+
+test('管理员探测按明确结果持久隔离，自动候选验证不修改隔离', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'fbp-probe-account-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const file = join(dir, 'account-state.json');
+  const accountStateStore = createAccountStateStore(file);
+  const source = readFileSync(new URL('../server.js', import.meta.url), 'utf8');
+  const start = source.indexOf('function findProbeState(');
+  const end = source.indexOf('\nconst accountEgressTasks =', start);
+  assert.ok(start >= 0 && end > start, '应能隔离账号探测分类与持久化逻辑');
+
+  let upstreamResult = { status: 403, data: { status: 'banned' } };
+  const expectedFetch = async () => new Response();
+  const enqueueUpstream = async (method, path, token, body, headers, timeout, fetchOverride) => {
+    assert.equal(method, 'GET');
+    assert.equal(path, '/api/v1/freebuff/session');
+    assert.equal(fetchOverride, expectedFetch, '管理员探测必须使用调用方给定的账号 lane fetch');
+    return { ...upstreamResult, text: JSON.stringify(upstreamResult.data), headers: new Headers() };
+  };
+  const probeAccount = new Function(
+    'enqueueUpstream',
+    'accountStateStore',
+    `${source.slice(start, end)}; return probeAccount;`,
+  )(enqueueUpstream, accountStateStore);
+  const token = 'server-probe-terminal-token-123456';
+
+  const banned = await probeAccount(token, { upstreamFetch: expectedFetch });
+  assert.equal(banned.state, 'banned');
+  assert.equal(banned.isolatedPermanent, true);
+  assert.equal(Object.hasOwn(banned, 'raw'), false);
+  const bannedRaw = await readFile(file, 'utf8');
   assert.match(bannedRaw, /"state":\s*"banned"/);
   assert.match(bannedRaw, /"until":\s*null/);
   assert.doesNotMatch(bannedRaw, new RegExp(token));
-  assert.deepEqual((await add.json()).probe, {
-    state: 'banned',
-    label: '已被封禁',
-    quota: null,
-    retryAfterMs: null,
-    uid: null,
-    accessTier: null,
-    model: null,
-    statusCode: 403,
-    isolatedUntil: null,
-    isolatedPermanent: true,
+
+  upstreamResult = { status: 200, data: { status: 'active' } };
+  const healthy = await probeAccount(token, { upstreamFetch: expectedFetch });
+  assert.equal(healthy.state, 'ok');
+  assert.equal(healthy.isolatedPermanent, false);
+  assert.doesNotMatch(await readFile(file, 'utf8'), /"state":\s*"banned"/);
+
+  upstreamResult = { status: 403, data: { error: { status: 'banned' } } };
+  const nested = await probeAccount(token, { upstreamFetch: expectedFetch });
+  assert.equal(nested.state, 'banned');
+  assert.equal(nested.isolatedPermanent, true);
+
+  upstreamResult = { status: 200, data: { status: 'active' } };
+  const verification = await probeAccount(token, {
+    upstreamFetch: expectedFetch,
+    updateIsolation: false,
   });
-
-  const accounts = await fetch(s.base + '/_api/accounts');
-  assert.equal(accounts.status, 200);
-  const account = (await accounts.json()).accounts[0];
-  for (const forbidden of ['token', 'authToken', 'tokenShort']) {
-    assert.equal(Object.hasOwn(account, forbidden), false, `账号列表不得返回 ${forbidden}`);
-  }
-
-  mode = 'ok';
-  const probe = await fetch(s.base + '/_api/accounts/probe%40example.test');
-  assert.equal(probe.status, 200);
-  const probeBody = await probe.json();
-  assert.equal(probeBody.state, 'ok');
-  assert.equal(probeBody.isolatedPermanent, false);
-  const clearedRaw = await readFile(stateFile, 'utf8');
-  assert.doesNotMatch(clearedRaw, /"state":\s*"banned"/);
-
-  mode = 'nested-banned';
-  const nested = await fetch(s.base + '/_api/accounts/probe%40example.test');
-  assert.equal(nested.status, 200);
-  const nestedBody = await nested.json();
-  assert.equal(nestedBody.state, 'banned');
-  assert.equal(nestedBody.isolatedPermanent, true);
-  assert.equal(Object.hasOwn(nestedBody, 'raw'), false, 'probe 不得回传上游原始响应');
-  const nestedRaw = await readFile(stateFile, 'utf8');
-  assert.match(nestedRaw, /"state":\s*"banned"/);
+  assert.equal(verification.state, 'ok');
+  assert.equal(verification.isolatedPermanent, true,
+    '自动选点模型验证成功不能清除管理员持久隔离');
 });
 
 test('OAuth poll 不返回 authToken，token-only 账号使用 opaque key', async (t) => {
@@ -491,6 +535,46 @@ test('OAuth poll 不返回 authToken，token-only 账号使用 opaque key', asyn
   assert.deepEqual(Object.keys(stored.accounts), [account.key], 'opaque key 必须持久化');
 });
 
+test('OAuth 更新同一 token 时复用原账号和 lane，不创建重复路由', async (t) => {
+  const token = 'oauth-existing-token-12345678901234567890';
+  const fake = await startFakeOauthUpstream({
+    id: 'oauth-new-id',
+    email: 'oauth-new@example.test',
+    authToken: token,
+  });
+  const s = await startServer({ CODEBUFF_API: fake.url }, async (dir) => {
+    const credentialsDir = join(dir, 'credentials');
+    await mkdir(credentialsDir, { recursive: true });
+    await writeFile(join(credentialsDir, 'freebuff_credentials.json'), JSON.stringify({
+      accounts: {
+        original: {
+          id: 'original',
+          email: 'original@example.test',
+          authToken: token,
+          egressMode: 'manual',
+          egressNode: 'US-A',
+          egressLane: 9,
+        },
+      },
+    }, null, 2));
+  });
+  t.after(async () => {
+    await stopServer(s);
+    await new Promise((resolve) => fake.upstream.close(resolve));
+  });
+
+  const started = await fetch(s.base + '/_api/login/start', { method: 'POST' });
+  const { fingerprintId } = await started.json();
+  const poll = await fetch(s.base + '/_api/login/poll?fingerprintId=' + encodeURIComponent(fingerprintId));
+  assert.equal(poll.status, 200);
+
+  const stored = JSON.parse(await readFile(join(s.dir, 'credentials', 'freebuff_credentials.json'), 'utf8'));
+  assert.deepEqual(Object.keys(stored.accounts), ['original']);
+  assert.equal(stored.accounts.original.egressLane, 9);
+  assert.equal(stored.accounts.original.egressMode, 'manual');
+  assert.equal(stored.accounts.original.egressNode, 'US-A');
+});
+
 test('历史 token 前缀账号 key 会迁移为持久 opaque key', async (t) => {
   const token = 'legacy-token-only-account-1234567890';
   const legacyKey = 'token-' + token.slice(0, 12);
@@ -518,4 +602,349 @@ test('历史 token 前缀账号 key 会迁移为持久 opaque key', async (t) =>
   const stored = JSON.parse(await readFile(join(s.dir, 'credentials', 'freebuff_credentials.json'), 'utf8'));
   assert.deepEqual(Object.keys(stored.accounts), [account.key]);
   assert.equal(JSON.stringify(stored).includes(legacyKey), false);
+});
+
+test('历史重复 token 只保留首个账号和 lane，并规范化凭据', async (t) => {
+  const token = 'duplicate-account-token-12345678901234567890';
+  const fake = await startFakeProbeUpstream(() => 'ok');
+  const s = await startServer({ CODEBUFF_API: fake.url }, async (dir) => {
+    const credentialsDir = join(dir, 'credentials');
+    await mkdir(credentialsDir, { recursive: true });
+    await writeFile(join(credentialsDir, 'freebuff_credentials.json'), JSON.stringify({
+      accounts: {
+        primary: {
+          id: 'primary',
+          name: 'Primary',
+          email: '',
+          authToken: `  ${token}  `,
+          egressMode: 'manual',
+          egressNode: 'US-A',
+          egressLane: 7,
+        },
+        duplicate: {
+          id: 'duplicate',
+          name: 'Duplicate',
+          email: 'duplicate@example.test',
+          authToken: token,
+          egressMode: 'auto',
+          egressNode: '',
+          egressLane: 11,
+        },
+      },
+    }, null, 2));
+  });
+  t.after(async () => {
+    await stopServer(s);
+    await new Promise((resolve) => fake.upstream.close(resolve));
+  });
+
+  const response = await fetch(s.base + '/_api/accounts');
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.deepEqual(body.accounts.map((account) => account.key), ['primary']);
+
+  const stored = JSON.parse(await readFile(join(s.dir, 'credentials', 'freebuff_credentials.json'), 'utf8'));
+  assert.deepEqual(Object.keys(stored.accounts), ['primary']);
+  assert.equal(stored.accounts.primary.authToken, token);
+  assert.equal(stored.accounts.primary.egressLane, 7);
+  assert.equal(stored.accounts.primary.egressMode, 'manual');
+  assert.equal(stored.accounts.primary.egressNode, 'US-A');
+});
+
+test('账号出站配置持久化且内部 lane 不暴露给管理 API', async (t) => {
+  const tokens = ['egress-account-a-123456789012345', 'egress-account-b-123456789012345'];
+  const fake = await startFakeProbeUpstream(() => 'ok');
+  const s = await startServer({ CODEBUFF_API: fake.url }, async (dir) => {
+    const credentialsDir = join(dir, 'credentials');
+    await mkdir(credentialsDir, { recursive: true });
+    await writeFile(join(credentialsDir, 'freebuff_credentials.json'), JSON.stringify({
+      accounts: {
+        'account-a': { id: 'account-a', email: 'a@example.test', authToken: tokens[0] },
+        'account-b': { id: 'account-b', email: 'b@example.test', authToken: tokens[1] },
+      },
+    }, null, 2));
+  });
+  t.after(async () => {
+    await stopServer(s);
+    await new Promise((resolve) => fake.upstream.close(resolve));
+  });
+
+  const response = await fetch(s.base + '/_api/accounts');
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.accounts.length, 2);
+  for (const account of body.accounts) {
+    assert.equal(account.egressMode, 'auto');
+    assert.equal(account.egressNode, '');
+    assert.equal(Object.hasOwn(account, 'egressLane'), false, '内部 lane 不得暴露到浏览器');
+  }
+  assert.deepEqual(Object.keys(body.egress).sort(), body.accounts.map((account) => account.key).sort());
+  assert.ok(Object.values(body.egress).every((entry) => entry.state === 'proxy_offline'));
+
+  const credentialsFile = join(s.dir, 'credentials', 'freebuff_credentials.json');
+  const stored = JSON.parse(await readFile(credentialsFile, 'utf8'));
+  const rows = Object.values(stored.accounts);
+  assert.deepEqual(rows.map((row) => row.egressMode), ['auto', 'auto']);
+  assert.deepEqual(rows.map((row) => row.egressNode), ['', '']);
+  assert.equal(new Set(rows.map((row) => row.egressLane)).size, 2, '两个账号必须持久化不同 lane');
+  assert.ok(rows.every((row) => Number.isInteger(row.egressLane) && row.egressLane >= 0));
+
+  const patchResponse = await fetch(s.base + '/_api/accounts/account-a', {
+    method: 'PATCH',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ egressMode: 'manual', egressNode: 'US-A' }),
+  });
+  assert.equal(patchResponse.status, 409, '无订阅时不能保存一个实际未生效的手动节点');
+  assert.equal((await patchResponse.json()).error.type, 'proxy_not_ready');
+  const after = JSON.parse(await readFile(credentialsFile, 'utf8'));
+  assert.equal(after.accounts['account-a'].egressMode, 'auto', '失败配置必须保持原值');
+  assert.equal(after.accounts['account-a'].egressNode, '');
+
+  const invalidMode = await fetch(s.base + '/_api/accounts/account-a', {
+    method: 'PATCH',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ egressMode: 'random', egressNode: 'US-A' }),
+  });
+  assert.equal(invalidMode.status, 400);
+  assert.equal((await invalidMode.json()).error.type, 'invalid_egress_config');
+
+  const missingManualNode = await fetch(s.base + '/_api/accounts/account-a', {
+    method: 'PATCH',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ egressMode: 'manual', egressNode: '' }),
+  });
+  assert.equal(missingManualNode.status, 400);
+  assert.equal((await missingManualNode.json()).error.type, 'invalid_egress_config');
+});
+
+test('账号出站 lane 用尽时新增账号返回明确容量错误', async (t) => {
+  const fake = await startFakeProbeUpstream(() => 'ok');
+  const s = await startServer({ CODEBUFF_API: fake.url }, async (dir) => {
+    const credentialsDir = join(dir, 'credentials');
+    await mkdir(credentialsDir, { recursive: true });
+    const accounts = {};
+    for (let lane = 0; lane < 64; lane++) {
+      accounts[`account-${lane}`] = {
+        id: `account-${lane}`,
+        email: `account-${lane}@example.test`,
+        authToken: `lane-${lane}-token-12345678901234567890`,
+        egressMode: 'auto',
+        egressNode: '',
+        egressLane: lane,
+      };
+    }
+    await writeFile(join(credentialsDir, 'freebuff_credentials.json'), JSON.stringify({ accounts }, null, 2));
+  });
+  t.after(async () => {
+    await stopServer(s);
+    await new Promise((resolve) => fake.upstream.close(resolve));
+  });
+
+  const response = await fetch(s.base + '/_api/accounts', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      email: 'overflow@example.test',
+      authToken: 'overflow-account-token-12345678901234567890',
+    }),
+  });
+  assert.equal(response.status, 409);
+  assert.equal((await response.json()).error.type, 'egress_capacity');
+
+  const stored = JSON.parse(await readFile(join(s.dir, 'credentials', 'freebuff_credentials.json'), 'utf8'));
+  assert.equal(Object.keys(stored.accounts).length, 64, '容量错误不得写入一个没有 lane 的账号');
+});
+
+test('自动节点验证过期时沿用已验证 lane 并后台刷新，不中断当前请求', () => {
+  const source = readFileSync(new URL('../server.js', import.meta.url), 'utf8');
+  const start = source.indexOf('function accountEgressFetch(');
+  const end = source.indexOf('\nfunction accountEgressStatus(', start);
+  assert.ok(start >= 0 && end > start, '应存在账号出站 fetch 选择函数');
+  const body = source.slice(start, end);
+  assert.match(body, /getAccountAutoUpstreamFetch\(account\.egressLane, \{ allowStale: true, identity \}\)/,
+    '自动模式应识别上次已验证但过期的 lane');
+  assert.match(body, /if \(staleFetch\)[\s\S]*?scheduleAccountEgress\(account, \{ force: false \}\)[\s\S]*?return route\(staleFetch\)/,
+    '缓存过期应后台重验并继续使用上次已验证 fetch');
+});
+
+test('后台账号出站刷新只更新运行态，不能用旧快照覆盖持久化配置', () => {
+  const source = readFileSync(new URL('../server.js', import.meta.url), 'utf8');
+  const start = source.indexOf('function scheduleAccountEgress(');
+  const end = source.indexOf('\nasync function initializeAccountEgress(', start);
+  assert.ok(start >= 0 && end > start, '应存在后台账号出站调度函数');
+  const body = source.slice(start, end);
+  assert.match(body, /configureAccountEgress\(current, \{ force: runForce, persist: false \}\)/,
+    '后台重验不得重写账号凭据或覆盖用户刚保存的出站配置');
+});
+
+test('旧 token 的 lane 拒绝回调不得触碰已复用账号', () => {
+  const source = readFileSync(new URL('../server.js', import.meta.url), 'utf8');
+  const start = source.indexOf('function handleEgressReject(');
+  const end = source.indexOf('\n// === Freebuff 授权码登录', start);
+  assert.ok(start >= 0 && end > start, '应存在可隔离验证的出口拒绝回调');
+  const factory = new Function(
+    'accountByToken',
+    'noteEgressReject',
+    'scheduleAccountEgress',
+    `${source.slice(start, end)}; return handleEgressReject;`,
+  );
+  const noted = [];
+  const scheduled = [];
+  const accounts = new Map([
+    ['current-token', { key: 'current', egressLane: 4, egressMode: 'auto' }],
+  ]);
+  const handler = factory(
+    (token) => accounts.get(token) || null,
+    (info) => noted.push(info),
+    (account) => scheduled.push(account.key),
+  );
+
+  handler({ token: 'deleted-token', lane: 4, node: 'US-A', generation: 1 });
+  handler({ token: 'current-token', lane: 5, node: 'SG-B', generation: 2 });
+  assert.deepEqual(noted, [], 'token 不存在或 lane 不匹配时不得修改当前代理 lane');
+  assert.deepEqual(scheduled, [], '无效回调不得触发当前账号后台重选');
+
+  handler({ token: 'current-token', lane: 4, node: 'US-A', generation: 3 });
+  assert.equal(noted.length, 1);
+  assert.deepEqual(scheduled, ['current'], '只有 token 与 lane 同时匹配才允许归因和重选');
+});
+
+test('同账号重叠写操作结束一项后仍保持后台任务门闩', () => {
+  const source = readFileSync(new URL('../server.js', import.meta.url), 'utf8');
+  const start = source.indexOf('const accountEgressMutations =');
+  const end = source.indexOf('const managedAccountTokenHistory', start);
+  const block = source.slice(start, end);
+  for (const marker of [
+    'beginAccountEgressMutation',
+    'endAccountEgressMutation',
+    'accountEgressMutationActive',
+  ]) {
+    assert.ok(block.includes(marker), `账号出站写门闩缺少 ${marker}`);
+  }
+  const gate = new Function(
+    `${block}; return { beginAccountEgressMutation, endAccountEgressMutation, accountEgressMutationActive };`,
+  )();
+
+  gate.beginAccountEgressMutation('same-account');
+  gate.beginAccountEgressMutation('same-account');
+  assert.equal(gate.accountEgressMutationActive('same-account'), true);
+  gate.endAccountEgressMutation('same-account');
+  assert.equal(gate.accountEgressMutationActive('same-account'), true,
+    '第一个 PATCH 完成时不能解除第二个 PATCH 仍持有的门闩');
+  gate.endAccountEgressMutation('same-account');
+  assert.equal(gate.accountEgressMutationActive('same-account'), false);
+
+  const scheduler = source.slice(
+    source.indexOf('function scheduleAccountEgress('),
+    source.indexOf('\nasync function initializeAccountEgress(', source.indexOf('function scheduleAccountEgress(')),
+  );
+  assert.match(scheduler, /accountEgressMutationActive\(account\.key\)/,
+    '后台调度入口和执行前都必须读取引用计数门闩');
+  const patch = source.slice(source.indexOf("if (method === 'PATCH' && sub)"), source.indexOf("if (method === 'DELETE' && sub)"));
+  assert.match(patch, /beginAccountEgressMutation\(key\)/);
+  assert.match(patch, /endAccountEgressMutation\(key\)/);
+});
+
+test('新增账号首次凭据探测显式使用账号 lane，禁止回落共享出口', () => {
+  const source = readFileSync(new URL('../server.js', import.meta.url), 'utf8');
+  const post = source.slice(source.indexOf("if (method === 'POST' && !sub)"), source.indexOf("if (method === 'PATCH' && sub)"));
+  assert.match(post, /const account = accountByKey\(key\)/,
+    '保存后必须重新读取带 lane 的账号');
+  assert.match(post, /const upstreamFetch = accountEgressFetch\(account\)/,
+    '首次探测必须取得该账号专属 fetch；未就绪时由该 fetch fail closed');
+  assert.match(post, /probeAccount\(authToken, \{\s*upstreamFetch,?\s*\}\)/,
+    'Bearer 凭据不得交给 probeAccount 的共享出口 fallback');
+  assert.match(post, /upstreamFetch === accountEgressUnavailableFetch[\s\S]*?state:\s*'egress_unavailable'/,
+    '账号已保存但 lane 尚未就绪时应返回可识别状态，不能把成功保存伪装成 502');
+  assert.doesNotMatch(post, /probeAccount\(authToken\)\s*;/,
+    '订阅存在时裸 probeAccount 会经全局 selector 泄漏账号隔离');
+});
+
+test('账号 lane 未就绪哨兵必须穿透上游 JSON 适配层', async () => {
+  const source = readFileSync(new URL('../server.js', import.meta.url), 'utf8');
+  const start = source.indexOf('async function upstreamJson(');
+  const end = source.indexOf('\nfunction enqueueUpstream(', start);
+  assert.ok(start >= 0 && end > start, '应存在可隔离验证的上游 JSON 适配层');
+  const upstreamJson = new Function(
+    'CFG',
+    'getUpstreamFetch',
+    `${source.slice(start, end)}; return upstreamJson;`,
+  )({ codebuffApi: 'https://upstream.invalid' }, () => null);
+  const sentinel = Object.assign(new Error('账号出站节点尚未就绪'), {
+    code: 'ACCOUNT_EGRESS_UNAVAILABLE',
+  });
+
+  await assert.rejects(
+    () => upstreamJson('GET', '/api/v1/freebuff/session', 'secret', undefined, {}, 100,
+      async () => { throw sentinel; }),
+    (error) => error === sentinel,
+    '哨兵若被转换为 status:0，账号探测路由的 503 分支永远无法执行',
+  );
+});
+
+test('后台出站任务每轮重读账号，账号写操作会取消旧任务', () => {
+  const source = readFileSync(new URL('../server.js', import.meta.url), 'utf8');
+  const scheduler = source.slice(
+    source.indexOf('function scheduleAccountEgress('),
+    source.indexOf('\nasync function initializeAccountEgress(', source.indexOf('function scheduleAccountEgress(')),
+  );
+  assert.match(scheduler, /const current = accountByKey\(account\.key\)/,
+    '后台任务每轮必须重读当前账号，不能继续使用旧 token/模式快照');
+  assert.match(scheduler, /accountEgressIdentity\(current\) !== identity/,
+    'token 换代后旧后台任务必须停止');
+
+  const post = source.slice(source.indexOf("if (method === 'POST' && !sub)"), source.indexOf("if (method === 'PATCH' && sub)"));
+  assert.ok(post.indexOf('cancelAccountEgressTasks(key)') >= 0
+    && post.indexOf('cancelAccountEgressTasks(key)') < post.indexOf('saveAccounts(obj)'),
+  '手动写入新 token 前必须取消旧后台任务');
+
+  const patch = source.slice(source.indexOf("if (method === 'PATCH' && sub)"), source.indexOf("if (method === 'DELETE' && sub)"));
+  assert.ok(patch.indexOf('cancelAccountEgressTasks(key)') >= 0
+    && patch.indexOf('cancelAccountEgressTasks(key)') < patch.indexOf('configureAccountEgress('),
+  '修改出站模式前必须取消旧后台任务');
+});
+
+test('异步出站配置不得跨 token 或 lane 换代写入新账号', () => {
+  const source = readFileSync(new URL('../server.js', import.meta.url), 'utf8');
+  const start = source.indexOf('async function configureAccountEgress(');
+  const end = source.indexOf('\nfunction scheduleAccountEgress(', start);
+  const body = source.slice(start, end);
+  assert.match(body, /const expectedIdentity = accountEgressIdentity\(account\)/);
+  assert.match(body, /accountEgressIdentity\(stored\) !== expectedIdentity/);
+  assert.match(body, /stored\.egressLane !== account\.egressLane/);
+});
+
+test('worker 账号路由动态解析，已删除托管 token 必须 fail closed', () => {
+  const source = readFileSync(new URL('../server.js', import.meta.url), 'utf8');
+  const start = source.indexOf('function resolveAccountUpstreamRoute(');
+  const end = source.indexOf('\nfunction buildWorkerEnv(', start);
+  assert.ok(start >= 0 && end > start, '服务端应提供稳定的动态账号路由解析器');
+  const body = source.slice(start, end);
+  assert.match(body, /accountByToken\(wanted\)/, '每次上游调用必须读取当前账号，而不是请求开始时的快照');
+  assert.match(body, /managedAccountTokenHistory\.has\(wanted\)/,
+    '曾受 lane 管理的 token 删除或轮换后必须仍能识别');
+  assert.match(body, /accountEgressUnavailableFetch/,
+    '已删除托管 token 不得回落全局出口');
+});
+
+test('账号端口范围拒绝越界及 mixed/controller 冲突', () => {
+  const moduleUrl = new URL('../server/proxy.mjs', import.meta.url).href;
+  for (const accountBase of ['17897', '19090', '65500', 'not-a-port']) {
+    const result = spawnSync(process.execPath, [
+      '--input-type=module',
+      '-e',
+      `await import(${JSON.stringify(moduleUrl + `?port=${accountBase}`)})`,
+    ], {
+      env: {
+        ...process.env,
+        MIHOMO_MIXED_PORT: '17897',
+        MIHOMO_CTRL_PORT: '19090',
+        MIHOMO_ACCOUNT_PORT_BASE: accountBase,
+      },
+      encoding: 'utf8',
+    });
+    assert.notEqual(result.status, 0, `非法账号端口 ${accountBase} 不得加载成功`);
+    assert.match(result.stderr, /MIHOMO_ACCOUNT_PORT_BASE|账号出站端口/,
+      `非法账号端口 ${accountBase} 应返回明确错误`);
+  }
 });
