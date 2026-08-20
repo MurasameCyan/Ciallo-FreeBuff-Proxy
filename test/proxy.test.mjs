@@ -372,25 +372,35 @@ test('账号自动出站候选只包含测活成功的 US/SG 节点', async () =
   assert.equal(proxyModule.inferNodeRegion('🇸🇬 JP¹-SG⁰_singapore'), 'sg');
 });
 
-test('账号自动节点必须能取得 deepseek-v4-pro', () => {
-  assert.equal(typeof proxyModule.accountProbeSupportsDeepseekV4Pro, 'function');
-  assert.equal(proxyModule.accountProbeSupportsDeepseekV4Pro({ state: 'ok', accessTier: 'full', quota: null }), false,
-    '只有 full 标签但模型目录没列出 V4 Pro，不能当作验证成功');
-  assert.equal(proxyModule.accountProbeSupportsDeepseekV4Pro({
+test('账号自动节点必须有可用的 gpt-5.6-luna 额度', () => {
+  assert.equal(typeof proxyModule.accountProbeSupportsLuna, 'function');
+  assert.equal(proxyModule.accountProbeSupportsLuna({ state: 'ok', accessTier: 'full', quota: null }), false,
+    '只有 full 标签但额度表没列出 Luna，不能当作验证成功');
+  assert.equal(proxyModule.accountProbeSupportsLuna({
     state: 'ok',
     accessTier: 'standard',
-    quota: [{ model: 'deepseek/deepseek-v4-pro', used: 4, limit: 5 }],
+    quota: [{ model: 'openai/gpt-5.6-luna', used: 4, limit: 5 }],
   }), true);
-  assert.equal(proxyModule.accountProbeSupportsDeepseekV4Pro({
+  assert.equal(proxyModule.accountProbeSupportsLuna({
     state: 'ok',
     accessTier: 'standard',
-    quota: [{ model: 'mimo/mimo-v2.5', used: 0, limit: 5 }],
-  }), false);
+    quota: [{ model: 'openai/gpt-5.6-luna', used: 5, limit: 5 }],
+  }), false, 'Luna 已用尽时不能当作可用节点');
+  assert.equal(proxyModule.accountProbeSupportsLuna({
+    state: 'ok',
+    accessTier: 'standard',
+    quota: [{ model: 'openai/gpt-5.6-luna', remaining: 0, limit: 10 }],
+  }), false, '上游明确返回 remaining=0 时不能当作可用节点');
+  assert.equal(proxyModule.accountProbeSupportsLuna({
+    state: 'ok',
+    accessTier: 'standard',
+    quota: [{ model: 'deepseek/deepseek-v4-pro', used: 0, limit: 5 }],
+  }), false, 'DS4P 有额度不能替代 Luna 能力检查');
   for (const state of ['ip_capped', 'rate_limited', 'spend_limited']) {
-    assert.equal(proxyModule.accountProbeSupportsDeepseekV4Pro({
+    assert.equal(proxyModule.accountProbeSupportsLuna({
       state,
       statusCode: state === 'spend_limited' ? 200 : 429,
-      quota: [{ model: 'deepseek/deepseek-v4-pro', used: 0, limit: 10 }],
+      quota: [{ model: 'openai/gpt-5.6-luna', used: 0, limit: 10 }],
     }), false, `${state} 即使携带正额度也不能当作节点验证成功`);
   }
 });
@@ -989,7 +999,7 @@ test('后台重验期间收到出口拒绝时不得把旧节点重新标成有�
   await started;
   service.noteEgressReject({ lane: 4, state: 'country_blocked', status: 403 });
   releaseVerify(true);
-  await assert.rejects(revalidating, /没有可访问 deepseek\/deepseek-v4-pro/);
+  await assert.rejects(revalidating, /没有可访问 openai\/gpt-5\.6-luna/);
   assert.equal(service.getAccountAutoFetch(4, { allowStale: true }), null);
 });
 
@@ -1313,7 +1323,7 @@ test('probe dispatcher 构建结果无 fetch 时仍关闭未提交资源', async
   await service.setSubscription('https://sub.example.com/list');
   await assert.rejects(
     service.selectAccountNodeAuto({ lane: 9, verify: async () => true }),
-    /没有可访问 deepseek\/deepseek-v4-pro/,
+    /没有可访问 openai\/gpt-5\.6-luna/,
   );
   assert.equal(closed, 1, '无有效 fetch 的 probe dispatcher 也必须释放');
 });

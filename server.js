@@ -32,7 +32,7 @@ import {
   isAccountAutoEgressReady,
   getAccountEgressReject,
   inferNodeRegion,
-  accountProbeSupportsDeepseekV4Pro,
+  accountProbeSupportsLuna,
 } from './server/proxy.mjs';
 import { createUsagePersistence } from './server/usage-persistence.mjs';
 import { createApiKeyStore, OWNER_KEY_NAME } from './server/api-keys.mjs';
@@ -170,13 +170,14 @@ function migrateAccountKeys(obj) {
     if (token !== String(user.authToken || '')) changed = true;
     if (token) user.authToken = token;
     else if (Object.hasOwn(user, 'authToken')) user.authToken = '';
-    if (token && tokenOwners.has(token)) {
+    const tokenIdentity = normalizeAccountToken(token);
+    if (tokenIdentity && tokenOwners.has(tokenIdentity)) {
       changed = true;
       console.warn('[server] credentials migration removed a duplicate account token');
       continue;
     }
     accounts[nextKey] = user;
-    if (token) tokenOwners.set(token, nextKey);
+    if (tokenIdentity) tokenOwners.set(tokenIdentity, nextKey);
   }
   if (!changed) return obj;
   const migrated = { ...obj, accounts };
@@ -249,8 +250,9 @@ function accountKey(user) {
 }
 
 function existingAccountKey(obj, token) {
+  const wanted = normalizeAccountToken(token);
   for (const [key, user] of Object.entries(obj.accounts || {})) {
-    if (user && user.authToken === token) return key;
+    if (user && normalizeAccountToken(user.authToken) === wanted) return key;
   }
   return null;
 }
@@ -380,7 +382,7 @@ function enqueueUp(fn) {
 
 async function upstreamJson(method, path, token, body, extraHeaders = {}, timeoutMs = 15000, fetchOverride = null) {
   const headers = {};
-  if (token) headers.Authorization = `Bearer ${token}`;
+  if (token) headers.Authorization = `Bearer ${normalizeAccountToken(token)}`;
   if (body !== undefined) headers['Content-Type'] = 'application/json';
   Object.assign(headers, extraHeaders);
   const ctrl = new AbortController();
@@ -545,11 +547,17 @@ function cancelAccountEgressTasks(accountKey) {
   }
 }
 
+function normalizeAccountToken(value) {
+  const token = String(value || '').trim();
+  const colon = token.indexOf(':');
+  return colon > 0 ? token.slice(0, colon).trim() : token;
+}
+
 function accountByToken(token) {
-  const wanted = String(token || '').trim();
+  const wanted = normalizeAccountToken(token);
   let found = null;
   for (const account of listAccounts()) {
-    if (account.token.trim() === wanted) found = account;
+    if (normalizeAccountToken(account.token) === wanted) found = account;
   }
   return found;
 }
@@ -565,16 +573,17 @@ function accountEgressUnavailableFetch() {
 }
 
 function resolveAccountUpstreamRoute(token) {
-  const wanted = String(token || '').trim();
+  const wanted = normalizeAccountToken(token);
   if (!wanted) return null;
   const account = accountByToken(wanted);
   if (account) {
     managedAccountTokenHistory.add(wanted);
     return accountEgressFetch(account, { withRoute: true });
   }
-  const envTokens = (env.FREEBUFF_TOKEN || '').split(/[\n,]/).map((value) => value.trim()).filter(Boolean);
+  if (managedAccountTokenHistory.has(wanted)) return accountEgressUnavailableFetch;
+  const envTokens = (env.FREEBUFF_TOKEN || '').split(/[\n,]/).map(normalizeAccountToken).filter(Boolean);
   if (envTokens.includes(wanted)) return null;
-  return managedAccountTokenHistory.has(wanted) ? accountEgressUnavailableFetch : null;
+  return null;
 }
 
 function accountEgressFetch(account, { schedule = true, withRoute = false } = {}) {
@@ -640,7 +649,7 @@ function accountEgressStatus(account) {
     error = '尚未选择手动节点';
   } else {
     error = account.egressMode === 'auto'
-      ? '尚未找到可访问 deepseek/deepseek-v4-pro 的 US/SG 节点'
+      ? '尚未找到可访问 openai/gpt-5.6-luna 的 US/SG 节点'
       : '手动节点尚未就绪';
   }
   return {
@@ -679,7 +688,7 @@ async function configureAccountEgress(account, {
       force,
       verify: async ({ fetch: fetchForLane }) => {
         const probe = await probeAccount(account.token, { upstreamFetch: fetchForLane, updateIsolation: false });
-        return accountProbeSupportsDeepseekV4Pro(probe);
+        return accountProbeSupportsLuna(probe);
       },
     });
   }
@@ -910,7 +919,7 @@ async function readJsonObject(req) {
 function buildWorkerEnv() {
   const tokens = allTokens();
   for (const account of listAccounts()) {
-    if (account.hasToken) managedAccountTokenHistory.add(account.token.trim());
+    if (account.hasToken) managedAccountTokenHistory.add(normalizeAccountToken(account.token));
   }
   const envTokens = (env.FREEBUFF_TOKEN || '').split(/[\n,]/).map((s) => s.trim()).filter(Boolean);
   for (const t of envTokens) if (!tokens.includes(t)) tokens.push(t);

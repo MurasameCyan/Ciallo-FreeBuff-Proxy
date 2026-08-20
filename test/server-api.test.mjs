@@ -604,7 +604,7 @@ test('历史 token 前缀账号 key 会迁移为持久 opaque key', async (t) =>
   assert.equal(JSON.stringify(stored).includes(legacyKey), false);
 });
 
-test('历史重复 token 只保留首个账号和 lane，并规范化凭据', async (t) => {
+test('同一 Bearer 的历史 token:uid 只保留首个账号和 lane，新增时继续复用', async (t) => {
   const token = 'duplicate-account-token-12345678901234567890';
   const fake = await startFakeProbeUpstream(() => 'ok');
   const s = await startServer({ CODEBUFF_API: fake.url }, async (dir) => {
@@ -616,7 +616,7 @@ test('历史重复 token 只保留首个账号和 lane，并规范化凭据', as
           id: 'primary',
           name: 'Primary',
           email: '',
-          authToken: `  ${token}  `,
+          authToken: `  ${token}:uid-primary  `,
           egressMode: 'manual',
           egressNode: 'US-A',
           egressLane: 7,
@@ -625,7 +625,7 @@ test('历史重复 token 只保留首个账号和 lane，并规范化凭据', as
           id: 'duplicate',
           name: 'Duplicate',
           email: 'duplicate@example.test',
-          authToken: token,
+          authToken: `${token}:uid-duplicate`,
           egressMode: 'auto',
           egressNode: '',
           egressLane: 11,
@@ -643,12 +643,23 @@ test('历史重复 token 只保留首个账号和 lane，并规范化凭据', as
   const body = await response.json();
   assert.deepEqual(body.accounts.map((account) => account.key), ['primary']);
 
-  const stored = JSON.parse(await readFile(join(s.dir, 'credentials', 'freebuff_credentials.json'), 'utf8'));
+  let stored = JSON.parse(await readFile(join(s.dir, 'credentials', 'freebuff_credentials.json'), 'utf8'));
   assert.deepEqual(Object.keys(stored.accounts), ['primary']);
-  assert.equal(stored.accounts.primary.authToken, token);
+  assert.equal(stored.accounts.primary.authToken, `${token}:uid-primary`);
   assert.equal(stored.accounts.primary.egressLane, 7);
   assert.equal(stored.accounts.primary.egressMode, 'manual');
   assert.equal(stored.accounts.primary.egressNode, 'US-A');
+
+  const update = await fetch(s.base + '/_api/accounts', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ authToken: `${token}:uid-new`, name: 'Updated' }),
+  });
+  assert.equal(update.status, 200);
+  stored = JSON.parse(await readFile(join(s.dir, 'credentials', 'freebuff_credentials.json'), 'utf8'));
+  assert.deepEqual(Object.keys(stored.accounts), ['primary'], '新增同 Bearer 凭据不得再占一个 lane');
+  assert.equal(stored.accounts.primary.authToken, `${token}:uid-new`);
+  assert.equal(stored.accounts.primary.egressLane, 7);
 });
 
 test('账号出站配置持久化且内部 lane 不暴露给管理 API', async (t) => {
@@ -868,8 +879,13 @@ test('账号 lane 未就绪哨兵必须穿透上游 JSON 适配层', async () =>
   const upstreamJson = new Function(
     'CFG',
     'getUpstreamFetch',
+    'normalizeAccountToken',
     `${source.slice(start, end)}; return upstreamJson;`,
-  )({ codebuffApi: 'https://upstream.invalid' }, () => null);
+  )(
+    { codebuffApi: 'https://upstream.invalid' },
+    () => null,
+    (value) => String(value || '').trim().split(':', 1)[0],
+  );
   const sentinel = Object.assign(new Error('账号出站节点尚未就绪'), {
     code: 'ACCOUNT_EGRESS_UNAVAILABLE',
   });
@@ -925,6 +941,93 @@ test('worker 账号路由动态解析，已删除托管 token 必须 fail closed
     '曾受 lane 管理的 token 删除或轮换后必须仍能识别');
   assert.match(body, /accountEgressUnavailableFetch/,
     '已删除托管 token 不得回落全局出口');
+});
+
+test('token:uid 账号按 Bearer token 命中专属 lane，删除后仍 fail closed', () => {
+  const source = readFileSync(new URL('../server.js', import.meta.url), 'utf8');
+  const start = source.indexOf('function accountByToken(');
+  const end = source.indexOf('\nfunction accountEgressFetch(', start);
+  assert.ok(start >= 0 && end > start, '应能隔离账号 token 路由实现');
+  const factory = new Function(
+    'listAccounts',
+    'accountEgressFetch',
+    'env',
+    'managedAccountTokenHistory',
+    'normalizeAccountToken',
+    `${source.slice(start, end)}; return {
+      accountByToken, resolveAccountUpstreamRoute, accountEgressUnavailableFetch,
+    };`,
+  );
+  const bearerToken = 'managed-bearer-token-1234567890';
+  const pureToken = 'pure-managed-token-1234567890';
+  const envToken = 'env-only-token-1234567890';
+  const accounts = [{
+    key: 'managed-account',
+    token: `${bearerToken}:uid-value`,
+    egressLane: 7,
+  }, {
+    key: 'pure-account',
+    token: pureToken,
+    egressLane: 3,
+  }];
+  const routed = [];
+  const history = new Set();
+  const normalizeAccountToken = (value) => {
+    const token = String(value || '').trim();
+    const colon = token.indexOf(':');
+    return colon > 0 ? token.slice(0, colon).trim() : token;
+  };
+  const route = factory(
+    () => accounts,
+    (account) => {
+      routed.push(account.key);
+      return { lane: account.egressLane };
+    },
+    { FREEBUFF_TOKEN: `${bearerToken}:env-uid,${envToken}:env-uid` },
+    history,
+    normalizeAccountToken,
+  );
+
+  assert.deepEqual(route.resolveAccountUpstreamRoute(bearerToken), { lane: 7 },
+    'worker 传入冒号前 Bearer token 时必须命中账号专属 lane');
+  assert.deepEqual(routed, ['managed-account']);
+  assert.equal(history.has(bearerToken), true, '托管历史必须保存规范化 Bearer token');
+  assert.deepEqual(route.resolveAccountUpstreamRoute(pureToken), { lane: 3 },
+    '纯 token 账号的既有路由行为必须保持不变');
+
+  accounts.length = 0;
+  assert.equal(route.resolveAccountUpstreamRoute(bearerToken), route.accountEgressUnavailableFetch,
+    '账号删除后不得把旧 Bearer token 回落到共享出口');
+  assert.equal(route.resolveAccountUpstreamRoute(pureToken), route.accountEgressUnavailableFetch,
+    '纯 token 托管账号删除后同样必须 fail closed');
+  assert.equal(route.resolveAccountUpstreamRoute(envToken), null,
+    '非托管环境 token:uid 仍应沿用全局出口');
+});
+
+test('服务端账号探测发送 token:uid 时只把 Bearer 部分写入 Authorization', async () => {
+  const source = readFileSync(new URL('../server.js', import.meta.url), 'utf8');
+  const start = source.indexOf('async function upstreamJson(');
+  const end = source.indexOf('\nfunction enqueueUpstream(', start);
+  assert.ok(start >= 0 && end > start, '应能隔离上游 JSON 请求实现');
+  const upstreamJson = new Function(
+    'CFG',
+    'getUpstreamFetch',
+    'normalizeAccountToken',
+    `${source.slice(start, end)}; return upstreamJson;`,
+  )(
+    { codebuffApi: 'https://upstream.example.test' },
+    () => null,
+    (value) => String(value || '').trim().split(':', 1)[0],
+  );
+  let authorization = '';
+  const token = 'probe-bearer-token-1234567890';
+  const result = await upstreamJson('GET', '/api/v1/freebuff/session', `${token}:uid-value`, undefined, {}, 1000,
+    async (_url, init) => {
+      authorization = init.headers.Authorization;
+      return new Response('{}', { status: 200 });
+    });
+  assert.equal(result.status, 200);
+  assert.equal(authorization, `Bearer ${token}`);
 });
 
 test('账号端口范围拒绝越界及 mixed/controller 冲突', () => {

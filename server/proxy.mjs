@@ -125,11 +125,16 @@ function autoRegionRank(name) {
   return inferNodeRegion(name) ? 0 : 1;
 }
 
-export function accountProbeSupportsDeepseekV4Pro(probe) {
+export function accountProbeSupportsLuna(probe) {
   if (!probe || typeof probe !== 'object' || probe.state !== 'ok') return false;
-  return Array.isArray(probe.quota) && probe.quota.some((row) => (
-    row?.model === 'deepseek/deepseek-v4-pro' && Number(row.limit) > 0
-  ));
+  return Array.isArray(probe.quota) && probe.quota.some((row) => {
+    if (row?.model !== 'openai/gpt-5.6-luna') return false;
+    const limit = Number(row.limit);
+    if (!(limit > 0)) return false;
+    if (row.remaining != null) return Number(row.remaining) > 0;
+    const used = Number(row.used);
+    return Number.isFinite(used) && used >= 0 && used < limit;
+  });
 }
 
 function accountPoolName(lane) { return `freebuff-account-${lane}`; }
@@ -1212,7 +1217,7 @@ export function createProxyService({
           assertAccountOperation(lane, operationVersion, normalizedIdentity, topologyVersion);
           accountAutoValidations.delete(lane);
         });
-        const error = new Error('没有可访问 deepseek/deepseek-v4-pro 的 US/SG 节点');
+        const error = new Error('没有可访问 openai/gpt-5.6-luna 的 US/SG 节点');
         error.code = 'ACCOUNT_EGRESS_UNAVAILABLE';
         throw error;
       } finally {
