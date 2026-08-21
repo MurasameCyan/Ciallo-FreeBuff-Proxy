@@ -935,6 +935,40 @@ function loadModelAliases() {
   return merged;
 }
 
+const HISTORICAL_DEFAULT_MODEL_ALIASES = {
+  'deepseek-v4-flash-0731': 'deepseek/deepseek-v4-flash',
+  'deepseek-v4-pro-0813': 'deepseek/deepseek-v4-pro',
+  'mimo-v2.5': 'mimo/mimo-v2.5',
+};
+
+// 旧镜像曾把三条示例映射复制进持久化目录。只删除键和值都完全匹配的
+// 历史默认项，用户修改过目标或自行添加的映射一律保留。
+function removeHistoricalDefaultModelAliases() {
+  if (!existsSync(CFG.aliasFile)) return;
+  try {
+    const obj = JSON.parse(readFileSync(CFG.aliasFile, 'utf-8'));
+    if (!obj || typeof obj !== 'object') return;
+    const src = obj.aliases && typeof obj.aliases === 'object' ? obj.aliases : obj;
+    const next = Object.create(null);
+    let changed = false;
+    for (const [alias, modelId] of Object.entries(src)) {
+      if (HISTORICAL_DEFAULT_MODEL_ALIASES[alias] === modelId) {
+        changed = true;
+        continue;
+      }
+      next[alias] = modelId;
+    }
+    if (!changed) return;
+    mkdirSync(dirname(CFG.aliasFile), { recursive: true });
+    const tmp = CFG.aliasFile + '.tmp';
+    writeFileSync(tmp, JSON.stringify({ aliases: next }, null, 2) + '\n', 'utf-8');
+    writeFileSync(CFG.aliasFile, readFileSync(tmp, 'utf-8'), 'utf-8');
+    console.log('[server] 已移除历史默认模型映射');
+  } catch (e) {
+    console.error('[server] 清理历史默认模型映射失败（忽略）:', e.message);
+  }
+}
+
 // 代理管理接口的错误只返回可操作的中文提示；订阅 URL、控制器响应等内部
 // 细节不能从管理面板泄漏。proxy service 本身也会对启动/刷新错误脱敏，
 // 这里再做一层边界保护，避免未来新增实现把原始异常直接吐给浏览器。
@@ -1591,6 +1625,7 @@ if (!env.MODEL_ALIASES_FILE) {
   } catch (e) {
     console.error('[server] 迁移 aliases.json 失败（忽略）:', e.message);
   }
+  removeHistoricalDefaultModelAliases();
 }
 
 // 出口代理（可选）：订阅既可以来自 SUBSCRIPTION_URL，也可以来自

@@ -145,6 +145,69 @@ async function stopServer(s) {
   await rm(s.dir, { recursive: true, force: true });
 }
 
+test('启动时移除三个历史默认模型映射并保留用户自定义映射', async (t) => {
+  const s = await startServer({}, async (dir) => {
+    await writeFile(join(dir, 'aliases.json'), JSON.stringify({
+      aliases: {
+        'deepseek-v4-flash-0731': 'deepseek/deepseek-v4-flash',
+        'deepseek-v4-pro-0813': 'deepseek/deepseek-v4-pro',
+        'mimo-v2.5': 'mimo/mimo-v2.5',
+        custom: 'openai/gpt-5.6-luna',
+      },
+    }, null, 2));
+  });
+  t.after(() => stopServer(s));
+
+  const response = await fetch(s.base + '/_api/config');
+  assert.equal(response.status, 200);
+  assert.deepEqual((await response.json()).aliases, {
+    custom: 'openai/gpt-5.6-luna',
+  });
+  assert.deepEqual(JSON.parse(await readFile(join(s.dir, 'aliases.json'), 'utf8')), {
+    aliases: { custom: 'openai/gpt-5.6-luna' },
+  });
+});
+
+test('历史默认映射迁移保留同名自定义目标并规范旧对象格式', async (t) => {
+  const s = await startServer({}, async (dir) => {
+    await writeFile(join(dir, 'aliases.json'), JSON.stringify({
+      'deepseek-v4-flash-0731': 'deepseek/deepseek-v4-flash',
+      'deepseek-v4-pro-0813': 'custom/deepseek-v4-pro',
+    }, null, 2));
+  });
+  t.after(() => stopServer(s));
+
+  const response = await fetch(s.base + '/_api/config');
+  assert.equal(response.status, 200);
+  assert.deepEqual((await response.json()).aliases, {
+    'deepseek-v4-pro-0813': 'custom/deepseek-v4-pro',
+  });
+  assert.deepEqual(JSON.parse(await readFile(join(s.dir, 'aliases.json'), 'utf8')), {
+    aliases: { 'deepseek-v4-pro-0813': 'custom/deepseek-v4-pro' },
+  });
+});
+
+test('显式 MODEL_ALIASES_FILE 属于用户配置，启动时不得清理', async (t) => {
+  const managedDir = await mkdtemp(join(tmpdir(), 'fbp-managed-aliases-'));
+  const aliasFile = join(managedDir, 'aliases.json');
+  const configured = {
+    aliases: {
+      'deepseek-v4-pro-0813': 'deepseek/deepseek-v4-pro',
+      custom: 'openai/gpt-5.6-luna',
+    },
+  };
+  await writeFile(aliasFile, JSON.stringify(configured, null, 2));
+  t.after(() => rm(managedDir, { recursive: true, force: true }));
+
+  const s = await startServer({ MODEL_ALIASES_FILE: aliasFile });
+  t.after(() => stopServer(s));
+
+  const response = await fetch(s.base + '/_api/config');
+  assert.equal(response.status, 200);
+  assert.deepEqual((await response.json()).aliases, configured.aliases);
+  assert.deepEqual(JSON.parse(await readFile(aliasFile, 'utf8')), configured);
+});
+
 test('概况统计持久化 API 契约', async (t) => {
   const s = await startServer();
   t.after(() => stopServer(s));

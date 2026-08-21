@@ -605,6 +605,12 @@ select:disabled { opacity: .5; cursor: not-allowed; }
 .model-catalog .models li { width: fit-content; max-width: 100%; }
 .model-catalog .models::-webkit-scrollbar,
 .model-workspace-card .table-scroll::-webkit-scrollbar { display: none; }
+.model-availability-note {
+  margin-top: 10px; padding-top: 9px; border-top: 1px solid var(--line);
+  max-width: 260px; color: var(--fg-2); font: 10px/1.55 var(--mono);
+  overflow-wrap: anywhere;
+}
+.model-availability-note span { color: color-mix(in oklab, var(--fg-2) 72%, transparent); }
 .model-workspace-card .table-scroll { scrollbar-width: none; -ms-overflow-style: none; }
 .alias-editor .table-scroll {
   height: var(--model-list-height);  /* 作为 flex-basis：默认高度 */

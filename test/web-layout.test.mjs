@@ -356,6 +356,14 @@ assert.match(css, /\.model-catalog \.models\s*\{[^}]*row-gap:\s*3px/s,
   '模型列表纵向间距必须固定为紧凑的 3px，不能被通用 gap 或 flex 剩余高度放大');
 assert.match(css, /\.model-catalog \.models li\s*\{[^}]*width:\s*fit-content/s,
   '模型列表条目不应横向拉伸并留下空白');
+assert.match(html,
+  /<p class="model-availability-note">deepseek-v4-pro：北京时间 08:00–18:00 不可用 <span>\(UTC 00:00–10:00\)<\/span><\/p>/,
+  '模型列表底部必须写明 DS4P 的官方不可用时段');
+assert.match(css, /\.model-availability-note\s*\{[^}]*border-top:/s,
+  '模型时段说明必须用顶部分隔线与模型列表分开');
+const availabilityNote = html.match(/<p class="model-availability-note">[\s\S]*?<\/p>/)?.[0] || '';
+assert.ok(!/luna|kimi-k3/i.test(availabilityNote),
+  'Luna 与 K3 官方均为 always，不得捏造同类时段限制');
 assert.match(app, /MODEL_TIER_LABELS = \{ free: '免费', us_sg: '高级', limited: '限定' \}/,
   '模型列表的通用分组 tag 文案必须是 免费 / 高级 / 限定');
 for (const [id, label] of [
@@ -390,7 +398,7 @@ assert.match(app, /function selectedKeyModels\(\)[\s\S]*?\.filter\(Boolean\)/s,
 
 const helperSource = `const S = { models: [] };\nconst esc = (value) => String(value);\n${app.match(/const MODEL_TIER_LABELS = \{[^\n]+/)[0]}\n`
   + `${app.slice(app.indexOf('const MODEL_DISPLAY ='), app.indexOf('function modelsCellHtml'))}\n`
-  + 'globalThis.__modelUi = { accountQuotaSummary, modelDisplay, modelListHtml };';
+  + 'globalThis.__modelUi = { accountQuotaSummary, modelName, modelDisplay, modelListHtml };';
 const helperVm = { globalThis: null };
 helperVm.globalThis = helperVm;
 vm.runInNewContext(helperSource, helperVm);
@@ -461,6 +469,8 @@ assert.match(helperVm.__modelUi.modelListHtml(['mimo/mimo-v2.5']),
 assert.match(helperVm.__modelUi.modelListHtml(['z-ai/glm-5.2']),
   /">glm-5\.2 <span class="pill tier tier-limited">限定<\/span>/,
   'GLM 的限定标签必须使用 limited 配色');
+assert.equal(helperVm.__modelUi.modelName('crof/kimi-k3-eco'), 'kimi-k3-eco',
+  '统一模型名称函数必须去掉供应商前缀');
 assert.ok(!/short:\s*'/.test(app.slice(app.indexOf('const MODEL_DISPLAY ='), app.indexOf('function modelsCellHtml'))),
   '模型展示不得再保留短名映射');
 assert.ok(!html.includes('class="page-intro"'), '页面顶部不应保留运行面板介绍区');
@@ -674,6 +684,8 @@ for (const fn of ['function fmtUptime', 'function successRate', 'function fmtPer
   'function rankBreakdown', 'function renderUsageOverview', 'function renderUsageModels']) {
   assert.ok(app.includes(fn), `概况缺少函数: ${fn}`);
 }
+assert.match(app, /function renderUsageModels\(\)[\s\S]*?modelName\(r\.key\)/s,
+  '概况模型统计必须去掉 provider 前缀，只显示模型名称');
 assert.ok(app.includes('renderUsageOverview()'), 'refresh 必须渲染概况');
 for (const field of ['S.usage?.total', 'S.usage?.byModel', 'S.usage.startTime', 'S.usage.lastRequest']) {
   assert.ok(app.includes(field), `概况必须读取 ${field}`);

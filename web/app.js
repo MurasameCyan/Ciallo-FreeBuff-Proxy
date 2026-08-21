@@ -327,10 +327,15 @@ const MODEL_QUOTA_POOLS = {
 
 // 未收录的动态模型退回 /v1/models 的 tier 分组文案。
 // name 只保留 provider/ 后面的模型名，完整 id 仍放在 title 并继续作为 API/白名单值。
+function modelName(id) {
+  const value = String(id || '');
+  return value.slice(value.lastIndexOf('/') + 1);
+}
+
 function modelDisplay(id, model = null) {
   const known = MODEL_DISPLAY[id] || {};
   const tierKey = known.tier || model?.tier || '';
-  const name = String(id).slice(String(id).lastIndexOf('/') + 1);
+  const name = modelName(id);
   return { id, name, tierKey, tier: known.label || MODEL_TIER_LABELS[tierKey] || '' };
 }
 
@@ -1192,7 +1197,7 @@ function renderUsageModels() {
   const ul = $('s-models');
   ul.replaceChildren(...rows.map((r) => {
     const li = document.createElement('li');
-    const nm = tag('nm', r.key);
+    const nm = tag('nm', modelName(r.key));
     nm.title = r.key;              // 窄档省略号截断，悬停看全名
     const n = document.createElement('b');
     n.textContent = fmtCount(r.success);
