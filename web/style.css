@@ -217,6 +217,13 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
 .account-priority-toggle:hover:not(:disabled) { border-color: var(--fg-2); color: var(--fg); }
 .account-priority-toggle.active { border-color: color-mix(in oklab, var(--mint) 45%, var(--line-2)); color: var(--mint); }
 .account-priority-toggle:disabled { cursor: default; opacity: .55; }
+.account-egress-refresh {
+  min-height: 24px; padding: 3px 8px; border: 1px solid var(--line-2);
+  border-radius: var(--r-sm); background: transparent; color: var(--fg-2);
+  font: 11px var(--sans); cursor: pointer; white-space: nowrap;
+}
+.account-egress-refresh:hover:not(:disabled) { border-color: var(--fg-2); color: var(--fg); }
+.account-egress-refresh:disabled { cursor: default; opacity: .55; }
 .count {
   display: inline-flex; align-items: center;
   margin-left: 7px; padding: 2px 7px;

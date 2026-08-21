@@ -333,7 +333,7 @@ function dynamicStandardModels() {
 function modelPoolCategory(modelId) {
   // 上游现在给 D4P/Luna 各自独立的每日池；不能让动态源码里的 shared
   // PREMIUM 列表把它们重新合并。M3 已暂停，也不能继续继承旧 Premium 池。
-  if (PAUSED_QUOTA_MODELS.has(modelId)) return null;
+  if (PAUSED_QUOTA_MODELS.has(modelId) || isHiddenModelId(modelId)) return null;
   if (DEEPSEEK_PRO_QUOTA_MODELS.has(modelId)) return "deepseek_pro";
   if (LUNA_QUOTA_MODELS.has(modelId)) return "luna";
   const dyn = dynamicModelsCache;
@@ -405,6 +405,14 @@ const LUNA_QUOTA_MODELS = new Set([
 const PAUSED_QUOTA_MODELS = new Set([
   "minimax/minimax-m3",
 ]);
+// Freebuff 自家 Web/Cloud runner 专用模型。普通 token、CLI、Desktop 和第三方
+// 代理没有服务账号权限，动态源即使返回也必须 fail closed。
+const HIDDEN_MODEL_IDS = new Set(["stealth/ox-alpha"]);
+function isHiddenModelId(modelId) {
+  const value = String(modelId || "").trim().toLowerCase();
+  return HIDDEN_MODEL_IDS.has(value) || value === "ox-alpha"
+    || value === "anthropic/ox-alpha" || value.endsWith("/ox-alpha");
+}
 const PREMIUM_QUOTA_MODELS = new Set([
   "deepseek/deepseek-v4-flash",
   "crof/kimi-k3-eco",
@@ -1585,7 +1593,7 @@ function isTransientUpstreamError(error) {
 }
 
 function pickToken(env, sessionModel, attempted = new Set()) {
-  if (PAUSED_QUOTA_MODELS.has(String(sessionModel || ''))) return null;
+  if (PAUSED_QUOTA_MODELS.has(String(sessionModel || '')) || isHiddenModelId(sessionModel)) return null;
   syncAccountState(env);
   const pool = parseAccounts(env);
   if (pool.length === 0) return null;
@@ -1910,13 +1918,13 @@ function isStaleSessionGate(status, body) {
 }
 
 function quotaEntryForModel(quota, sessionModel) {
-  if (!quota || typeof quota !== "object" || PAUSED_QUOTA_MODELS.has(sessionModel)) return null;
+  if (!quota || typeof quota !== "object" || PAUSED_QUOTA_MODELS.has(sessionModel) || isHiddenModelId(sessionModel)) return null;
   const scope = quotaScopeForModel(sessionModel);
   const pool = scope.startsWith("pool:") ? scope.slice(5) : null;
   if (pool === "premium") {
     const pooled = [];
     for (const [model, entry] of Object.entries(quota)) {
-      if (!entry || typeof entry !== "object" || PAUSED_QUOTA_MODELS.has(model)) continue;
+      if (!entry || typeof entry !== "object" || PAUSED_QUOTA_MODELS.has(model) || isHiddenModelId(model)) continue;
       const entryPool = String(entry.pool || "");
       if (entryPool === "premium" || (!entryPool && PREMIUM_QUOTA_MODELS.has(model))) pooled.push(entry);
     }
@@ -3220,7 +3228,7 @@ function resolveModelAlias(modelId) {
 // 查找模型配置：自定义别名 → 硬编码 MODELS → 动态表（合并表）
 function findModelConfig(modelId) {
   const target = resolveModelAlias(modelId) || modelId;
-  if (PAUSED_QUOTA_MODELS.has(target)) return null;
+  if (PAUSED_QUOTA_MODELS.has(target) || isHiddenModelId(target)) return null;
   const hit = MODELS.find((m) => m.id === target);
   if (hit) return hit;
   const dyn = dynamicModelsCache.models;
@@ -3235,7 +3243,7 @@ function findModelConfig(modelId) {
 // 不能依赖 /v1/models 先被调用：Cloudflare 不保证两个请求落在同一 isolate。
 async function resolveModelConfig(modelId) {
   const target = resolveModelAlias(modelId) || modelId;
-  if (PAUSED_QUOTA_MODELS.has(target)) return null;
+  if (PAUSED_QUOTA_MODELS.has(target) || isHiddenModelId(target)) return null;
   let hit = findModelConfig(target);
   if (hit) return hit;
   try {
@@ -3877,6 +3885,7 @@ function anthropicModelToOpenAI(model) {
   if (!raw) return null;
   // 剥掉 anthropic/ 前缀（claude 客户端有时带）
   raw = raw.replace(/^anthropic\//, "");
+  if (isHiddenModelId(raw)) return null;
   // 自定义别名优先（本地映射，无网络）
   const aliasHit = resolveModelAlias(raw);
   if (aliasHit) return aliasHit;
@@ -4707,7 +4716,7 @@ async function handleModels(client = null) {
   }
   // 官方暂停模型可能残留在动态源/旧 Key 白名单中；它不能继续出现在正常
   // 模型目录，否则客户端会先选中再收到上游 409。
-  modelList = modelList.filter((m) => !PAUSED_QUOTA_MODELS.has(m.id));
+  modelList = modelList.filter((m) => !PAUSED_QUOTA_MODELS.has(m.id) && !isHiddenModelId(m.id));
   const data = modelList
     .map((m) => {
       // 实测（2026-08-15）：免费账号只有 Flash / MiMo 2.5 两个模型能建会话

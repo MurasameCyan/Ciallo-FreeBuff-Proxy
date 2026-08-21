@@ -629,6 +629,38 @@ test('优先高级找不到未占用高级节点时才复用已占用高级节�
   assert.deepEqual(verified, ['US-advanced', 'SG-free', 'US-advanced']);
 });
 
+test('账号进入终态后立即停止自动节点验证，不继续携带 Bearer 遍历候选', async () => {
+  const nodes = ['US-A', 'SG-B'];
+  const verified = [];
+  const { service } = fakeService({
+    controller: {
+      async request(path) {
+        if (path === '/proxies/freebuff-pool') return { all: nodes, now: nodes[0] };
+        if (path === '/proxies/freebuff-auto') return { now: nodes[0], all: nodes };
+        if (path.startsWith('/group/freebuff-pool/delay')) return { 'US-A': 10, 'SG-B': 20 };
+        return {};
+      },
+    },
+    service: {
+      buildFetch: async () => ({ fetch: async () => new Response('ok'), close: async () => {} }),
+    },
+  });
+  await service.setSubscription('https://sub.example.com/list');
+
+  await assert.rejects(
+    () => service.selectAccountNodeAuto({
+      lane: 0,
+      identity: 'terminal-account',
+      verify: async ({ node }) => {
+        verified.push(node);
+        throw Object.assign(new Error('账号已进入终态'), { code: 'ACCOUNT_EGRESS_TERMINAL' });
+      },
+    }),
+    (error) => error?.code === 'ACCOUNT_EGRESS_TERMINAL',
+  );
+  assert.deepEqual(verified, ['US-A'], '终态错误后不得继续探测 SG-B');
+});
+
 test('账号自动节点验证结果会缓存，出口拒绝后避开原节点重选', async () => {
   let clock = 1000;
   const nodes = ['US-A', 'SG-B', 'JP-C'];

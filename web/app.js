@@ -310,9 +310,17 @@ const MODEL_DISPLAY = {
 // 官方已撤回但动态目录可能不再返回的模型，保留在管理面板用于说明历史配置，
 // 不代表它仍可调用；worker /v1/models 和请求入口都会将其排除。
 const PAUSED_MODEL_IDS = new Set(['minimax/minimax-m3']);
+const HIDDEN_MODEL_IDS = new Set(['stealth/ox-alpha']);
+
+function isHiddenModelId(modelId) {
+  const value = String(modelId || '').trim().toLowerCase();
+  return HIDDEN_MODEL_IDS.has(value) || value === 'ox-alpha'
+    || value === 'anthropic/ox-alpha' || value.endsWith('/ox-alpha');
+}
 
 function catalogModelIds() {
-  const ids = Array.isArray(S.models) ? S.models.map((m) => m.id).filter(Boolean) : [];
+  const ids = Array.isArray(S.models) ? S.models.map((m) => m.id)
+    .filter((id) => id && !isHiddenModelId(id)) : [];
   for (const id of PAUSED_MODEL_IDS) if (!ids.includes(id)) ids.push(id);
   return ids;
 }
@@ -340,7 +348,9 @@ function modelDisplay(id, model = null) {
 }
 
 function modelListHtml(modelIds = []) {
-  return [...new Set((Array.isArray(modelIds) ? modelIds : []).filter(Boolean))].map((id) => {
+  return [...new Set((Array.isArray(modelIds) ? modelIds : []).filter((id) => {
+    return id && !isHiddenModelId(id);
+  }))].map((id) => {
     const { name, tier, tierKey } = modelDisplay(id);
     return `<span class="model-label" title="${esc(id)}">${esc(name)}${tier ? ` <span class="pill tier tier-${esc(tierKey)}">${esc(tier)}</span>` : ''}</span>`;
   }).join(', ');
@@ -357,7 +367,8 @@ function quotaRows(probe) {
   if (!probe || !Array.isArray(probe.quota)) return [];
   return probe.quota.filter((q) => {
     const limit = Number(q?.limit);
-    return Number.isFinite(limit) && limit >= 0 && !PAUSED_MODEL_IDS.has(String(q?.model || ''));
+    return Number.isFinite(limit) && limit >= 0
+      && !PAUSED_MODEL_IDS.has(String(q?.model || '')) && !isHiddenModelId(q?.model);
   });
 }
 
@@ -709,6 +720,7 @@ async function saveAliases(next) {
 // （PATCH），空就是发新的（POST）—— 省掉第二套 DOM 和第二条提交路径。
 let keyEditing = null;
 let keyEditingPausedModels = [];
+let keyEditingHiddenModels = [];
 
 function keyMask(key) {
   return `${key.slice(0, 8)}…`;
@@ -717,13 +729,14 @@ function keyMask(key) {
 /** 已存的白名单模型即使当前模型表里没有也保留，
     否则编辑一把限了「暂时拉不到的模型」的 key，一保存就把白名单清空了。 */
 function selectedKeyModels() {
-  return [...$('newKeyModels').querySelectorAll('[data-key-model][aria-pressed="true"]')]
+  const selected = [...$('newKeyModels').querySelectorAll('[data-key-model][aria-pressed="true"]')]
     .map((button) => button.dataset.keyModel)
     .filter(Boolean);
+  return [...new Set([...selected, ...keyEditingPausedModels, ...keyEditingHiddenModels])];
 }
 
 function setKeyModelSelection(selected = []) {
-  const wanted = new Set([...selected, ...keyEditingPausedModels]);
+  const wanted = new Set([...selected, ...keyEditingPausedModels, ...keyEditingHiddenModels]);
   const hasSpecific = wanted.size > 0;
   $('newKeyModels').querySelectorAll('[data-key-model]').forEach((button) => {
     const model = button.dataset.keyModel;
@@ -734,7 +747,7 @@ function setKeyModelSelection(selected = []) {
 function fillKeyModelButtons(selected = []) {
   const chosen = [...new Set(selected.filter(Boolean))];
   const ids = catalogModelIds();
-  for (const id of chosen) if (!ids.includes(id)) ids.push(id);
+  for (const id of chosen) if (!ids.includes(id) && !isHiddenModelId(id)) ids.push(id);
   const root = $('newKeyModels');
   root.innerHTML = [
     `<button type="button" class="key-model-option" data-key-model="" aria-pressed="${chosen.length === 0}" title="不限模型">All</button>`,
@@ -760,6 +773,7 @@ function fillKeyModelButtons(selected = []) {
 function resetKeyForm() {
   keyEditing = null;
   keyEditingPausedModels = [];
+  keyEditingHiddenModels = [];
   $('newKeyName').value = '';
   $('newKeyConcurrency').value = '1';   // 并发默认 1：免费通道同号并发 >1 就出问题
   $('newKeyDaily').value = '0';
@@ -772,6 +786,9 @@ function fillKeyForm(k) {
   keyEditing = k.key;
   keyEditingPausedModels = Array.isArray(k.models)
     ? k.models.filter((model) => PAUSED_MODEL_IDS.has(model))
+    : [];
+  keyEditingHiddenModels = Array.isArray(k.models)
+    ? k.models.filter((model) => isHiddenModelId(model))
     : [];
   $('newKeyName').value = k.name || '';
   $('newKeyConcurrency').value = String(k.concurrency ?? 1);
@@ -796,8 +813,9 @@ function renderKeys() {
     body.innerHTML = list.map((k) => {
       const st = S.keyStats[k.name] || {};
       const modelIds = Array.isArray(k.models) ? k.models : [];
-      const models = modelIds.length ? modelListHtml(modelIds) : 'All';
-      const modelsTitle = modelIds.length ? modelIds.join(', ') : 'All';
+      const visibleModelIds = modelIds.filter((model) => !isHiddenModelId(model));
+      const models = modelIds.length ? (modelListHtml(modelIds) || '—') : 'All';
+      const modelsTitle = visibleModelIds.length ? visibleModelIds.join(', ') : (modelIds.length ? '—' : 'All');
       const running = st.inFlight > 0 ? ` · <span class="key-inflight" title="在跑 ${st.inFlight}" aria-label="在跑 ${st.inFlight}">${st.inFlight}</span>` : '';
       return `<tr class="${k.disabled ? 'key-off' : ''}">
         <td><span class="nm">${esc(k.name)}</span>${k.disabled ? ' <span class="pill">已停用</span>' : ''}</td>
@@ -916,7 +934,9 @@ function renderModels() {
   const ul = $('models');
   const known = new Map((Array.isArray(S.models) ? S.models : []).map((m) => [m.id, m]));
   for (const id of PAUSED_MODEL_IDS) if (!known.has(id)) known.set(id, { id, tier: 'paused' });
-  const list = [...known.values()];
+  const list = [...known.values()].filter((m) => {
+    return m?.id && !isHiddenModelId(m.id);
+  });
   const modelCount = $('modelCount');
   if (modelCount) modelCount.textContent = `${list.length} 个`;
   $('models-empty').hidden = list.length > 0;
@@ -1027,6 +1047,8 @@ function renderProxy() {
       : '当前优先选择未被其他账号使用的节点，点击切换为优先高级';
     accountPriorityToggle.disabled = !p.configured || state === 'starting';
   }
+  const accountEgressRefresh = $('accountEgressRefresh');
+  if (accountEgressRefresh) accountEgressRefresh.disabled = !p.configured || state === 'starting';
 
   const rawNodes = Array.isArray(p.nodes) ? p.nodes : [];
   // 后端已按延迟升序排序（失效节点垫底），前端只如实呈现顺序与延迟。
@@ -1191,7 +1213,7 @@ function renderUsageOverview() {
  * 累计分布 —— 逐条日志被环形缓冲截断后，早期调用只在这个累计数里还留着。
  */
 function renderUsageModels() {
-  const rows = rankBreakdown(S.usage?.byModel, 0);
+  const rows = rankBreakdown(S.usage?.byModel, 0).filter((row) => !isHiddenModelId(row.key));
   $('s-models-empty').hidden = rows.length > 0;
 
   const ul = $('s-models');
@@ -1554,6 +1576,12 @@ function wire() {
       return priority === 'advanced' ? '已设为优先高级' : '已设为优先未用';
     }).finally(() => renderProxy());
   });
+  $('accountEgressRefresh')?.addEventListener('click', (event) => run(event.currentTarget, '刷新出站', async () => {
+    const r = await api('/proxy/refresh-egress', { method: 'POST' });
+    S.proxy = r?.proxy || S.proxy;
+    renderProxy();
+    return Number.isFinite(r?.refreshedAccounts) ? `已重测 ${r.refreshedAccounts} 个自动账号` : '';
+  }));
   $('proxyNode')?.addEventListener('change', async (event) => {
     const select = event.currentTarget;
     const node = select.value;

@@ -165,10 +165,29 @@ assert.match(html, /id="acctBody"><tr><td colspan="5" class="empty">加载中…
   '账号池新增出站节点列后，初始空态必须横跨 5 列');
 assert.match(html, /id="accountPriorityToggle"[^>]*aria-pressed="true"[^>]*>优先高级<\/button>/s,
   '账号池必须提供默认“优先高级”点击切换按钮');
+assert.match(html,
+  /id="accountPriorityToggle"[^>]*>优先高级<\/button>\s*<button[^>]*id="accountEgressRefresh"[^>]*>刷新出站<\/button>/s,
+  '账号池必须在“优先高级”右侧提供刷新出站按钮');
 assert.ok(app.includes('accountSelectionPriority') && app.includes("/proxy/account-priority"),
   '账号优先级按钮必须读取状态并调用专用管理 API');
+assert.ok(app.includes("api('/proxy/refresh-egress'"),
+  '刷新出站按钮必须调用独立管理 API，不能复用只更新订阅的接口');
+assert.match(app, /\$\('accountEgressRefresh'\)[\s\S]{0,160}disabled\s*=\s*!p\.configured\s*\|\|\s*state\s*===\s*'starting'/,
+  '未配置订阅或代理启动中时刷新出站按钮必须禁用');
 assert.match(css, /\.account-priority-toggle\s*\{[^}]*white-space:\s*nowrap/s,
   '账号优先级按钮必须保持紧凑单行');
+assert.match(css, /\.account-egress-refresh\s*\{[^}]*white-space:\s*nowrap/s,
+  '刷新出站按钮必须保持紧凑单行');
+assert.ok(app.includes("const HIDDEN_MODEL_IDS = new Set(['stealth/ox-alpha'])"),
+  '面板必须过滤 service-only ox-alpha，避免旧缓存或 Key 白名单重新显示');
+assert.match(app, /function isHiddenModelId\(modelId\)[\s\S]*?value === 'ox-alpha'[\s\S]*?value\.endsWith\('\/ox-alpha'\)/,
+  '面板必须统一过滤完整 ID、供应商变体和短名 ox-alpha');
+assert.match(app, /for \(const id of chosen\) if \(!ids\.includes\(id\) && !isHiddenModelId\(id\)\) ids\.push\(id\)/,
+  '旧 Key 白名单里的短名 ox-alpha 不得被重新加入模型按钮');
+assert.match(app, /function quotaRows\(probe\)[\s\S]*?!isHiddenModelId\(q\?\.model\)/,
+  '账号可用模型列表必须在生成行之前排除 ox-alpha，不能留下空项目');
+assert.match(app, /const rows = rankBreakdown\(S\.usage\?\.byModel, 0\)\.filter\(\(row\) => !isHiddenModelId\(row\.key\)\)/,
+  '概况模型统计不得从历史数据重新显示 ox-alpha');
 assert.ok(app.includes('function poolResetAt') && app.includes('function renderQuotaHead'),
   '重置时间必须提到列标题（池级统一，逐行重复无信息量）');
 assert.ok(app.includes('`可用模型 (重置 ${formatResetAt(reset)})`'),

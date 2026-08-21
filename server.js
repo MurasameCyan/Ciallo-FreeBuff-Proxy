@@ -355,8 +355,8 @@ function json(res, status, obj, extraHeaders = {}) {
   res.end(JSON.stringify(obj));
 }
 
-function err(res, status, message, type = 'api_error') {
-  json(res, status, { error: { message, type } });
+function err(res, status, message, type = 'api_error', extraHeaders = {}) {
+  json(res, status, { error: { message, type } }, extraHeaders);
 }
 
 function readBody(req, maxBytes = 2 * 1024 * 1024) {
@@ -477,6 +477,7 @@ async function probeAccount(token, {
   timeoutMs = 15000,
   queueKey = null,
 } = {}) {
+  const stateToken = normalizeAccountToken(token);
   const headers = { 'x-freebuff-include-unused-rate-limits': '1' };
   const r = queueKey == null
     ? await enqueueUpstream('GET', '/api/v1/freebuff/session', token, undefined,
@@ -546,16 +547,18 @@ async function probeAccount(token, {
   // 只有管理员主动探测得到明确存活结果时才清除持久隔离；业务成功响应
   // 不自动清除，避免上游短暂异常造成封禁状态抖动。
   if (updateIsolation) {
-    const existingState = accountStateStore.snapshot([token])[token] || null;
-    if (result.state === 'ok') accountStateStore.clear(token);
+    const existingState = accountStateStore.snapshot([stateToken])[stateToken] || null;
+    if (result.state === 'ok') accountStateStore.clear(stateToken);
     else if (result.state === 'banned' && existingState?.state !== 'banned') {
-      accountStateStore.set(token, { state: 'banned', until: null, reason: 'upstream_banned' });
+      accountStateStore.set(stateToken, { state: 'banned', until: null, reason: 'upstream_banned' });
+      cancelAccountEgressTasksForToken(stateToken);
     } else if (result.state === 'token_invalid' && existingState?.state !== 'token_invalid') {
-      accountStateStore.set(token, { state: 'token_invalid', until: null, reason: 'upstream_auth_rejected' });
+      accountStateStore.set(stateToken, { state: 'token_invalid', until: null, reason: 'upstream_auth_rejected' });
+      cancelAccountEgressTasksForToken(stateToken);
     }
   }
   // 官方 banned 没有恢复时间；永久隔离只由管理员成功探测或 clear 解除。
-  const isolation = accountStateStore.snapshot([token])[token];
+  const isolation = accountStateStore.snapshot([stateToken])[stateToken];
   result.isolatedUntil = isolation && isolation.until != null ? isolation.until : null;
   result.isolatedPermanent = Boolean(
     isolation && isolation.until == null
@@ -605,6 +608,11 @@ function cancelAccountEgressTasks(accountKey) {
   }
 }
 
+function cancelAccountEgressTasksForToken(token) {
+  const account = accountByToken(token);
+  if (account) cancelAccountEgressTasks(account.key);
+}
+
 function normalizeAccountToken(value) {
   const token = String(value || '').trim();
   const colon = token.indexOf(':');
@@ -622,6 +630,40 @@ function accountByToken(token) {
 
 function accountByKey(key) {
   return listAccounts().find((account) => account.key === key) || null;
+}
+
+const TERMINAL_ACCOUNT_STATE_LABELS = Object.freeze({
+  banned: '已被封禁',
+  token_invalid: '凭据已失效',
+  manual_disabled: '管理员已停用',
+});
+
+function accountTerminalState(account) {
+  const token = normalizeAccountToken(account?.token);
+  if (!token) return null;
+  return accountStateStore.snapshot([token])[token] || null;
+}
+
+function isTerminalAccount(account) {
+  return Boolean(accountTerminalState(account));
+}
+
+function terminalAccountProbe(account) {
+  const state = accountTerminalState(account);
+  if (!state) return null;
+  return {
+    state: state.state,
+    label: TERMINAL_ACCOUNT_STATE_LABELS[state.state] || '账号已隔离',
+    quota: null,
+    retryAfterMs: null,
+    uid: null,
+    accessTier: null,
+    model: null,
+    statusCode: state.state === 'token_invalid' ? 401 : 403,
+    isolatedUntil: null,
+    isolatedPermanent: true,
+    ...(state.reason ? { reason: state.reason } : {}),
+  };
 }
 
 function accountEgressUnavailableFetch() {
@@ -644,7 +686,7 @@ function resolveAccountUpstreamRoute(token) {
   return null;
 }
 
-function accountEgressFetch(account, { schedule = true, withRoute = false } = {}) {
+function accountEgressFetch(account, { schedule = true, withRoute = false, allowTerminal = false } = {}) {
   if (!account) return null;
   const route = (selectedFetch) => {
     if (!withRoute) return selectedFetch;
@@ -657,6 +699,7 @@ function accountEgressFetch(account, { schedule = true, withRoute = false } = {}
       },
     };
   };
+  if (!allowTerminal && isTerminalAccount(account)) return route(accountEgressUnavailableFetch);
   if (!getConfiguredSubscription()) return route(accountEgressUnavailableFetch);
   const identity = accountEgressIdentity(account);
   const fetchForLane = getAccountUpstreamFetch(account.egressLane, { identity });
@@ -678,6 +721,7 @@ function accountEgressFetch(account, { schedule = true, withRoute = false } = {}
 }
 
 function accountEgressStatus(account) {
+  const terminal = accountTerminalState(account);
   const currentNode = Number.isInteger(account?.egressLane)
     ? getAccountProxyNode(account.egressLane) || null : null;
   const reject = Number.isInteger(account?.egressLane)
@@ -692,7 +736,10 @@ function accountEgressStatus(account) {
     : Boolean(autoVerifiedFetch);
   let state = 'unavailable';
   let error = null;
-  if (!getConfiguredSubscription()) {
+  if (terminal) {
+    state = 'terminal';
+    error = TERMINAL_ACCOUNT_STATE_LABELS[terminal.state] || '账号已隔离';
+  } else if (!getConfiguredSubscription()) {
     state = 'proxy_offline';
     error = '尚未配置出口代理订阅';
   } else if (!Number.isInteger(account?.egressLane)) {
@@ -718,6 +765,7 @@ function accountEgressStatus(account) {
     region: inferNodeRegion(currentNode),
     verified,
     reject,
+    terminal: terminal ? { state: terminal.state, reason: terminal.reason || null } : null,
     error,
   };
 }
@@ -727,6 +775,7 @@ async function configureAccountEgress(account, {
   node = account?.egressNode,
   force = false,
   persist = true,
+  allowTerminal = false,
 } = {}) {
   if (!account || !account.hasToken) throw Object.assign(new Error('账号不存在'), { code: 'ACCOUNT_NOT_FOUND' });
   if (!Number.isInteger(account.egressLane)) {
@@ -747,12 +796,21 @@ async function configureAccountEgress(account, {
       identity: expectedIdentity,
       force,
       verify: async ({ fetch: fetchForLane }) => {
+        if (!allowTerminal && isTerminalAccount(account)) {
+          throw Object.assign(new Error('账号已进入终态'), { code: 'ACCOUNT_EGRESS_TERMINAL' });
+        }
         const probe = await probeAccount(account.token, {
           upstreamFetch: fetchForLane,
           updateIsolation: false,
           timeoutMs: ACCOUNT_EGRESS_PROBE_TIMEOUT_MS,
           queueKey: account.key,
         });
+        if (['banned', 'token_invalid', 'manual_disabled'].includes(probe.state)) {
+          throw Object.assign(new Error('账号已进入终态'), { code: 'ACCOUNT_EGRESS_TERMINAL' });
+        }
+        if (!allowTerminal && isTerminalAccount(account)) {
+          throw Object.assign(new Error('账号已进入终态'), { code: 'ACCOUNT_EGRESS_TERMINAL' });
+        }
         return classifyAccountProbeAuthorization(probe);
       },
     });
@@ -774,6 +832,7 @@ async function configureAccountEgress(account, {
 }
 
 function scheduleAccountEgress(account, { force = false } = {}) {
+  if (isTerminalAccount(account)) return null;
   if (!account || !getConfiguredSubscription() || accountEgressMutationActive(account.key)) return null;
   const identity = accountEgressIdentity(account);
   const taskKey = accountEgressTaskKey(account);
@@ -789,7 +848,7 @@ function scheduleAccountEgress(account, { force = false } = {}) {
       record.pendingForce = false;
       if (record.cancelled) return null;
       const current = accountByKey(account.key);
-      if (!current || accountEgressIdentity(current) !== identity || accountEgressMutationActive(account.key)) return null;
+      if (!current || isTerminalAccount(current) || accountEgressIdentity(current) !== identity || accountEgressMutationActive(account.key)) return null;
       try {
         await configureAccountEgress(current, { force: runForce, persist: false });
       } catch (error) {
@@ -804,17 +863,66 @@ function scheduleAccountEgress(account, { force = false } = {}) {
   return record.task;
 }
 
-async function initializeAccountEgress({ force = false } = {}) {
-  if (!getConfiguredSubscription()) return;
-  await Promise.all(listAccounts()
-    .filter((account) => account.hasToken && Number.isInteger(account.egressLane))
-    .map(async (account) => {
-      try {
-        await scheduleAccountEgress(account, { force });
-      } catch (error) {
-        console.error(`[server] 账号 ${account.key} 出站初始化失败: ${String(error?.message || error).slice(0, 180)}`);
+async function initializeAccountEgress({ force = false, serial = false, autoOnly = false, skipActive = false } = {}) {
+  if (!getConfiguredSubscription()) return 0;
+  const accounts = listAccounts().filter((account) => account.hasToken
+    && Number.isInteger(account.egressLane)
+    && (!autoOnly || account.egressMode === 'auto')
+    && !isTerminalAccount(account));
+  let refreshed = 0;
+  const run = async (account) => {
+    try {
+      const active = skipActive && typeof accountEgressTaskActive === 'function' && accountEgressTaskActive(account);
+      const task = scheduleAccountEgress(account, { force });
+      if (task) {
+        if (!active || force) refreshed++;
+        await task;
       }
-    }));
+    } catch (error) {
+      console.error(`[server] 账号 ${account.key} 出站初始化失败: ${String(error?.message || error).slice(0, 180)}`);
+    }
+  };
+  if (serial) {
+    for (const account of accounts) await run(account);
+  } else {
+    await Promise.all(accounts.map(run));
+  }
+  return refreshed;
+}
+
+const ACCOUNT_EGRESS_REFRESH_COOLDOWN_MS = 60 * 1000;
+let accountEgressRefreshTask = null;
+let accountEgressRefreshAt = 0;
+
+async function refreshAccountEgressNow() {
+  if (!getConfiguredSubscription()) {
+    throw Object.assign(new Error('未配置订阅，无法刷新出站'), { code: 'ACCOUNT_EGRESS_REFRESH_UNAVAILABLE' });
+  }
+  if (accountEgressRefreshTask) {
+    throw Object.assign(new Error('已有一轮出站刷新正在进行'), { code: 'ACCOUNT_EGRESS_REFRESH_IN_PROGRESS' });
+  }
+  const retryAfterMs = ACCOUNT_EGRESS_REFRESH_COOLDOWN_MS - (Date.now() - accountEgressRefreshAt);
+  if (accountEgressRefreshAt && retryAfterMs > 0) {
+    throw Object.assign(new Error('出站刚刚刷新过，请稍后重试'), {
+      code: 'ACCOUNT_EGRESS_REFRESH_COOLDOWN', retryAfterMs,
+    });
+  }
+  const run = (async () => {
+    const refreshed = await refreshSubscription();
+    if (refreshed && refreshed.ok === false) {
+      throw Object.assign(new Error(refreshed.error || '订阅刷新失败'), { code: 'ACCOUNT_EGRESS_REFRESH_FAILED' });
+    }
+    const refreshedAccounts = await initializeAccountEgress({ force: true, serial: true, autoOnly: true, skipActive: true });
+    accountEgressRefreshAt = Date.now();
+    const proxy = await getProxyStatus();
+    return { proxy, refreshedAccounts };
+  })();
+  accountEgressRefreshTask = run;
+  try {
+    return await run;
+  } finally {
+    if (accountEgressRefreshTask === run) accountEgressRefreshTask = null;
+  }
 }
 
 function handleEgressReject(info = {}) {
@@ -822,6 +930,7 @@ function handleEgressReject(info = {}) {
   if (Number.isInteger(info.lane)) {
     if (!account || account.egressLane !== info.lane) return;
     noteEgressReject(info);
+    if (isTerminalAccount(account)) return;
     if (account?.egressMode === 'auto') scheduleAccountEgress(account, { force: true });
     return;
   }
@@ -830,7 +939,21 @@ function handleEgressReject(info = {}) {
     return;
   }
   noteEgressReject({ ...info, lane: account.egressLane });
+  if (isTerminalAccount(account)) return;
   if (account.egressMode === 'auto') scheduleAccountEgress(account, { force: true });
+}
+
+async function ensureAccountEgressForAdminProbe(account) {
+  let upstreamFetch = accountEgressFetch(account, { schedule: false, allowTerminal: true });
+  if (upstreamFetch !== accountEgressUnavailableFetch) return upstreamFetch;
+  if (!account || account.egressMode !== 'auto' || !Number.isInteger(account.egressLane)) return upstreamFetch;
+  try {
+    await configureAccountEgress(account, { force: true, persist: false, allowTerminal: true });
+  } catch {
+    // The caller will return the normal egress_unavailable response.
+  }
+  upstreamFetch = accountEgressFetch(account, { schedule: false, allowTerminal: true });
+  return upstreamFetch;
 }
 
 // === Freebuff 授权码登录（OAuth 代理） ===
@@ -976,6 +1099,21 @@ function proxyApiError(res, error) {
   const code = error?.code || '';
   const raw = String(error?.message || '代理操作失败');
   if (code === 'ENV_LOCKED') return err(res, 409, 'SUBSCRIPTION_URL 由环境变量配置，面板不可覆盖', 'env_locked');
+  if (code === 'ACCOUNT_EGRESS_REFRESH_UNAVAILABLE') {
+    return err(res, 409, '未配置订阅，无法刷新出站', 'egress_refresh_unavailable');
+  }
+  if (code === 'ACCOUNT_EGRESS_REFRESH_IN_PROGRESS') {
+    return err(res, 409, '已有一轮出站刷新正在进行', 'egress_refresh_in_progress');
+  }
+  if (code === 'ACCOUNT_EGRESS_REFRESH_COOLDOWN') {
+    const retryAfterMs = Math.max(1000, Number(error?.retryAfterMs) || 0);
+    return err(res, 429, '出站刚刚刷新过，请稍后重试', 'egress_refresh_cooldown', {
+      'Retry-After': String(Math.ceil(retryAfterMs / 1000)),
+    });
+  }
+  if (code === 'ACCOUNT_EGRESS_REFRESH_FAILED') {
+    return err(res, 503, '出站刷新失败，请稍后重试', 'egress_refresh_failed');
+  }
   if (/订阅地址|必须以|必须是|模式|间隔|整数|节点不存在|选择节点|优先级|enabled/i.test(raw)) {
     return err(res, 400, raw.slice(0, 180), 'invalid_proxy_config');
   }
@@ -1051,9 +1189,17 @@ function buildWorkerEnv() {
     // worker 只拿当前账号的内存快照；落盘始终由 server 负责哈希 token。
     FREEBUFF_ACCOUNT_STATE: accountStateStore.snapshot(stateTokens),
     FREEBUFF_ACCOUNT_STATE_REVISION: accountStateStore.revision(),
-    FREEBUFF_ACCOUNT_STATE_SET: (token, state) => accountStateStore.set(token, state),
-    FREEBUFF_ACCOUNT_STATE_CLEAR: (token) => accountStateStore.clear(token),
-    FREEBUFF_ACCOUNT_STATE_GET: (token) => accountStateStore.snapshot([token])[token] || null,
+    FREEBUFF_ACCOUNT_STATE_SET: (token, state) => {
+      const normalized = normalizeAccountToken(token);
+      const result = accountStateStore.set(normalized, state);
+      cancelAccountEgressTasksForToken(normalized);
+      return result;
+    },
+    FREEBUFF_ACCOUNT_STATE_CLEAR: (token) => accountStateStore.clear(normalizeAccountToken(token)),
+    FREEBUFF_ACCOUNT_STATE_GET: (token) => {
+      const normalized = normalizeAccountToken(token);
+      return accountStateStore.snapshot([normalized])[normalized] || null;
+    },
   };
 }
 
@@ -1118,6 +1264,15 @@ async function handleWebApi(req, res, url) {
         const proxy = await refreshSubscription();
         if (proxy.ok) void initializeAccountEgress();
         return json(res, 200, { ok: proxy.ok, proxy });
+      } catch (e) {
+        return proxyApiError(res, e);
+      }
+    }
+
+    if (method === 'POST' && sub === 'refresh-egress') {
+      try {
+        const result = await refreshAccountEgressNow();
+        return json(res, 200, result);
       } catch (e) {
         return proxyApiError(res, e);
       }
@@ -1212,6 +1367,10 @@ async function handleWebApi(req, res, url) {
       const results = await Promise.all(accounts.map(async (acct) => {
         if (!acct.hasToken) {
           return { key: acct.key, egress: accountEgressStatus(acct), probe: null };
+        }
+        const terminalProbe = terminalAccountProbe(acct);
+        if (terminalProbe) {
+          return { key: acct.key, egress: accountEgressStatus(acct), probe: terminalProbe };
         }
         const upstreamFetch = accountEgressFetch(acct);
         const accountEgress = accountEgressStatus(acct);
@@ -1324,8 +1483,9 @@ async function handleWebApi(req, res, url) {
       const acct = accounts.find((a) => a.key === decodeURIComponent(sub));
       if (!acct || !acct.hasToken) return err(res, 404, '账号不存在', 'not_found');
       try {
+        const upstreamFetch = await ensureAccountEgressForAdminProbe(acct);
         return json(res, 200, await probeAccount(acct.token, {
-          upstreamFetch: accountEgressFetch(acct),
+          upstreamFetch,
           queueKey: acct.key,
         }));
       } catch (error) {

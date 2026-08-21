@@ -1426,6 +1426,7 @@ export function createProxyService({
             });
           } catch (error) {
             if (error?.code === 'ACCOUNT_EGRESS_SUPERSEDED') throw error;
+            if (error?.code === 'ACCOUNT_EGRESS_TERMINAL') throw error;
             verificationFailed = true;
             serviceLogger('warn', `[proxy] 账号 lane ${lane} 节点验证失败 ${candidate.name}: ${cleanError(error)}`);
           }

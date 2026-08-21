@@ -563,14 +563,28 @@ test('管理员探测按明确结果持久隔离，自动候选验证不修改�
   const probeAccount = new Function(
     'enqueueUpstream',
     'accountStateStore',
+    'normalizeAccountToken',
+    'cancelAccountEgressTasksForToken',
     `${source.slice(start, end)}; return probeAccount;`,
-  )(enqueueUpstream, accountStateStore);
-  const token = 'server-probe-terminal-token-123456';
+  )(
+    enqueueUpstream,
+    accountStateStore,
+    (value) => String(value || '').trim().split(':', 1)[0],
+    (value) => cancelledTokens.push(value),
+  );
+  const bearerToken = 'server-probe-terminal-token-123456';
+  const token = `${bearerToken}:uid-value`;
+  const cancelledTokens = [];
   let expectedTimeout = 15000;
 
   const banned = await probeAccount(token, { upstreamFetch: expectedFetch });
   assert.equal(banned.state, 'banned');
   assert.equal(banned.isolatedPermanent, true);
+  assert.equal(accountStateStore.snapshot([bearerToken])[bearerToken]?.state, 'banned',
+    'token:uid 管理探测必须把终态写到裸 Bearer token');
+  assert.deepEqual(accountStateStore.snapshot([token]), {},
+    '不能把带 uid 的展示凭据另存成无法被 worker 命中的终态');
+  assert.deepEqual(cancelledTokens, [bearerToken], '终态持久化后必须取消该 Bearer 的后台出站任务');
   assert.equal(Object.hasOwn(banned, 'raw'), false);
   const bannedRaw = await readFile(file, 'utf8');
   assert.match(bannedRaw, /"state":\s*"banned"/);
@@ -590,6 +604,8 @@ test('管理员探测按明确结果持久隔离，自动候选验证不修改�
   const healthy = await probeAccount(token, { upstreamFetch: expectedFetch });
   assert.equal(healthy.state, 'ok');
   assert.equal(healthy.isolatedPermanent, false);
+  assert.deepEqual(accountStateStore.snapshot([bearerToken]), {},
+    '管理员成功探测必须清除裸 Bearer token 的终态');
   assert.doesNotMatch(await readFile(file, 'utf8'), /"state":\s*"banned"/);
 
   upstreamResult = { status: 403, data: { error: { status: 'banned' } } };
@@ -961,6 +977,7 @@ test('账号出口初始化并发启动全部有效账号，不被首个慢任�
     'getConfiguredSubscription',
     'listAccounts',
     'scheduleAccountEgress',
+    'isTerminalAccount',
     `${source.slice(start, end)}; return initializeAccountEgress;`,
   )(
     () => 'https://subscription.example.test',
@@ -973,6 +990,7 @@ test('账号出口初始化并发启动全部有效账号，不被首个慢任�
       started.push(account.key);
       return account.key === 'slow' ? slowTask : Promise.resolve();
     },
+    () => false,
   );
   const started = [];
   let releaseSlow;
@@ -986,12 +1004,268 @@ test('账号出口初始化并发启动全部有效账号，不被首个慢任�
   await initialization;
 });
 
+test('手动刷新出站只串行强制重验自动账号，手动绑定账号保持不变', async () => {
+  const source = readFileSync(new URL('../server.js', import.meta.url), 'utf8');
+  const start = source.indexOf('async function initializeAccountEgress(');
+  const end = source.indexOf('\nconst ACCOUNT_EGRESS_REFRESH_COOLDOWN_MS', start);
+  assert.ok(start >= 0 && end > start, '账号出口初始化后应定义手动刷新冷却器');
+  const initializeAccountEgress = new Function(
+    'getConfiguredSubscription',
+    'listAccounts',
+    'scheduleAccountEgress',
+    'isTerminalAccount',
+    `${source.slice(start, end)}; return initializeAccountEgress;`,
+  )(
+    () => 'https://subscription.example.test',
+    () => [
+      { key: 'auto-slow', hasToken: true, egressLane: 1, egressMode: 'auto' },
+      { key: 'manual', hasToken: true, egressLane: 2, egressMode: 'manual' },
+      { key: 'auto-fast', hasToken: true, egressLane: 3, egressMode: 'auto' },
+    ],
+    (account, options) => {
+      started.push({ key: account.key, options });
+      return account.key === 'auto-slow' ? slowTask : Promise.resolve();
+    },
+    () => false,
+  );
+  const started = [];
+  let releaseSlow;
+  const slowTask = new Promise((resolve) => { releaseSlow = resolve; });
+
+  const refresh = initializeAccountEgress({ force: true, serial: true, autoOnly: true });
+  await Promise.resolve();
+  assert.deepEqual(started.map((entry) => entry.key), ['auto-slow'],
+    '串行刷新不得在首个账号完成前启动下一个账号探测');
+  releaseSlow();
+  const refreshed = await refresh;
+  assert.deepEqual(started.map((entry) => entry.key), ['auto-slow', 'auto-fast']);
+  assert.ok(started.every((entry) => entry.options.force === true), '手动刷新必须强制重新验证缓存');
+  assert.equal(refreshed, 2, '返回值应为实际发起重验的自动账号数');
+});
+
+test('自动出口初始化跳过终态账号，批量刷新合并已有任务后强制重测', async () => {
+  const source = readFileSync(new URL('../server.js', import.meta.url), 'utf8');
+  const start = source.indexOf('function scheduleAccountEgress(');
+  const end = source.indexOf('\nconst ACCOUNT_EGRESS_REFRESH_COOLDOWN_MS', start);
+  assert.ok(start >= 0 && end > start, '应能隔离后台调度与批量初始化逻辑');
+  const terminal = new Map([
+    ['banned-token', { state: 'banned', until: null }],
+    ['invalid-token', { state: 'token_invalid', until: null }],
+    ['disabled-token', { state: 'manual_disabled', until: null }],
+  ]);
+  const accountStateStore = {
+    snapshot(tokens) {
+      return Object.fromEntries(tokens.flatMap((token) => terminal.has(token) ? [[token, terminal.get(token)]] : []));
+    },
+  };
+  const accounts = [
+    { key: 'banned', token: 'banned-token', hasToken: true, egressLane: 1, egressMode: 'auto' },
+    { key: 'invalid', token: 'invalid-token', hasToken: true, egressLane: 2, egressMode: 'auto' },
+    { key: 'disabled', token: 'disabled-token', hasToken: true, egressLane: 3, egressMode: 'auto' },
+    { key: 'healthy', token: 'healthy-token', hasToken: true, egressLane: 4, egressMode: 'auto' },
+  ];
+  const configured = [];
+  const api = new Function(
+    'getConfiguredSubscription',
+    'accountEgressMutationActive',
+    'accountEgressIdentity',
+    'accountEgressTaskKey',
+    'accountEgressTasks',
+    'accountEgressTaskActive',
+    'accountByKey',
+    'configureAccountEgress',
+    'listAccounts',
+    'accountStateStore',
+    'isTerminalAccount',
+    `${source.slice(start, end)}; return { scheduleAccountEgress, initializeAccountEgress };`,
+  )(
+    () => 'https://subscription.example.test',
+    () => false,
+    (account) => account.token,
+    (account) => `${account.key}\0${account.token}`,
+    new Map(),
+    () => false,
+    (key) => accounts.find((account) => account.key === key) || null,
+    async (account, options) => { configured.push({ key: account.key, options }); },
+    () => accounts,
+    accountStateStore,
+    (account) => Boolean(account?.token && accountStateStore.snapshot([account.token])[account.token]),
+  );
+
+  assert.equal(api.scheduleAccountEgress(accounts[0], { force: true }), null,
+    '后台调度入口不得触碰 banned 账号');
+  const refreshed = await api.initializeAccountEgress({ force: true, serial: true, autoOnly: true });
+  assert.deepEqual(configured.map((entry) => entry.key), ['healthy']);
+  assert.equal(refreshed, 1);
+
+  let release;
+  const active = new Promise((resolve) => { release = resolve; });
+  const activeAccounts = [{ key: 'active', token: 'active-token', hasToken: true, egressLane: 5, egressMode: 'auto' }];
+  let runs = 0;
+  const tasks = new Map();
+  const activeApi = new Function(
+    'getConfiguredSubscription',
+    'accountEgressMutationActive',
+    'accountEgressIdentity',
+    'accountEgressTaskKey',
+    'accountEgressTasks',
+    'accountEgressTaskActive',
+    'accountByKey',
+    'configureAccountEgress',
+    'listAccounts',
+    'accountStateStore',
+    'isTerminalAccount',
+    `${source.slice(start, end)}; return { scheduleAccountEgress, initializeAccountEgress };`,
+  )(
+    () => 'https://subscription.example.test',
+    () => false,
+    (account) => account.token,
+    (account) => `${account.key}\0${account.token}`,
+    tasks,
+    (account) => tasks.has(`${account.key}\0${account.token}`),
+    () => activeAccounts[0],
+    async () => { runs++; await active; },
+    () => activeAccounts,
+    { snapshot: () => ({}) },
+    () => false,
+  );
+  const first = activeApi.scheduleAccountEgress(activeAccounts[0], { force: false });
+  await Promise.resolve();
+  const duplicateRefresh = activeApi.initializeAccountEgress({
+    force: true, serial: true, autoOnly: true, skipActive: true,
+  });
+  await Promise.resolve();
+  release();
+  const duplicateCount = await duplicateRefresh;
+  assert.equal(duplicateCount, 1, '批量刷新应把已有任务合并为一次强制重测');
+  await first;
+  assert.equal(runs, 2, '批量刷新必须在已有任务完成后追加一次 force 探测');
+});
+
+test('账号进入终态后停止后台节点验证并取消同账号任务', () => {
+  const source = readFileSync(new URL('../server.js', import.meta.url), 'utf8');
+  const configureStart = source.indexOf('async function configureAccountEgress(');
+  const configureEnd = source.indexOf('\nfunction scheduleAccountEgress(', configureStart);
+  assert.ok(configureStart >= 0 && configureEnd > configureStart);
+  const configure = source.slice(configureStart, configureEnd);
+  assert.match(configure, /verify: async \(\{ fetch: fetchForLane \}\) => \{[\s\S]*?isTerminalAccount\(account\)[\s\S]*?probeAccount\([\s\S]*?isTerminalAccount\(account\)/,
+    '每次后台账号探测前后都必须检查持久终态，不能继续探测后续节点');
+  assert.match(source, /cancelAccountEgressTasksForToken\(normalized\)/,
+    '持久化终态时必须取消同账号后台出站任务');
+});
+
+test('worker 写入终态时取消 token:uid 账号任务，普通账号也保持原 token 语义', () => {
+  const source = readFileSync(new URL('../server.js', import.meta.url), 'utf8');
+  const start = source.indexOf('function buildWorkerEnv(');
+  const end = source.indexOf('\n// === Web 管理 API 路由', start);
+  assert.ok(start >= 0 && end > start);
+  const accountStateStore = {
+    set(token, state) { writes.push({ token, state }); return { revision: writes.length }; },
+    clear() {},
+    snapshot() { return {}; },
+    revision() { return 0; },
+  };
+  const writes = [];
+  const cancelled = [];
+  const buildWorkerEnv = new Function(
+    'allTokens', 'listAccounts', 'managedAccountTokenHistory', 'normalizeAccountToken', 'env',
+    'loadModelAliases', 'currentApiKey', 'apiKeyStore', 'accountLabels', 'getUpstreamFetch',
+    'resolveAccountUpstreamRoute', 'handleEgressReject', 'accountStateStore', 'cancelAccountEgressTasksForToken',
+    `${source.slice(start, end)}; return buildWorkerEnv;`,
+  )(
+    () => ['bearer-token:uid-value', 'plain-token'],
+    () => [],
+    new Set(),
+    (value) => String(value || '').trim().split(':', 1)[0],
+    {},
+    () => new Map(),
+    () => 'master-key',
+    { descriptors: () => [] },
+    () => ({}),
+    () => null,
+    () => null,
+    () => {},
+    accountStateStore,
+    (token) => cancelled.push(token),
+  );
+  const workerEnv = buildWorkerEnv();
+
+  workerEnv.FREEBUFF_ACCOUNT_STATE_SET('bearer-token:uid-value', { state: 'banned' });
+  workerEnv.FREEBUFF_ACCOUNT_STATE_SET('plain-token', { state: 'token_invalid' });
+  assert.deepEqual(writes.map((entry) => entry.token), ['bearer-token', 'plain-token']);
+  assert.deepEqual(cancelled, ['bearer-token', 'plain-token']);
+});
+
+test('手动刷新出站单飞且完成后 60 秒内拒绝重复批量探测', async () => {
+  const source = readFileSync(new URL('../server.js', import.meta.url), 'utf8');
+  const start = source.indexOf('const ACCOUNT_EGRESS_REFRESH_COOLDOWN_MS');
+  const end = source.indexOf('\nfunction handleEgressReject(', start);
+  assert.ok(start >= 0 && end > start, '应存在可隔离验证的手动出站刷新函数');
+  let now = 1_000_000;
+  class FakeDate extends Date { static now() { return now; } }
+  let releaseSubscription;
+  const subscription = new Promise((resolve) => { releaseSubscription = resolve; });
+  const initCalls = [];
+  const refreshAccountEgressNow = new Function(
+    'Date',
+    'getConfiguredSubscription',
+    'refreshSubscription',
+    'initializeAccountEgress',
+    'getProxyStatus',
+    `${source.slice(start, end)}; return refreshAccountEgressNow;`,
+  )(
+    FakeDate,
+    () => 'https://subscription.example.test',
+    () => subscription,
+    async (options) => { initCalls.push(options); return 3; },
+    async () => ({ ok: true, state: 'ready' }),
+  );
+
+  const first = refreshAccountEgressNow();
+  await assert.rejects(
+    () => refreshAccountEgressNow(),
+    (error) => error?.code === 'ACCOUNT_EGRESS_REFRESH_IN_PROGRESS',
+    '已有一轮刷新时不能并发启动第二轮',
+  );
+  releaseSubscription({ ok: true });
+  const result = await first;
+  assert.equal(result.refreshedAccounts, 3);
+  assert.deepEqual(initCalls, [{ force: true, serial: true, autoOnly: true, skipActive: true }]);
+
+  await assert.rejects(
+    () => refreshAccountEgressNow(),
+    (error) => error?.code === 'ACCOUNT_EGRESS_REFRESH_COOLDOWN' && error.retryAfterMs > 0,
+    '完成后冷却期内不能再次批量探测',
+  );
+  now += 60_000;
+  const afterCooldown = await new Function(
+    'refreshSubscription',
+    'run',
+    'return async () => { refreshSubscription(); return run(); };',
+  )(() => {}, refreshAccountEgressNow)();
+  assert.equal(afterCooldown.refreshedAccounts, 3);
+});
+
+test('刷新出站管理 API 等待节点测活与账号重验完成', () => {
+  const source = readFileSync(new URL('../server.js', import.meta.url), 'utf8');
+  const route = source.slice(
+    source.indexOf("if (seg === 'proxy')"),
+    source.indexOf("if (method === 'PUT' && (!sub || sub === 'subscription'))"),
+  );
+  assert.match(route,
+    /method === 'POST' && sub === 'refresh-egress'[\s\S]*?await refreshAccountEgressNow\(\)/,
+    '刷新出站 API 必须等待完整重验，不能只丢一个后台任务就返回成功');
+  assert.match(source, /ACCOUNT_EGRESS_REFRESH_COOLDOWN[\s\S]*?Retry-After/,
+    '批量刷新冷却响应必须告诉面板可重试时间');
+});
+
 test('stale 自动验证路由在后台复验期间仍显示 ready', () => {
   const source = readFileSync(new URL('../server.js', import.meta.url), 'utf8');
   const start = source.indexOf('function accountEgressStatus(');
   const end = source.indexOf('\nasync function configureAccountEgress(', start);
   assert.ok(start >= 0 && end > start, '应存在可隔离验证的账号出口状态函数');
   const accountEgressStatus = new Function(
+    'accountTerminalState',
     'getAccountProxyNode',
     'getAccountEgressReject',
     'accountEgressIdentity',
@@ -1003,6 +1277,7 @@ test('stale 自动验证路由在后台复验期间仍显示 ready', () => {
     'inferNodeRegion',
     `${source.slice(start, end)}; return accountEgressStatus;`,
   )(
+    () => null,
     () => 'US-A',
     () => null,
     () => 'account-identity',
@@ -1038,6 +1313,7 @@ test('旧 token 的 lane 拒绝回调不得触碰已复用账号', () => {
     'accountByToken',
     'noteEgressReject',
     'scheduleAccountEgress',
+    'isTerminalAccount',
     `${source.slice(start, end)}; return handleEgressReject;`,
   );
   const noted = [];
@@ -1049,6 +1325,7 @@ test('旧 token 的 lane 拒绝回调不得触碰已复用账号', () => {
     (token) => accounts.get(token) || null,
     (info) => noted.push(info),
     (account) => scheduled.push(account.key),
+    () => false,
   );
 
   handler({ token: 'deleted-token', lane: 4, node: 'US-A', generation: 1 });
@@ -1059,6 +1336,80 @@ test('旧 token 的 lane 拒绝回调不得触碰已复用账号', () => {
   handler({ token: 'current-token', lane: 4, node: 'US-A', generation: 3 });
   assert.equal(noted.length, 1);
   assert.deepEqual(scheduled, ['current'], '只有 token 与 lane 同时匹配才允许归因和重选');
+});
+
+test('出口拒绝回调记录终态账号的节点错误但不再自动重调度', () => {
+  const source = readFileSync(new URL('../server.js', import.meta.url), 'utf8');
+  const start = source.indexOf('function handleEgressReject(');
+  const end = source.indexOf('\n// === Freebuff 授权码登录', start);
+  const terminal = { key: 'banned', token: 'banned-token', egressLane: 4, egressMode: 'auto' };
+  const noted = [];
+  const scheduled = [];
+  const handler = new Function(
+    'accountByToken', 'noteEgressReject', 'scheduleAccountEgress', 'isTerminalAccount',
+    `${source.slice(start, end)}; return handleEgressReject;`,
+  )(
+    () => terminal,
+    (info) => noted.push(info),
+    (account) => scheduled.push(account.key),
+    () => true,
+  );
+
+  handler({ token: terminal.token, lane: terminal.egressLane, state: 'blocked' });
+  assert.equal(noted.length, 1, '节点拒绝仍需记录供管理员诊断');
+  assert.deepEqual(scheduled, [], '终态账号不得因出口拒绝继续切换和探测节点');
+});
+
+test('账号列表对终态账号只返回持久状态，单账号显式探测仍允许恢复', () => {
+  const source = readFileSync(new URL('../server.js', import.meta.url), 'utf8');
+  const listRoute = source.slice(
+    source.indexOf("if (method === 'GET' && !sub)"),
+    source.indexOf("if (method === 'POST' && !sub)"),
+  );
+  const singleRoute = source.slice(
+    source.indexOf("if (method === 'GET' && sub)"),
+    source.indexOf("return err(res, 405, 'method not allowed');", source.indexOf("if (method === 'GET' && sub)")),
+  );
+  assert.match(listRoute, /terminalAccountProbe\(acct\)/,
+    '账号列表必须直接使用持久终态，不能每次刷新都向上游探测封禁账号');
+  assert.match(listRoute, /if \(terminalProbe\)[\s\S]*?probe:\s*terminalProbe/,
+    '终态账号应在调用 accountEgressFetch/probeAccount 前短路');
+  assert.match(singleRoute, /ensureAccountEgressForAdminProbe\(acct\)/,
+    '管理员单账号探测必须走显式恢复准备路径');
+  assert.match(singleRoute, /ensureAccountEgressForAdminProbe\(acct\)/,
+    '管理员显式探测应允许为终态账号主动准备 lane 以验证恢复');
+  assert.match(singleRoute, /probeAccount\(acct\.token,[\s\S]*?upstreamFetch/,
+    '管理员显式探测必须继续调用真实上游探测');
+  assert.doesNotMatch(singleRoute, /updateIsolation:\s*false/,
+    '管理员探测不得关闭默认的终态清除逻辑');
+});
+
+test('token:uid 账号按 Bearer token 命中持久终态，不能绕过后台短路', () => {
+  const source = readFileSync(new URL('../server.js', import.meta.url), 'utf8');
+  const start = source.indexOf('const TERMINAL_ACCOUNT_STATE_LABELS');
+  const end = source.indexOf('\nfunction accountEgressUnavailableFetch(', start);
+  assert.ok(start >= 0 && end > start, '应能隔离终态账号判定逻辑');
+  const bearer = 'terminal-bearer-token-1234567890';
+  const state = { state: 'banned', until: null, reason: 'upstream_banned' };
+  const accountStateStore = {
+    snapshot(tokens) {
+      assert.deepEqual(tokens, [bearer], '持久状态必须按上游实际 Bearer token 查询');
+      return { [bearer]: state };
+    },
+  };
+  const api = new Function(
+    'accountStateStore',
+    'normalizeAccountToken',
+    `${source.slice(start, end)}; return { accountTerminalState, isTerminalAccount, terminalAccountProbe };`,
+  )(
+    accountStateStore,
+    (value) => String(value || '').trim().split(':', 1)[0],
+  );
+  const account = { token: `${bearer}:uid-value` };
+
+  assert.deepEqual(api.accountTerminalState(account), state);
+  assert.equal(api.isTerminalAccount(account), true);
+  assert.equal(api.terminalAccountProbe(account)?.state, 'banned');
 });
 
 test('同账号重叠写操作结束一项后仍保持后台任务门闩', () => {
