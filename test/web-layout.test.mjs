@@ -417,6 +417,7 @@ assert.match(app, /function selectedKeyModels\(\)[\s\S]*?\.filter\(Boolean\)/s,
 
 const helperSource = `const S = { models: [] };\nconst esc = (value) => String(value);\n${app.match(/const MODEL_TIER_LABELS = \{[^\n]+/)[0]}\n`
   + `${app.slice(app.indexOf('const MODEL_DISPLAY ='), app.indexOf('function modelsCellHtml'))}\n`
+  + 'globalThis.__modelState = S;\n'
   + 'globalThis.__modelUi = { accountQuotaSummary, modelName, modelDisplay, modelListHtml };';
 const helperVm = { globalThis: null };
 helperVm.globalThis = helperVm;
@@ -463,6 +464,23 @@ assert.equal(
   null,
   '暂停 M3 的残留额度行不得生成 P 摘要',
 );
+helperVm.__modelState.models = [{ id: 'deepseek/deepseek-v4-pro', pool: 'premium' }];
+assert.deepEqual(
+  JSON.parse(JSON.stringify(helperVm.__modelUi.accountQuotaSummary({ quota: [
+    { model: 'deepseek/deepseek-v4-pro', used: 2, limit: 5 },
+  ] }))),
+  { text: '( P5 )', title: '额度 P 2/5' },
+  '账号行缺少 pool 时必须使用模型目录的实时 pool，而不是静态 DS4P 归属',
+);
+assert.match(
+  helperVm.__modelUi.modelListHtml(
+    ['deepseek/deepseek-v4-pro'],
+    [{ id: 'deepseek/deepseek-v4-pro' }],
+  ),
+  /tier-premium">高级<\/span>/,
+  '账号行缺少 pool 时模型列表也必须回退到模型目录 pool',
+);
+helperVm.__modelState.models = [];
 assert.deepEqual(
   JSON.parse(JSON.stringify(helperVm.__modelUi.modelDisplay('minimax/minimax-m3'))),
   { id: 'minimax/minimax-m3', name: 'minimax-m3', tierKey: 'paused', tier: '停用' },
@@ -472,6 +490,36 @@ assert.deepEqual(
   JSON.parse(JSON.stringify(helperVm.__modelUi.modelDisplay('deepseek/deepseek-v4-flash'))),
   { id: 'deepseek/deepseek-v4-flash', name: 'deepseek-v4-flash', tierKey: 'us_sg', tier: '高级' },
   'DS4F 必须去掉 provider 前缀，只保留模型名 + 高级标签',
+);
+assert.deepEqual(
+  JSON.parse(JSON.stringify(helperVm.__modelUi.modelDisplay('deepseek/deepseek-v4-pro', { pool: 'premium' }))),
+  { id: 'deepseek/deepseek-v4-pro', name: 'deepseek-v4-pro', tierKey: 'premium', tier: '高级' },
+  '实时 pool=premium 时 DS4P 必须动态显示高级，而不是静态 DS4P',
+);
+assert.deepEqual(
+  JSON.parse(JSON.stringify(helperVm.__modelUi.modelDisplay('deepseek/deepseek-v4-pro', { pool: 'deepseek_pro' }))),
+  { id: 'deepseek/deepseek-v4-pro', name: 'deepseek-v4-pro', tierKey: 'deepseek_pro', tier: 'DS4P' },
+  '实时 pool=deepseek_pro 时 DS4P 才显示 DS4P 标签',
+);
+assert.deepEqual(
+  JSON.parse(JSON.stringify(helperVm.__modelUi.modelDisplay('vendor/new-model', { pool: 'preview_pool' }))),
+  { id: 'vendor/new-model', name: 'new-model', tierKey: 'pool-other', tier: 'preview_pool' },
+  '未知 pool 必须原样显示且使用通用配色，不能猜成高级池',
+);
+assert.deepEqual(
+  JSON.parse(JSON.stringify(helperVm.__modelUi.modelDisplay('deepseek/deepseek-v4-pro', { pool: 'preview_pool' }))),
+  { id: 'deepseek/deepseek-v4-pro', name: 'deepseek-v4-pro', tierKey: 'pool-other', tier: 'preview_pool' },
+  '已知模型遇到未知显式 pool 时也必须服从实时 pool，不能回退到静态 DS4P 标签',
+);
+assert.match(app, /function modelsCellHtml[\s\S]*?modelListHtml\(\[q\.model\], \[q\]\)/s,
+  '账号可用模型必须把实时额度行传给统一 Tag 解析器');
+assert.match(
+  helperVm.__modelUi.modelListHtml(
+    ['deepseek/deepseek-v4-pro'],
+    [{ id: 'deepseek/deepseek-v4-pro', pool: 'premium' }],
+  ),
+  /tier-premium">高级<\/span>/,
+  '账号额度行传入 pool 后必须覆盖 DS4P 静态标签',
 );
 assert.equal(
   helperVm.__modelUi.modelListHtml(['openai/gpt-5.6-luna']),

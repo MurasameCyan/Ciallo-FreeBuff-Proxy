@@ -615,6 +615,20 @@ await tAsync('Reviewer 上游 400 原文回传，不换号也不冷却账号', a
   if (inCooldown(tokenA) || inCooldown(tokenB)) throw new Error('400 不应冷却账号');
 });
 
+await tAsync('模型目录携带官方动态 pool 元数据', async () => {
+  setTestDynamicModels([
+    {
+      id: 'deepseek/deepseek-v4-pro', session: 'deepseek/deepseek-v4-pro',
+      agent: 'base2-free-deepseek', root_agent: 'base2-free-deepseek',
+      pool: 'premium',
+    },
+  ]);
+  const body = await (await handleModels()).json();
+  const pro = body.data.find((model) => model.id === 'deepseek/deepseek-v4-pro');
+  if (!pro || pro.pool !== 'premium') throw new Error('DS4P pool 元数据错误: ' + JSON.stringify(pro));
+  setTestDynamicModels(null);
+});
+
 console.log('--- /v1/models 分组 tag ---');
 await tAsync('模型按 免费 → US/SG → 限定 分组打 tier', async () => {
   if (MODEL_TIERS.map(([k]) => k).join(',') !== 'free,us_sg,limited') {

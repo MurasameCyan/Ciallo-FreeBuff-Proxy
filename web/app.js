@@ -293,8 +293,8 @@ function stateDot(s, detail = '') {
 }
 
 // 面板只显示模型名（去掉 provider/ 前缀）；完整 id 留在 title 和 API/白名单值里。
-// tag 只表达额度归属：免费 / 高级 / Luna / DS4P / 限定 / 停用。
-// Luna、DS4P 是各自独立的额度池，所以从「高级」里单独拆出来，但配色仍走高级色。
+// tag 只表达当前额度池：免费 / 高级 / Luna / DS4P / 限定 / 停用。
+// 上游显式 pool 优先，静态表只在旧快照或旧 Key 没有 pool 时兼容展示。
 const MODEL_DISPLAY = {
   'openai/gpt-5.6-luna': { label: 'Luna', tier: 'us_sg' },
   'deepseek/deepseek-v4-pro': { label: 'DS4P', tier: 'us_sg' },
@@ -333,6 +333,14 @@ const MODEL_QUOTA_POOLS = {
   'meta/muse-spark-1.2-contributor': 'premium',
 };
 
+const KNOWN_POOL_TAGS = {
+  premium: { label: '高级', tierKey: 'premium' },
+  luna: { label: 'Luna', tierKey: 'luna' },
+  deepseek_pro: { label: 'DS4P', tierKey: 'deepseek_pro' },
+  glm: { label: '限定', tierKey: 'glm' },
+  standard: { label: '免费', tierKey: 'free' },
+};
+
 // 未收录的动态模型退回 /v1/models 的 tier 分组文案。
 // name 只保留 provider/ 后面的模型名，完整 id 仍放在 title 并继续作为 API/白名单值。
 function modelName(id) {
@@ -342,23 +350,47 @@ function modelName(id) {
 
 function modelDisplay(id, model = null) {
   const known = MODEL_DISPLAY[id] || {};
-  const tierKey = known.tier || model?.tier || '';
+  if (PAUSED_MODEL_IDS.has(id)) {
+    return { id, name: modelName(id), tierKey: 'paused', tier: '停用' };
+  }
+  const rawPool = String(model?.pool || '').trim().slice(0, 64);
   const name = modelName(id);
+  if (rawPool) {
+    const poolTag = KNOWN_POOL_TAGS[rawPool.toLowerCase()];
+    return {
+      id,
+      name,
+      tierKey: poolTag?.tierKey || 'pool-other',
+      tier: poolTag?.label || rawPool,
+    };
+  }
+  const tierKey = known.tier || model?.tier || '';
   return { id, name, tierKey, tier: known.label || MODEL_TIER_LABELS[tierKey] || '' };
 }
 
-function modelListHtml(modelIds = []) {
+function modelListHtml(modelIds = [], models = null) {
+  const byId = new Map((Array.isArray(S.models) ? S.models : [])
+    .filter((model) => model?.id)
+    .map((model) => [model.id, model]));
+  for (const model of Array.isArray(models) ? models : []) {
+    if (!model?.id) continue;
+    byId.set(model.id, { ...byId.get(model.id), ...model });
+  }
   return [...new Set((Array.isArray(modelIds) ? modelIds : []).filter((id) => {
     return id && !isHiddenModelId(id);
   }))].map((id) => {
-    const { name, tier, tierKey } = modelDisplay(id);
+    const { name, tier, tierKey } = modelDisplay(id, byId.get(id));
     return `<span class="model-label" title="${esc(id)}">${esc(name)}${tier ? ` <span class="pill tier tier-${esc(tierKey)}">${esc(tier)}</span>` : ''}</span>`;
   }).join(', ');
 }
 
 function quotaPoolForRow(row) {
   const explicit = String(row?.pool || '').trim().toLowerCase();
-  return explicit || MODEL_QUOTA_POOLS[row?.model] || '';
+  if (explicit) return explicit;
+  const model = Array.isArray(S.models)
+    ? S.models.find((entry) => entry?.id === row?.model)
+    : null;
+  return String(model?.pool || '').trim().toLowerCase() || MODEL_QUOTA_POOLS[row?.model] || '';
 }
 
 // 额度展示按上游 pool 聚合。D/L/P 是池上限的紧凑摘要，已用/总量只放 title，
@@ -429,7 +461,7 @@ function modelsCellHtml(probe) {
     }
     return '<span class="quota">—</span>';
   }
-  const items = rows.map((q) => `<li>${modelListHtml([q.model])}</li>`).join('');
+  const items = rows.map((q) => `<li>${modelListHtml([q.model], [q])}</li>`).join('');
   return `<ul class="quota quota-models">${items}</ul>`;
 }
 
@@ -752,7 +784,8 @@ function fillKeyModelButtons(selected = []) {
   root.innerHTML = [
     `<button type="button" class="key-model-option" data-key-model="" aria-pressed="${chosen.length === 0}" title="不限模型">All</button>`,
     ...ids.map((id) => {
-      const { name, tier } = modelDisplay(id);
+      const model = (Array.isArray(S.models) ? S.models : []).find((entry) => entry?.id === id);
+      const { name, tier } = modelDisplay(id, model);
       const paused = PAUSED_MODEL_IDS.has(id);
       return `<button type="button" class="key-model-option${paused ? ' is-paused' : ''}" data-key-model="${esc(id)}" aria-pressed="${chosen.includes(id)}"${paused ? ' disabled aria-disabled="true"' : ''} title="${esc(id)}">${esc(name)}${tier ? ` · ${esc(tier)}` : ''}</button>`;
     }),

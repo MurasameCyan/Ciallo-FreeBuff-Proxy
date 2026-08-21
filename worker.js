@@ -204,6 +204,17 @@ function buildDynamicModelTable(agentMappings) {
   }));
 }
 
+function annotateDynamicModelPools(models, pool) {
+  const premium = pool?.premium instanceof Set ? pool.premium : new Set(pool?.premium || []);
+  const glm = pool?.glm instanceof Set ? pool.glm : new Set(pool?.glm || []);
+  return (Array.isArray(models) ? models : []).map((model) => {
+    if (model && typeof model === "object" && String(model.pool || "").trim()) return model;
+    const id = String(model?.id || "");
+    const category = glm.has(id) ? "glm" : premium.has(id) ? "premium" : null;
+    return category ? { ...model, pool: category } : model;
+  });
+}
+
 // 合并硬编码与动态表：硬编码优先（不覆盖），动态新增追加
 function mergeModelTables(hardcoded, dynamic) {
   const seen = new Set(hardcoded.map((m) => m.id));
@@ -271,14 +282,15 @@ async function refreshDynamicModelsIfStale() {
       return dynamicModelsCache;
     }
     const pools = parseModelPools(modelsSrc, modelIdConstants);
+    const pool = {
+      premium: new Set(pools.premium),
+      standard: null,
+      glm: new Set(pools.glm),
+    };
     dynamicModelsCache = {
       fetchedAt: Date.now(),
-      models: buildDynamicModelTable(agentMappings),
-      pool: {
-        premium: new Set(pools.premium),
-        standard: null,
-        glm: new Set(pools.glm),
-      },
+      models: annotateDynamicModelPools(buildDynamicModelTable(agentMappings), pool),
+      pool,
     };
   } catch {
     // 解析崩溃：尝试 Releases 兜底
@@ -303,14 +315,15 @@ async function tryReleaseFallback() {
       if (resp.ok) {
         const json = await resp.json();
         if (json && Array.isArray(json.models) && json.models.length > 0) {
+          const pool = {
+            premium: new Set(json.pools?.premium ?? []),
+            standard: null,
+            glm: new Set(json.pools?.glm ?? []),
+          };
           return {
             fetchedAt: Date.now(),
-            models: json.models,
-            pool: {
-              premium: new Set(json.pools?.premium ?? []),
-              standard: null,
-              glm: new Set(json.pools?.glm ?? []),
-            },
+            models: annotateDynamicModelPools(json.models, pool),
+            pool,
           };
         }
       }
@@ -328,23 +341,66 @@ function dynamicStandardModels() {
   return new Set(cache.models.map((m) => m.id).filter((id) => !premium.has(id) && !glm.has(id)));
 }
 
-// 模型池分类查询：独立池优先，随后动态池和硬编码兜底。
-// 返回 "deepseek_pro" | "luna" | "premium" | "standard" | "glm" | null
-function modelPoolCategory(modelId) {
-  // 上游现在给 D4P/Luna 各自独立的每日池；不能让动态源码里的 shared
-  // PREMIUM 列表把它们重新合并。M3 已暂停，也不能继续继承旧 Premium 池。
-  if (PAUSED_QUOTA_MODELS.has(modelId) || isHiddenModelId(modelId)) return null;
-  if (DEEPSEEK_PRO_QUOTA_MODELS.has(modelId)) return "deepseek_pro";
-  if (LUNA_QUOTA_MODELS.has(modelId)) return "luna";
+const KNOWN_QUOTA_POOLS = new Set(["premium", "luna", "deepseek_pro", "glm", "standard"]);
+
+function normalizePoolName(value) {
+  const raw = String(value ?? "").trim().toLowerCase();
+  if (!raw) return "";
+  return KNOWN_QUOTA_POOLS.has(raw) ? raw : "";
+}
+
+function safePoolName(value) {
+  const raw = String(value ?? "").trim().toLowerCase();
+  return /^[a-z0-9][a-z0-9_-]{0,63}$/.test(raw) ? raw : "";
+}
+
+function quotaRowForModel(quota, modelId) {
+  if (!quota || typeof quota !== "object") return null;
+  const exact = quota[modelId];
+  if (exact && typeof exact === "object") return exact;
+  const wanted = String(modelId || "").toLowerCase();
+  const hit = Object.entries(quota).find(([id, entry]) =>
+    String(id).toLowerCase() === wanted && entry && typeof entry === "object");
+  return hit ? hit[1] : null;
+}
+
+function dynamicModelForId(modelId) {
+  const id = String(modelId || "");
+  return Array.isArray(dynamicModelsCache.models)
+    ? dynamicModelsCache.models.find((model) => model?.id === id) || null
+    : null;
+}
+
+// 模型池分类查询：实时账号快照 > 动态模型元数据 > 动态池集合 > 静态兜底。
+// 未知 pool 返回 null，调用层按模型隔离，不能猜测为共享池。
+function modelPoolCategory(modelId, quota = null) {
+  const id = String(modelId || "").trim();
+  if (!id || PAUSED_QUOTA_MODELS.has(id) || isHiddenModelId(id)) return null;
+
+  const quotaRow = quotaRowForModel(quota, id);
+  if (quotaRow && String(quotaRow.pool || "").trim()) {
+    const pool = normalizePoolName(quotaRow.pool);
+    return KNOWN_QUOTA_POOLS.has(pool) ? pool : null;
+  }
+
+  const dynamic = dynamicModelForId(id);
+  if (dynamic && String(dynamic.pool || "").trim()) {
+    const pool = normalizePoolName(dynamic.pool);
+    return KNOWN_QUOTA_POOLS.has(pool) ? pool : null;
+  }
+
   const dyn = dynamicModelsCache;
   if (dyn && dyn.pool) {
-    if (dyn.pool.premium.has(modelId)) return "premium";
-    if (dyn.pool.glm.has(modelId)) return "glm";
-    if (dynamicStandardModels().has(modelId)) return "standard";
+    if (dyn.pool.premium?.has(id)) return "premium";
+    if (dyn.pool.glm?.has(id)) return "glm";
+    if (dynamicStandardModels().has(id)) return "standard";
   }
-  // 硬编码兜底
-  if (PREMIUM_QUOTA_MODELS.has(modelId)) return "premium";
-  if (STANDARD_MODELS.has(modelId)) return "standard";
+  // 静态兼容兜底只在没有实时/动态 pool 时使用。
+  if (DEEPSEEK_PRO_QUOTA_MODELS.has(id)) return "deepseek_pro";
+  if (LUNA_QUOTA_MODELS.has(id)) return "luna";
+  if (PREMIUM_QUOTA_MODELS.has(id)) return "premium";
+  if (STANDARD_MODELS.has(id)) return "standard";
+  if (GLM_QUOTA_MODELS.has(id)) return "glm";
   return null;
 }
 
@@ -388,10 +444,10 @@ const MODEL_TIERS = [
 ];
 
 // ---------------------------------------------------------------------------
-// 额度池说明（上游 rateLimitsByModel，2026-08-21）：
-//   deepseek_pro：D4P 独立池，通常 1 次/日
-//   luna：Luna 独立池，通常 1 次/日
-//   premium：DS4F / Kimi / Muse 等共享池，额度上限以每次探测返回的 limit 为准
+// 额度池说明（上游 rateLimitsByModel）：
+//   同一模型的 pool 会随上游 entitlement/rollout 变化；账号实时快照优先。
+//   deepseek_pro / luna / premium / glm 只作为已知池名和无快照时的兼容兜底，
+//   不能再假设 DS4P 永远属于 deepseek_pro。
 //   glm：GLM referral 独立池
 // M3 虽曾出现在旧 Premium 快照里，但已于 2026-08-20 暂停，不得再据旧表
 // 认定为当前可运行额度池。额度只用于本地调度/错误作用域，不改变调用方模型。
@@ -772,6 +828,7 @@ const HEALTH_OBSERVATION_TTL_MS = 10 * 60 * 1000;
 // 也不要把网络错误/未知响应误记成账号失效。
 function recordAccountObservation(token, status, dataOrText, extra = {}) {
   if (!token) return;
+  const previous = acctHealth.get(token) || {};
   let data = dataOrText;
   if (typeof dataOrText === "string") {
     try { data = JSON.parse(dataOrText); } catch { data = null; }
@@ -781,7 +838,8 @@ function recordAccountObservation(token, status, dataOrText, extra = {}) {
     "rate_limited", "rate_limit_exceeded", "quota_exceeded", "spend_limited",
     "ip_capped", "country_blocked", "waiting_room_queued", "waiting_room_required",
   ].includes(upstreamState))
-    ? classifyRateLimit(dataOrText, status, extra.headers || {}, extra.model || null)
+    ? classifyRateLimit(dataOrText, status, extra.headers || {}, extra.model || null,
+      Date.now(), extra.quota || previous.quota || null)
     : null;
   let state = null;
   if (status === 404) state = "ok";
@@ -823,7 +881,6 @@ function recordAccountObservation(token, status, dataOrText, extra = {}) {
     });
   }
 
-  const previous = acctHealth.get(token) || {};
   const hasQuota = Boolean(extra.quota && typeof extra.quota === "object");
   const hasScopedQuota = Boolean(rateLimit && rateLimit.reason === "quota");
   const observedAt = Date.now();
@@ -1798,12 +1855,12 @@ function scopedCooldownKey(token, scope) {
   return token + "\u0000scope:" + String(scope);
 }
 
-function quotaScopeForModel(model) {
+function quotaScopeForModel(model, quota = null) {
   const id = String(model || "").trim();
   if (!id) return "account";
-  const category = modelPoolCategory(id);
+  const category = modelPoolCategory(id, quota);
   if (["deepseek_pro", "luna", "premium"].includes(category)) return "pool:" + category;
-  if (category === "glm" || GLM_QUOTA_MODELS.has(id)) return "pool:glm";
+  if (category === "glm") return "pool:glm";
   // Standard/Limited grouping is not assumed without a confirmed upstream pool.
   return "model:" + id;
 }
@@ -1865,7 +1922,8 @@ function scopedCooldownInfo(token, model, now = Date.now()) {
   const keys = [token];
   if (model) {
     keys.push(scopedCooldownKey(token, "model:" + String(model)));
-    keys.push(scopedCooldownKey(token, quotaScopeForModel(model)));
+    const quota = acctHealth.get(token)?.quota || null;
+    keys.push(scopedCooldownKey(token, quotaScopeForModel(model, quota)));
   }
   let selected = null;
   for (const key of keys) {
@@ -1918,36 +1976,41 @@ function isStaleSessionGate(status, body) {
 }
 
 function quotaEntryForModel(quota, sessionModel) {
-  if (!quota || typeof quota !== "object" || PAUSED_QUOTA_MODELS.has(sessionModel) || isHiddenModelId(sessionModel)) return null;
-  const scope = quotaScopeForModel(sessionModel);
+  const id = String(sessionModel || "").trim();
+  if (!quota || typeof quota !== "object" || PAUSED_QUOTA_MODELS.has(id) || isHiddenModelId(id)) return null;
+  const exact = quotaRowForModel(quota, id);
+  const declaredPool = safePoolName(exact?.pool);
+  const scope = quotaScopeForModel(id, quota);
   const pool = scope.startsWith("pool:") ? scope.slice(5) : null;
   if (pool === "premium") {
     const pooled = [];
     for (const [model, entry] of Object.entries(quota)) {
       if (!entry || typeof entry !== "object" || PAUSED_QUOTA_MODELS.has(model) || isHiddenModelId(model)) continue;
-      const entryPool = String(entry.pool || "");
+      const entryPool = safePoolName(entry.pool);
       if (entryPool === "premium" || (!entryPool && PREMIUM_QUOTA_MODELS.has(model))) pooled.push(entry);
     }
     if (pooled.length) {
       const limits = pooled.map((entry) => Number(entry.limit)).filter(Number.isFinite);
       const counts = pooled.map((entry) => Number(entry.recentCount)).filter(Number.isFinite);
+      const limit = limits.length ? Math.min(...limits) : null;
+      const recentCount = counts.length ? Math.max(...counts) : null;
+      if (exact && (!limits.length || Number(exact.limit) === limit)
+        && (!counts.length || Number(exact.recentCount) === recentCount)) return exact;
       return {
         ...pooled[0],
-        ...(limits.length ? { limit: Math.min(...limits) } : {}),
-        ...(counts.length ? { recentCount: Math.max(...counts) } : {}),
+        ...(limits.length ? { limit } : {}),
+        ...(counts.length ? { recentCount } : {}),
         pool: "premium",
       };
     }
     return null;
   }
-  const exact = quota[sessionModel];
   if (exact && typeof exact === "object") {
-    const exactPool = String(exact.pool || "");
-    if (!exactPool || !pool || exactPool === pool) return exact;
+    if (!declaredPool || !pool || declaredPool === pool) return exact;
   }
   if (!pool) return null;
   for (const entry of Object.values(quota)) {
-    if (entry && typeof entry === "object" && String(entry.pool || "") === pool) return entry;
+    if (entry && typeof entry === "object" && safePoolName(entry.pool) === pool) return entry;
   }
   return null;
 }
@@ -1973,13 +2036,14 @@ function isQuotaExhausted(info, sessionModel) {
     // A missing scope is not evidence of a shared pool. Only reuse the
     // observation for the exact model that produced it; typed pool/account
     // scopes may be shared according to the upstream contract.
+    const expectedScope = quotaScopeForModel(sessionModel, info.quota || null);
     return scope
-      ? scope === "account" || scope === modelScope || scope === quotaScopeForModel(sessionModel)
+      ? scope === "account" || scope === modelScope || scope === expectedScope
       : info.quotaModel != null && String(info.quotaModel) === String(sessionModel);
   }
   // STANDARD 没有可靠的剩余次数查询；只处理明确的账号/上游状态，
   // 不根据 rateLimitsByModel 的 STANDARD 数字判断耗尽。
-  if (modelPoolCategory(sessionModel) === "standard") return false;
+  if (modelPoolCategory(sessionModel, info.quota) === "standard") return false;
   if (!info.quota) return false;
   const entry = quotaEntryForModel(info.quota, sessionModel);
   if (!entry || typeof entry.recentCount !== "number" || typeof entry.limit !== "number") return false;
@@ -2159,7 +2223,7 @@ function findRateLimitState(value, depth = 0) {
  * 将 429/typed admission 状态转换成统一的作用域决策。
  * 该函数只返回公开状态和时间，不携带 token、响应原文或 URL。
  */
-function classifyRateLimit(text, status = 429, headers = {}, model = null, now = Date.now()) {
+function classifyRateLimit(text, status = 429, headers = {}, model = null, now = Date.now(), quota = null) {
   const body = parseJsonBody(text);
   const headerState = headerValue(headers, "x-freebuff-status")
     || headerValue(headers, "x-freebuff-state");
@@ -2186,7 +2250,7 @@ function classifyRateLimit(text, status = 429, headers = {}, model = null, now =
       reason: "quota",
       // 只有明确的 typed quota 状态才能证明对应共享池；generic 429
       // 没有作用域信息，只锁当前模型，避免误伤同账号其他 Premium 模型。
-      scope: state ? quotaScopeForModel(model) : (model ? "model:" + String(model) : "account"),
+      scope: state ? quotaScopeForModel(model, quota) : (model ? "model:" + String(model) : "account"),
       retryAfterMs,
     };
   }
@@ -2410,8 +2474,8 @@ function isExpectedFlowError(error) {
     || error instanceof EmptyUpstreamStreamError;
 }
 
-function throwIfAdmissionResponse(status, payload, headers, model) {
-  const decision = classifyRateLimit(payload, status, headers, model);
+function throwIfAdmissionResponse(status, payload, headers, model, quota = null) {
+  const decision = classifyRateLimit(payload, status, headers, model, Date.now(), quota);
   if (decision.reason === "egress") throw new EgressRejectedError(decision, status);
   if (decision.reason === "waiting_room") {
     throw new WaitingRoomError(decision.retryAfterMs || 30 * 1000);
@@ -2596,7 +2660,7 @@ async function freshQuotaProbe(token, sessionModel) {
       ...cached,
       scope: cached.state === "spend_limited"
         ? "account"
-        : cached.quotaScope || quotaScopeForModel(sessionModel),
+        : cached.quotaScope || quotaScopeForModel(sessionModel, cached.quota || null),
     });
   }
 }
@@ -2802,7 +2866,8 @@ async function verifySessionInBackground(token, sessionModel) {
       model: sessionModel,
     });
     throwIfTerminalResponse(token, cur.status, cur.data);
-    throwIfAdmissionResponse(cur.status, cur.data, cur.headers, sessionModel);
+    throwIfAdmissionResponse(cur.status, cur.data, cur.headers, sessionModel,
+      cur.data?.rateLimitsByModel || acctHealth.get(token)?.quota || null);
     if (!(cur.status === 200 && cur.data?.status === "active" && cur.data?.instanceId)) {
       const key = token + ":" + sessionModel;
       if (sessCache.has(key)) sessCache.delete(key);
@@ -2873,7 +2938,8 @@ async function createSession(token, sessionModel, forceCreate = false, client = 
       });
       if (cur.status === 401) await confirmTokenInvalid(token, sessionModel);
       throwIfTerminalResponse(token, cur.status, cur.data);
-      throwIfAdmissionResponse(cur.status, cur.data, cur.headers, sessionModel);
+      throwIfAdmissionResponse(cur.status, cur.data, cur.headers, sessionModel,
+        cur.data?.rateLimitsByModel || acctHealth.get(token)?.quota || null);
       if (cur.status === 200 && cur.data?.status === "active" && cur.data?.instanceId) {
         const cm = cur.data.model;
         if (!cm || cm === sessionModel) {
@@ -2902,7 +2968,8 @@ async function createSession(token, sessionModel, forceCreate = false, client = 
     });
     if (r.status === 401) await confirmTokenInvalid(token, sessionModel);
     throwIfTerminalResponse(token, r.status, r.data);
-    throwIfAdmissionResponse(r.status, r.data, r.headers, sessionModel);
+    throwIfAdmissionResponse(r.status, r.data, r.headers, sessionModel,
+      r.data?.rateLimitsByModel || acctHealth.get(token)?.quota || null);
     if (r.status === 200 && r.data?.status === "active" && r.data?.instanceId) {
       const s = normalizeSession(r.data, sessionModel);
       sessCache.set(key, s);
@@ -2922,7 +2989,8 @@ async function createSession(token, sessionModel, forceCreate = false, client = 
           model: sessionModel,
         });
         throwIfTerminalResponse(token, q.status, q.data);
-        throwIfAdmissionResponse(q.status, q.data, q.headers, sessionModel);
+        throwIfAdmissionResponse(q.status, q.data, q.headers, sessionModel,
+          q.data?.rateLimitsByModel || acctHealth.get(token)?.quota || null);
         if (q.status === 200 && q.data?.status === "active") {
           const s = normalizeSession({ ...q.data, instanceId: q.data.instanceId || inst }, sessionModel);
           sessCache.set(key, s);
@@ -2959,7 +3027,8 @@ async function startRun(token, agentId, ancestors = [], sessionModel = null) {
       model: sessionModel,
     });
     throwIfTerminalResponse(token, r.status, r.data ?? r.text);
-    throwIfAdmissionResponse(r.status, r.data ?? r.text, r.headers, sessionModel);
+    throwIfAdmissionResponse(r.status, r.data ?? r.text, r.headers, sessionModel,
+      acctHealth.get(token)?.quota || null);
     throw new Error("start_run failed: " + r.status + " " + (r.text || "").slice(0, 200));
   }
   return r.data.runId;
@@ -3459,7 +3528,8 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode, requestSig
           await confirmTokenInvalid(token, mc.session);
           throw new TransientAccountAuthError();
         }
-        throwIfAdmissionResponse(resp.status, text, resp.headers, mc.session);
+        throwIfAdmissionResponse(resp.status, text, resp.headers, mc.session,
+          acctHealth.get(token)?.quota || null);
         lastErrMsg = "reviewer upstream error: " + text.slice(0, 300);
         if (resp.status === 400) {
           // 与 executeChat 同口径：400 是「请求本身不合法」，和账号无关。
@@ -3541,7 +3611,7 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode, requestSig
           reason: "quota",
           retryAfterMs: ra,
           model: mc.session,
-          scope: e.scope || quotaScopeForModel(mc.session),
+          scope: e.scope || quotaScopeForModel(mc.session, acctHealth.get(token)?.quota || null),
         });
       } else if (!terminal && !retrySameAccount && !(e instanceof WaitingRoomError) && !scopedCooldownInfo(token, mc.session)
         && (e instanceof TransientAccountAuthError
@@ -3721,7 +3791,8 @@ async function executeChatPooled(env, chatParams, mc, isStream, mode, requestSig
         recordAccountObservation(token, resp.status, errText, { headers: resp.headers, model: mc.session });
         throwIfTerminalResponse(token, resp.status, errText);
         if (resp.status === 401) await confirmTokenInvalid(token, mc.session);
-        throwIfAdmissionResponse(resp.status, errText, resp.headers, mc.session);
+        throwIfAdmissionResponse(resp.status, errText, resp.headers, mc.session,
+          acctHealth.get(token)?.quota || null);
         // 428 waiting_room_required（无活跃 session）/ 409 session_superseded（被新 session 顶替）
         // 都说明缓存 instance 已失效 → 清缓存强制重建后重试一次；不是限流，不计冷却。
         // 失效安全窗口：该号刚才（30s 内）已经失效重建过一次还再次失效，
@@ -3822,7 +3893,7 @@ async function executeChatPooled(env, chatParams, mc, isStream, mode, requestSig
           reason: "quota",
           retryAfterMs: ra,
           model: mc.session,
-          scope: e.scope || quotaScopeForModel(mc.session),
+          scope: e.scope || quotaScopeForModel(mc.session, acctHealth.get(token)?.quota || null),
         });
       }
       if (e instanceof EmptyUpstreamStreamError) {
@@ -4723,11 +4794,14 @@ async function handleModels(client = null) {
       // （上游 409 session_model_mismatch / 403 free_mode_invalid_agent_model 拒绝其余模型）。
       // 分组键与排序都取自 MODEL_TIERS：免费 → US/SG → 限定 → 未分组。
       const rank = MODEL_TIERS.findIndex(([, ids]) => ids.has(m.id));
+      const declaredPool = safePoolName(m.pool);
+      const pool = declaredPool || modelPoolCategory(m.id) || "";
       return {
         id: m.id,
         object: "model",
         created: Math.floor(Date.now() / 1000),
         owned_by: "freebuff",
+        ...(pool ? { pool } : {}),
         ...(rank >= 0 ? { tier: MODEL_TIERS[rank][0] } : {}),
         _sort: rank < 0 ? MODEL_TIERS.length : rank,
       };

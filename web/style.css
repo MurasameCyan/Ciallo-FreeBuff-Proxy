@@ -487,9 +487,14 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
   background: transparent; vertical-align: 1px;
 }
 .pill.tier-free    { color: var(--mint);   border-color: color-mix(in oklab, var(--mint) 30%, transparent); }
-.pill.tier-us_sg   { color: var(--violet); border-color: color-mix(in oklab, var(--violet) 45%, transparent); }
-.pill.tier-limited { color: var(--amber);  border-color: color-mix(in oklab, var(--amber) 30%, transparent); }
+.pill.tier-us_sg,
+.pill.tier-premium,
+.pill.tier-luna,
+.pill.tier-deepseek_pro { color: var(--violet); border-color: color-mix(in oklab, var(--violet) 45%, transparent); }
+.pill.tier-limited,
+.pill.tier-glm     { color: var(--amber);  border-color: color-mix(in oklab, var(--amber) 30%, transparent); }
 .pill.tier-paused  { color: var(--fg-2);  border-color: color-mix(in oklab, var(--fg-2) 45%, transparent); }
+.pill.tier-pool-other { color: var(--fg-2); border-color: color-mix(in oklab, var(--fg-2) 35%, transparent); }
 /* 模型列表：纯文本清单，不再给每个模型名套卡片(边框+底色)——一屏九行卡片噪音大过信息，
    去掉包裹后行距收紧到 3px、字号降到 10px，列表宽度也跟着按最长模型名收窄。 */
 .models {

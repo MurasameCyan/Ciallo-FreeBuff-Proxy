@@ -10,7 +10,7 @@ import { createAccountStateStore } from '../server/account-state.mjs';
 const workerSource = readFileSync(new URL('../worker.js', import.meta.url), 'utf8');
 const workerWrapper = workerSource.replace('export default {', 'const __workerDefault__ = {')
   + '\n\nglobalThis.__workerDefault__ = __workerDefault__;\n'
-  + 'globalThis.__accountSafetyTestApi__ = { pickToken, pickTokenWithSessionWait, waitForAnyTokenRelease, sessionLeaseWaitMs, releaseToken, invalidateSessionCache, recordAccountObservation, cooldown, parseCooldown, accountPoolExhaustion, classifyRateLimit, quotaScopeForModel, freshQuotaProbe, startRun, executeChat, executeCodeReview, createSession, clientStatsSnapshot, recordRequest, usageSnapshot, restoreUsageSnapshot, restoreKeyUsageSnapshot, authenticatedUpstreamFetch };\n';
+  + 'globalThis.__accountSafetyTestApi__ = { pickToken, pickTokenWithSessionWait, waitForAnyTokenRelease, sessionLeaseWaitMs, releaseToken, invalidateSessionCache, recordAccountObservation, cooldown, parseCooldown, accountPoolExhaustion, classifyRateLimit, quotaScopeForModel, quotaEntryForModel, modelPoolCategory, freshQuotaProbe, startRun, executeChat, executeCodeReview, createSession, clientStatsSnapshot, recordRequest, usageSnapshot, restoreUsageSnapshot, restoreKeyUsageSnapshot, authenticatedUpstreamFetch };\n';
 
 const TOKEN = 'permanent-banned-account-token-123456';
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -475,6 +475,56 @@ test('额度快照按上游 pool 选择，不再取任意 Premium 模型行', as
   await assert.doesNotReject(workerVm.api.freshQuotaProbe(token, 'mimo/mimo-v2.5'));
 });
 
+test('账号实时 pool 覆盖 DS4P 旧静态归属并共享 Premium', async () => {
+  const workerVm = createWorkerVm();
+  const token = 'dynamic-ds4p-premium-account-123456';
+  const quota = {
+    'deepseek/deepseek-v4-pro': { recentCount: 2.6, limit: 5, pool: 'premium' },
+    'deepseek/deepseek-v4-flash': { recentCount: 2.6, limit: 5, pool: 'premium' },
+    'crof/kimi-k3-eco': { recentCount: 2.6, limit: 5, pool: 'premium' },
+  };
+  workerVm.api.recordAccountObservation(token, 200, { status: 'ok' }, { quota });
+
+  assert.equal(workerVm.api.modelPoolCategory('deepseek/deepseek-v4-pro', quota), 'premium');
+  assert.equal(workerVm.api.quotaScopeForModel('deepseek/deepseek-v4-pro', quota), 'pool:premium');
+  assert.deepEqual(workerVm.api.quotaEntryForModel(quota, 'deepseek/deepseek-v4-pro'), {
+    recentCount: 2.6,
+    limit: 5,
+    pool: 'premium',
+  });
+  await assert.doesNotReject(workerVm.api.freshQuotaProbe(token, 'deepseek/deepseek-v4-pro'));
+
+  const exhausted = {
+    ...quota,
+    'deepseek/deepseek-v4-pro': { recentCount: 5, limit: 5, pool: 'premium' },
+    'deepseek/deepseek-v4-flash': { recentCount: 5, limit: 5, pool: 'premium' },
+  };
+  workerVm.api.recordAccountObservation(token, 200, { status: 'ok' }, { quota: exhausted });
+  await assert.rejects(
+    workerVm.api.freshQuotaProbe(token, 'deepseek/deepseek-v4-pro'),
+    (error) => error?.name === 'QuotaExhaustedError' && error.scope === 'pool:premium',
+  );
+});
+
+test('未知显式 pool 按模型隔离但仍使用该模型额度行', async () => {
+  const workerVm = createWorkerVm();
+  const token = 'unknown-pool-model-account-123456';
+  const model = 'vendor/new-model';
+  const quota = {
+    [model]: { recentCount: 5, limit: 5, pool: 'preview_pool' },
+  };
+
+  workerVm.api.recordAccountObservation(token, 200, { status: 'ok' }, { quota });
+
+  assert.equal(workerVm.api.quotaScopeForModel(model, quota), `model:${model}`);
+  assert.deepEqual(workerVm.api.quotaEntryForModel(quota, model), quota[model]);
+  await assert.rejects(
+    workerVm.api.freshQuotaProbe(token, model),
+    (error) => error?.name === 'QuotaExhaustedError'
+      && error.scope === `model:${model}`,
+  );
+});
+
 test('Premium 快照异常不一致时各模型使用同一保守池结论并忽略暂停 M3', async () => {
   const workerVm = createWorkerVm();
   const token = 'premium-inconsistent-snapshot-account-123456';
@@ -601,6 +651,32 @@ test('startRun 的 typed 429 只锁定对应 quota pool，不污染异池模型'
     (error) => error?.name === 'QuotaExhaustedError' && error.scope === 'pool:deepseek_pro',
   );
   await assert.doesNotReject(workerVm.api.freshQuotaProbe(token, otherPoolModel));
+});
+
+test('startRun typed 429 继承账号实时 pool，不回退到 DS4P 旧静态池', async () => {
+  const token = 'start-run-dynamic-pool-account-123456';
+  const model = 'deepseek/deepseek-v4-pro';
+  const workerVm = createWorkerVm({
+    fetchImpl: async (url) => {
+      if (new URL(String(url)).pathname === '/api/v1/agent-runs') {
+        return upstreamResponse(429, { status: 'rate_limited' });
+      }
+      return upstreamResponse(200, {});
+    },
+  });
+  workerVm.api.recordAccountObservation(token, 200, { status: 'ok' }, {
+    model,
+    quota: { [model]: { recentCount: 2, limit: 5, pool: 'premium' } },
+  });
+
+  await assert.rejects(
+    workerVm.api.startRun(token, 'base-agent', [], model),
+    (error) => error?.name === 'QuotaExhaustedError' && error.scope === 'pool:premium',
+  );
+  await assert.rejects(
+    workerVm.api.freshQuotaProbe(token, model),
+    (error) => error?.name === 'QuotaExhaustedError' && error.scope === 'pool:premium',
+  );
 });
 
 test('普通成功观测不应续命已过期的 quota 快照', async () => {
