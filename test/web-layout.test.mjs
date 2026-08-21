@@ -362,7 +362,7 @@ for (const [id, label] of [
   ['openai/gpt-5.6-luna', 'Luna'],
   ['deepseek/deepseek-v4-pro', 'DS4P'],
   ['deepseek/deepseek-v4-flash', '高级'],
-  ['minimax/minimax-m3', '已暂停'],
+  ['minimax/minimax-m3', '停用'],
   ['crof/kimi-k3-eco', '高级'],
   ['meta/muse-spark-1.2-contributor', '高级'],
   ['mimo/mimo-v2.5', '免费'],
@@ -379,6 +379,10 @@ assert.match(app, /function renderKeys\(\)[\s\S]*?modelListHtml\(/s,
   'Key 表格的可用模型必须使用统一标签展示');
 assert.match(app, /function renderModels\(\)[\s\S]*?modelDisplay\(/s,
   '模型列表必须使用统一标签展示');
+assert.match(app, /function renderModels\(\)[\s\S]*?li\.textContent = name/s,
+  '模型列表条目必须只显示模型名（去掉 provider 前缀）');
+assert.match(app, /fillKeyModelButtons[\s\S]*?title="\$\{esc\(id\)\}">\$\{esc\(name\)\}/s,
+  'Key 模型按钮必须只显示模型名，完整 id 留在 title');
 assert.match(app, /PAUSED_MODEL_IDS[\s\S]*?fillKeyModelButtons[\s\S]*?disabled aria-disabled="true"/s,
   'Key 模型列表必须展示 M3 已暂停，但不得允许新 Key 选择它');
 assert.match(app, /function selectedKeyModels\(\)[\s\S]*?\.filter\(Boolean\)/s,
@@ -434,18 +438,31 @@ assert.equal(
 );
 assert.deepEqual(
   JSON.parse(JSON.stringify(helperVm.__modelUi.modelDisplay('minimax/minimax-m3'))),
-  { id: 'minimax/minimax-m3', short: 'M3', tier: '已暂停', tierKey: 'paused', fallbackTier: '' },
-  'M3 在模型与 Key 展示中必须标为已暂停',
+  { id: 'minimax/minimax-m3', name: 'minimax-m3', tierKey: 'paused', tier: '停用' },
+  'M3 在模型与 Key 展示中必须标为停用',
 );
 assert.deepEqual(
   JSON.parse(JSON.stringify(helperVm.__modelUi.modelDisplay('deepseek/deepseek-v4-flash'))),
-  { id: 'deepseek/deepseek-v4-flash', short: 'DS4F', tier: '高级', tierKey: 'us_sg', fallbackTier: '高级' },
-  'DS4F 必须统一展示为短名 + 高级标签',
+  { id: 'deepseek/deepseek-v4-flash', name: 'deepseek-v4-flash', tierKey: 'us_sg', tier: '高级' },
+  'DS4F 必须去掉 provider 前缀，只保留模型名 + 高级标签',
 );
-assert.match(helperVm.__modelUi.modelListHtml(['mimo/mimo-v2.5']), /tier-free">免费<\/span>/,
+assert.equal(
+  helperVm.__modelUi.modelListHtml(['openai/gpt-5.6-luna']),
+  '<span class="model-label" title="openai/gpt-5.6-luna">gpt-5.6-luna'
+  + ' <span class="pill tier tier-us_sg">Luna</span></span>',
+  '模型名只显示去 provider 的官方名，完整 id 留在 title，Luna 只作为 tag',
+);
+assert.match(helperVm.__modelUi.modelListHtml(['deepseek/deepseek-v4-pro']),
+  /">deepseek-v4-pro <span class="pill tier tier-us_sg">DS4P<\/span>/,
+  'DS4P 必须显示去 provider 的模型名 + DS4P tag');
+assert.match(helperVm.__modelUi.modelListHtml(['mimo/mimo-v2.5']),
+  /">mimo-v2\.5 <span class="pill tier tier-free">免费<\/span>/,
   'MiMo 的免费标签必须使用 free 配色');
-assert.match(helperVm.__modelUi.modelListHtml(['z-ai/glm-5.2']), /tier-limited">限定<\/span>/,
+assert.match(helperVm.__modelUi.modelListHtml(['z-ai/glm-5.2']),
+  /">glm-5\.2 <span class="pill tier tier-limited">限定<\/span>/,
   'GLM 的限定标签必须使用 limited 配色');
+assert.ok(!/short:\s*'/.test(app.slice(app.indexOf('const MODEL_DISPLAY ='), app.indexOf('function modelsCellHtml'))),
+  '模型展示不得再保留短名映射');
 assert.ok(!html.includes('class="page-intro"'), '页面顶部不应保留运行面板介绍区');
 for (const removedText of ['控制台', '运行面板', '账号、模型与出口代理集中管理']) {
   assert.ok(!html.includes(`>${removedText}<`), `页面必须移除介绍文案: ${removedText}`);
@@ -844,6 +861,10 @@ assert.match(app, /const modelIds = Array\.isArray\(k\.models\)[\s\S]*?modelList
   '可用模型列必须保留 All 语义，并用统一模型标签渲染具体白名单');
 assert.match(app, /function selectedKeyModels\(\)[\s\S]*?\[data-key-model\]\[aria-pressed="true"\][\s\S]*?dataset\.keyModel/s,
   '提交时必须从 aria-pressed=true 的具体模型按钮读取白名单');
+assert.match(css, /\.key-model-option\s*\{[^}]*max-width:\s*100%[^}]*overflow-wrap:\s*anywhere/s,
+  'Key 模型按钮显示官方模型名时必须在窄屏内换行');
+assert.match(css, /\.model-label\s*\{[^}]*overflow-wrap:\s*anywhere/s,
+  'Key 表格和账号模型列表中的官方模型名必须允许任意断行');
 assert.match(app, /let keyEditingPausedModels = \[\]/,
   '编辑旧 Key 时必须单独记住暂停模型白名单');
 assert.match(app, /const chosen = \[\.\.\.new Set\(selected\.filter\(Boolean\)\)\]/,

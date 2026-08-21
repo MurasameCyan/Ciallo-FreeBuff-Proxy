@@ -504,6 +504,7 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
   display: flex; flex-wrap: wrap; gap: 3px 14px;
   margin: 0; padding: 0; list-style: none; line-height: 1.35;
 }
+.model-label { overflow-wrap: anywhere; }
 .quota-models li { min-width: 0; overflow-wrap: anywhere; }
 .quota b { color: var(--fg); font-family: var(--mono); }
 .acct-usage { font-weight: 500; font-size: 11px; color: var(--fg-2); font-family: var(--mono); white-space: nowrap; }
@@ -647,6 +648,7 @@ select:disabled { opacity: .5; cursor: not-allowed; }
 .key-model-option {
   padding: 5px 9px; border: 1px solid var(--line-2); border-radius: 999px;
   background: transparent; color: var(--fg-2); font: 11px var(--mono);
+  max-width: 100%; overflow-wrap: anywhere; text-align: left;
   cursor: pointer; transition: color .12s, border-color .12s, background .12s;
 }
 .key-model-option:hover { color: var(--fg); border-color: var(--fg-2); }

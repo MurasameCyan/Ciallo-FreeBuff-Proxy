@@ -292,18 +292,19 @@ function stateDot(s, detail = '') {
   return `<span class="account-state-dot dot ${cls}" title="状态：${esc(label)}" aria-label="状态：${esc(label)}" role="img"></span>`;
 }
 
-// 模型短名只影响面板，完整 id 仍放在 title 并继续作为 API/白名单值。
-// label 是用户要看的短名或能力标签；short 存在时 label 作为标签显示。
+// 面板只显示模型名（去掉 provider/ 前缀）；完整 id 留在 title 和 API/白名单值里。
+// tag 只表达额度归属：免费 / 高级 / Luna / DS4P / 限定 / 停用。
+// Luna、DS4P 是各自独立的额度池，所以从「高级」里单独拆出来，但配色仍走高级色。
 const MODEL_DISPLAY = {
-  'openai/gpt-5.6-luna': { label: 'Luna', showTier: false },
-  'deepseek/deepseek-v4-pro': { label: 'DS4P', showTier: false },
-  'deepseek/deepseek-v4-flash': { label: '高级', short: 'DS4F', tier: 'us_sg' },
-  'minimax/minimax-m3': { label: '已暂停', short: 'M3', tier: 'paused' },
-  'crof/kimi-k3-eco': { label: '高级', short: 'Kimi', tier: 'us_sg' },
-  'meta/muse-spark-1.2-contributor': { label: '高级', short: 'Muse', tier: 'us_sg' },
-  'mimo/mimo-v2.5': { label: '免费', short: 'MiMo', tier: 'free' },
-  'z-ai/glm-5.2': { label: '限定', short: 'GLM', tier: 'limited' },
-  'anthropic/claude-fable-5': { label: '限定', short: 'Fable', tier: 'limited' },
+  'openai/gpt-5.6-luna': { label: 'Luna', tier: 'us_sg' },
+  'deepseek/deepseek-v4-pro': { label: 'DS4P', tier: 'us_sg' },
+  'deepseek/deepseek-v4-flash': { label: '高级', tier: 'us_sg' },
+  'minimax/minimax-m3': { label: '停用', tier: 'paused' },
+  'crof/kimi-k3-eco': { label: '高级', tier: 'us_sg' },
+  'meta/muse-spark-1.2-contributor': { label: '高级', tier: 'us_sg' },
+  'mimo/mimo-v2.5': { label: '免费', tier: 'free' },
+  'z-ai/glm-5.2': { label: '限定', tier: 'limited' },
+  'anthropic/claude-fable-5': { label: '限定', tier: 'limited' },
 };
 
 // 官方已撤回但动态目录可能不再返回的模型，保留在管理面板用于说明历史配置，
@@ -324,26 +325,19 @@ const MODEL_QUOTA_POOLS = {
   'meta/muse-spark-1.2-contributor': 'premium',
 };
 
+// 未收录的动态模型退回 /v1/models 的 tier 分组文案。
+// name 只保留 provider/ 后面的模型名，完整 id 仍放在 title 并继续作为 API/白名单值。
 function modelDisplay(id, model = null) {
   const known = MODEL_DISPLAY[id] || {};
-  const hasShort = Boolean(known.short);
-  const hasKnownDisplay = Object.prototype.hasOwnProperty.call(MODEL_DISPLAY, id);
-  const tierKey = known.tier || (hasKnownDisplay ? '' : model?.tier || '');
-  return {
-    id,
-    short: known.short || known.label || id,
-    tier: hasShort ? known.label : '',
-    tierKey,
-    fallbackTier: known.showTier === false ? '' : (MODEL_TIER_LABELS[tierKey] || ''),
-  };
+  const tierKey = known.tier || model?.tier || '';
+  const name = String(id).slice(String(id).lastIndexOf('/') + 1);
+  return { id, name, tierKey, tier: known.label || MODEL_TIER_LABELS[tierKey] || '' };
 }
 
 function modelListHtml(modelIds = []) {
   return [...new Set((Array.isArray(modelIds) ? modelIds : []).filter(Boolean))].map((id) => {
-    const display = modelDisplay(id);
-    const tier = display.tier || display.fallbackTier;
-    const tierKey = display.tierKey;
-    return `<span class="model-label" title="${esc(display.id)}">${esc(display.short)}${tier ? ` <span class="pill tier tier-${esc(tierKey)}">${esc(tier)}</span>` : ''}</span>`;
+    const { name, tier, tierKey } = modelDisplay(id);
+    return `<span class="model-label" title="${esc(id)}">${esc(name)}${tier ? ` <span class="pill tier tier-${esc(tierKey)}">${esc(tier)}</span>` : ''}</span>`;
   }).join(', ');
 }
 
@@ -740,10 +734,9 @@ function fillKeyModelButtons(selected = []) {
   root.innerHTML = [
     `<button type="button" class="key-model-option" data-key-model="" aria-pressed="${chosen.length === 0}" title="不限模型">All</button>`,
     ...ids.map((id) => {
-      const display = modelDisplay(id);
-      const tier = display.tier || display.fallbackTier;
+      const { name, tier } = modelDisplay(id);
       const paused = PAUSED_MODEL_IDS.has(id);
-      return `<button type="button" class="key-model-option${paused ? ' is-paused' : ''}" data-key-model="${esc(id)}" aria-pressed="${chosen.includes(id)}"${paused ? ' disabled aria-disabled="true"' : ''} title="${esc(id)}">${esc(display.short)}${tier ? ` · ${esc(tier)}` : ''}</button>`;
+      return `<button type="button" class="key-model-option${paused ? ' is-paused' : ''}" data-key-model="${esc(id)}" aria-pressed="${chosen.includes(id)}"${paused ? ' disabled aria-disabled="true"' : ''} title="${esc(id)}">${esc(name)}${tier ? ` · ${esc(tier)}` : ''}</button>`;
     }),
   ].join('');
   root.querySelectorAll('[data-key-model]').forEach((button) => button.addEventListener('click', () => {
@@ -924,12 +917,11 @@ function renderModels() {
   $('models-empty').hidden = list.length > 0;
   ul.replaceChildren(...list.map((m) => {
     const li = document.createElement('li');
-    const display = modelDisplay(m.id, m);
-    li.textContent = display.short;
+    const { name, tier, tierKey } = modelDisplay(m.id, m);
+    li.textContent = name;
     li.title = m.id;
     // 未分组的模型不带任何 tag
-    const tier = display.tier || display.fallbackTier;
-    if (tier) li.append(' ', tag(`pill tier tier-${display.tierKey}`, tier));
+    if (tier) li.append(' ', tag(`pill tier tier-${tierKey}`, tier));
     return li;
   }));
   // 溢出项给键盘可达
