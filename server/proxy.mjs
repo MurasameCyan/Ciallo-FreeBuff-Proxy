@@ -898,13 +898,13 @@ export function createProxyService({
   }
 
   function reserveNextAccountAutoCandidate({
-    lane, identity, operationVersion, topologyVersion, excludedNodes = new Set(), allowOccupied = false,
+    lane, identity, operationVersion, topologyVersion, excludedNodes = new Set(),
   }) {
     assertAccountOperation(lane, operationVersion, identity, topologyVersion);
     const candidates = accountAutoCandidates(lane);
     for (const candidate of candidates) {
       if (excludedNodes.has(candidate.name)) continue;
-      if (!allowOccupied && isAccountNodeOccupied(candidate.name, lane)) continue;
+      if (isAccountNodeOccupied(candidate.name, lane)) continue;
       accountAutoReservations.set(lane, {
         lane,
         node: candidate.name,
@@ -1359,7 +1359,6 @@ export function createProxyService({
           identity: normalizedIdentity,
           operationVersion,
           topologyVersion,
-          allowOccupied: cfg.accountSelectionPriority === 'advanced',
         });
         if (!candidate) {
           const error = new Error('没有测活成功的 US/SG 节点');
@@ -1466,7 +1465,6 @@ export function createProxyService({
                 operationVersion,
                 topologyVersion,
                 excludedNodes: attemptedNodes,
-                allowOccupied: selectionPriority === 'advanced',
               });
             });
             if (!candidate && freeFallback) {
@@ -1497,7 +1495,6 @@ export function createProxyService({
               operationVersion,
               topologyVersion,
               excludedNodes: attemptedNodes,
-              allowOccupied: selectionPriority === 'advanced',
             });
           });
         }

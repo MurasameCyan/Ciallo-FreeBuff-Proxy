@@ -572,6 +572,63 @@ test('优先高级会跳过 Free 节点，优先未用保留首个未占用节�
   assert.equal(unused.node, 'US-free');
 });
 
+test('优先高级先使用未占用的 SG 高级节点，再复用已占用的 US 高级节点', async () => {
+  const nodes = ['US-advanced', 'SG-advanced'];
+  const verified = [];
+  const { service } = fakeService({
+    controller: {
+      async request(path) {
+        if (path === '/proxies/freebuff-pool') return { all: nodes, now: nodes[0] };
+        if (path === '/proxies/freebuff-auto') return { now: nodes[0], all: nodes };
+        if (path.startsWith('/group/freebuff-pool/delay')) return { 'US-advanced': 10, 'SG-advanced': 20 };
+        return {};
+      },
+    },
+    service: {
+      buildFetch: async () => ({ fetch: async () => new Response('ok'), close: async () => {} }),
+    },
+  });
+  await service.setSubscription('https://sub.example.com/list');
+  const verify = async ({ node }) => {
+    verified.push(node);
+    return { tier: 'advanced', model: 'openai/gpt-5.6-luna' };
+  };
+
+  assert.equal((await service.selectAccountNodeAuto({ lane: 0, identity: 'first', verify })).node, 'US-advanced');
+  assert.equal((await service.selectAccountNodeAuto({ lane: 1, identity: 'second', verify })).node, 'SG-advanced');
+  assert.deepEqual(verified, ['US-advanced', 'SG-advanced']);
+});
+
+test('优先高级找不到未占用高级节点时才复用已占用高级节点', async () => {
+  const nodes = ['US-advanced', 'SG-free'];
+  const verified = [];
+  const { service } = fakeService({
+    controller: {
+      async request(path) {
+        if (path === '/proxies/freebuff-pool') return { all: nodes, now: nodes[0] };
+        if (path === '/proxies/freebuff-auto') return { now: nodes[0], all: nodes };
+        if (path.startsWith('/group/freebuff-pool/delay')) return { 'US-advanced': 10, 'SG-free': 20 };
+        return {};
+      },
+    },
+    service: {
+      buildFetch: async () => ({ fetch: async () => new Response('ok'), close: async () => {} }),
+    },
+  });
+  await service.setSubscription('https://sub.example.com/list');
+  const verify = async ({ node }) => {
+    verified.push(node);
+    return node === 'US-advanced'
+      ? { tier: 'advanced', model: 'openai/gpt-5.6-luna' }
+      : { tier: 'free', model: 'mimo/mimo-v2.5' };
+  };
+
+  await service.selectAccountNodeAuto({ lane: 0, identity: 'first', verify });
+  const second = await service.selectAccountNodeAuto({ lane: 1, identity: 'second', verify });
+  assert.equal(second.node, 'US-advanced');
+  assert.deepEqual(verified, ['US-advanced', 'SG-free', 'US-advanced']);
+});
+
 test('账号自动节点验证结果会缓存，出口拒绝后避开原节点重选', async () => {
   let clock = 1000;
   const nodes = ['US-A', 'SG-B', 'JP-C'];
