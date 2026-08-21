@@ -328,9 +328,14 @@ function dynamicStandardModels() {
   return new Set(cache.models.map((m) => m.id).filter((id) => !premium.has(id) && !glm.has(id)));
 }
 
-// 模型池分类查询：动态池优先，硬编码兜底
-// 返回 "premium" | "standard" | "glm" | null
+// 模型池分类查询：独立池优先，随后动态池和硬编码兜底。
+// 返回 "deepseek_pro" | "luna" | "premium" | "standard" | "glm" | null
 function modelPoolCategory(modelId) {
+  // 上游现在给 D4P/Luna 各自独立的每日池；不能让动态源码里的 shared
+  // PREMIUM 列表把它们重新合并。M3 已暂停，也不能继续继承旧 Premium 池。
+  if (PAUSED_QUOTA_MODELS.has(modelId)) return null;
+  if (DEEPSEEK_PRO_QUOTA_MODELS.has(modelId)) return "deepseek_pro";
+  if (LUNA_QUOTA_MODELS.has(modelId)) return "luna";
   const dyn = dynamicModelsCache;
   if (dyn && dyn.pool) {
     if (dyn.pool.premium.has(modelId)) return "premium";
@@ -371,7 +376,6 @@ const FREE_AVAILABLE_MODELS = new Set([
 const MODEL_TIERS = [
   ["free", FREE_AVAILABLE_MODELS],
   ["us_sg", new Set([
-    "minimax/minimax-m3",
     "deepseek/deepseek-v4-pro",
     "openai/gpt-5.6-luna",
     "crof/kimi-k3-eco",
@@ -384,40 +388,31 @@ const MODEL_TIERS = [
 ];
 
 // ---------------------------------------------------------------------------
-// 额度池说明（逆向自官方源码 freebuff-models.ts，2026-08-10 实证）
-//
-// 官方三种额度池（都是 session 次数，非 token 数）：
-//   1. PREMIUM 池：共享 6 次/天（FREEBUFF_PREMIUM_SESSION_LIMIT=6）
-//      m3 / v4-pro / luna / laguna-s-2.1 / muse-spark / greg-2 等
-//      （FREEBUFF_WEB_PREMIUM_MODEL_IDS）
-//   2. STANDARD 池：浏览器/Web 端 6 次/天
-//      （FREEBUFF_WEB_STANDARD_SESSION_LIMIT=6；= 所有非 premium 模型，
-//      即 Flash / MiMo 2.5 等。FREEBUFF_WEB_STANDARD_MODEL_IDS）
-//      ⚠️ 注释原文："The CLI keeps these models UNLIMITED; browser surfaces
-//      cap fresh sessions to deter automated project/session churn."
-//      → CLI 协议 Flash 无限，但 CLI 已被官方封堵（free_mode_cli_required）；
-//        桌面版/Web 协议下 Flash 同样受 6 次/天限制
-//   3. GLM 5.2 池：独立，referral 解锁（不计入以上）
-//
-// 桌面版并发桶（FREEBUFF_DESKTOP_SESSION_LIMITS，仅限并发非额度）：
-//   premium:  1  ← Premium 模型每用户同时 1 个活跃 session
-//   unlimited: 3 ← Flash/MiMo 每用户最多 3 个并发 tab
-//   limited 访问层（无 Premium 的号）：所有模型都占 1 个 slot
-//   （occupiesFreebuffDesktopSlot / getFreebuffDesktopSessionBucket）
-//
-// 对 1.7.0 的意义：单号串行时每天上限 = Premium 6 + Flash 6（按上游
-// America/Los_Angeles 日历日重置，UTC 时刻随 DST 变化）。并发到多号会同时烧各号额度，
-// 无法靠并发突破每日上限。
-// 额度池只用于选号，绝不改变调用方请求的模型。
+// 额度池说明（上游 rateLimitsByModel，2026-08-21）：
+//   deepseek_pro：D4P 独立池，通常 1 次/日
+//   luna：Luna 独立池，通常 1 次/日
+//   premium：DS4F / Kimi / Muse 等共享池，额度上限以每次探测返回的 limit 为准
+//   glm：GLM referral 独立池
+// M3 虽曾出现在旧 Premium 快照里，但已于 2026-08-20 暂停，不得再据旧表
+// 认定为当前可运行额度池。额度只用于本地调度/错误作用域，不改变调用方模型。
 // ---------------------------------------------------------------------------
-const PREMIUM_QUOTA_MODELS = new Set([
+const DEEPSEEK_PRO_QUOTA_MODELS = new Set([
   "deepseek/deepseek-v4-pro",
+]);
+const LUNA_QUOTA_MODELS = new Set([
   "openai/gpt-5.6-luna",
+]);
+const PAUSED_QUOTA_MODELS = new Set([
   "minimax/minimax-m3",
+]);
+const PREMIUM_QUOTA_MODELS = new Set([
+  "deepseek/deepseek-v4-flash",
+  "crof/kimi-k3-eco",
   "meta/muse-spark-1.2-contributor",
+  "poolside/laguna-s-2.1",
+  "openrouter/poolside/laguna-s-2.1",
 ]);
 const STANDARD_MODELS = new Set([
-  "deepseek/deepseek-v4-flash",
   "mimo/mimo-v2.5",
 ]);
 const GLM_QUOTA_MODELS = new Set([
@@ -1590,6 +1585,7 @@ function isTransientUpstreamError(error) {
 }
 
 function pickToken(env, sessionModel, attempted = new Set()) {
+  if (PAUSED_QUOTA_MODELS.has(String(sessionModel || ''))) return null;
   syncAccountState(env);
   const pool = parseAccounts(env);
   if (pool.length === 0) return null;
@@ -1798,7 +1794,7 @@ function quotaScopeForModel(model) {
   const id = String(model || "").trim();
   if (!id) return "account";
   const category = modelPoolCategory(id);
-  if (category === "premium") return "pool:premium";
+  if (["deepseek_pro", "luna", "premium"].includes(category)) return "pool:" + category;
   if (category === "glm" || GLM_QUOTA_MODELS.has(id)) return "pool:glm";
   // Standard/Limited grouping is not assumed without a confirmed upstream pool.
   return "model:" + id;
@@ -1913,23 +1909,47 @@ function isStaleSessionGate(status, body) {
     status === expectedStatus && hasExactErrorCode(parsed, code));
 }
 
-// 仅供流式无首数据时确认 Premium 额度是否耗尽；不参与账号轮询排序。
+function quotaEntryForModel(quota, sessionModel) {
+  if (!quota || typeof quota !== "object" || PAUSED_QUOTA_MODELS.has(sessionModel)) return null;
+  const scope = quotaScopeForModel(sessionModel);
+  const pool = scope.startsWith("pool:") ? scope.slice(5) : null;
+  if (pool === "premium") {
+    const pooled = [];
+    for (const [model, entry] of Object.entries(quota)) {
+      if (!entry || typeof entry !== "object" || PAUSED_QUOTA_MODELS.has(model)) continue;
+      const entryPool = String(entry.pool || "");
+      if (entryPool === "premium" || (!entryPool && PREMIUM_QUOTA_MODELS.has(model))) pooled.push(entry);
+    }
+    if (pooled.length) {
+      const limits = pooled.map((entry) => Number(entry.limit)).filter(Number.isFinite);
+      const counts = pooled.map((entry) => Number(entry.recentCount)).filter(Number.isFinite);
+      return {
+        ...pooled[0],
+        ...(limits.length ? { limit: Math.min(...limits) } : {}),
+        ...(counts.length ? { recentCount: Math.max(...counts) } : {}),
+        pool: "premium",
+      };
+    }
+    return null;
+  }
+  const exact = quota[sessionModel];
+  if (exact && typeof exact === "object") {
+    const exactPool = String(exact.pool || "");
+    if (!exactPool || !pool || exactPool === pool) return exact;
+  }
+  if (!pool) return null;
+  for (const entry of Object.values(quota)) {
+    if (entry && typeof entry === "object" && String(entry.pool || "") === pool) return entry;
+  }
+  return null;
+}
+
+// 仅供流式无首数据时确认对应额度池是否耗尽；不参与账号轮询排序。
 function remainingQuota(token, sessionModel) {
   const h = acctHealth.get(token);
   if (!h || !h.quota || !Number.isFinite(Number(h.quotaCheckedAt))) return null;
   if (Date.now() - Number(h.quotaCheckedAt) > HEALTH_OBSERVATION_TTL_MS) return null;
-  let entry = h.quota[sessionModel];
-  if (!entry && modelPoolCategory(sessionModel) === "premium") {
-    const premiumPool = (dynamicModelsCache.pool && dynamicModelsCache.pool.premium)
-      ? dynamicModelsCache.pool.premium
-      : PREMIUM_QUOTA_MODELS;
-    for (const model of premiumPool) {
-      if (h.quota[model]) {
-        entry = h.quota[model];
-        break;
-      }
-    }
-  }
+  const entry = quotaEntryForModel(h.quota, sessionModel);
   if (!entry || typeof entry.recentCount !== "number" || typeof entry.limit !== "number") return null;
   return entry.limit - entry.recentCount;
 }
@@ -1953,15 +1973,7 @@ function isQuotaExhausted(info, sessionModel) {
   // 不根据 rateLimitsByModel 的 STANDARD 数字判断耗尽。
   if (modelPoolCategory(sessionModel) === "standard") return false;
   if (!info.quota) return false;
-  let entry = info.quota[sessionModel];
-  if (!entry && modelPoolCategory(sessionModel) === "premium") {
-    const premiumPool = (dynamicModelsCache.pool && dynamicModelsCache.pool.premium)
-      ? dynamicModelsCache.pool.premium
-      : PREMIUM_QUOTA_MODELS;
-    for (const model of premiumPool) {
-      if (info.quota[model]) { entry = info.quota[model]; break; }
-    }
-  }
+  const entry = quotaEntryForModel(info.quota, sessionModel);
   if (!entry || typeof entry.recentCount !== "number" || typeof entry.limit !== "number") return false;
   return entry.limit - entry.recentCount <= 0;
 }
@@ -2576,7 +2588,7 @@ async function freshQuotaProbe(token, sessionModel) {
       ...cached,
       scope: cached.state === "spend_limited"
         ? "account"
-        : cached.quotaScope || "model:" + String(sessionModel),
+        : cached.quotaScope || quotaScopeForModel(sessionModel),
     });
   }
 }
@@ -3208,6 +3220,7 @@ function resolveModelAlias(modelId) {
 // 查找模型配置：自定义别名 → 硬编码 MODELS → 动态表（合并表）
 function findModelConfig(modelId) {
   const target = resolveModelAlias(modelId) || modelId;
+  if (PAUSED_QUOTA_MODELS.has(target)) return null;
   const hit = MODELS.find((m) => m.id === target);
   if (hit) return hit;
   const dyn = dynamicModelsCache.models;
@@ -3222,6 +3235,7 @@ function findModelConfig(modelId) {
 // 不能依赖 /v1/models 先被调用：Cloudflare 不保证两个请求落在同一 isolate。
 async function resolveModelConfig(modelId) {
   const target = resolveModelAlias(modelId) || modelId;
+  if (PAUSED_QUOTA_MODELS.has(target)) return null;
   let hit = findModelConfig(target);
   if (hit) return hit;
   try {
@@ -4691,6 +4705,9 @@ async function handleModels(client = null) {
   if (client && Array.isArray(client.models) && client.models.length) {
     modelList = modelList.filter((m) => client.models.includes(m.id));
   }
+  // 官方暂停模型可能残留在动态源/旧 Key 白名单中；它不能继续出现在正常
+  // 模型目录，否则客户端会先选中再收到上游 409。
+  modelList = modelList.filter((m) => !PAUSED_QUOTA_MODELS.has(m.id));
   const data = modelList
     .map((m) => {
       // 实测（2026-08-15）：免费账号只有 Flash / MiMo 2.5 两个模型能建会话

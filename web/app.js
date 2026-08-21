@@ -292,24 +292,114 @@ function stateDot(s, detail = '') {
   return `<span class="account-state-dot dot ${cls}" title="状态：${esc(label)}" aria-label="状态：${esc(label)}" role="img"></span>`;
 }
 
-// 额度展示优先使用上游返回的池/模型快照；Premium 的共池关系已确认，其他分组不因本地
-// 猜测自动合并。重置时间也以每条快照的 resetAt 为准，不硬编码 UTC 时刻。
-// 账号级用量取用量最高的池呈现（免费号只有一个池，等价于账号通用）。
-// 「可用池」= 有真实额度（limit>0）。免费号里 glm-5.2 等未解锁模型上游会以 0/0
-// （limit=0）返回，既非真正可用、又会污染账号用量取值，这里统一滤掉。
-function usableQuota(probe) {
-  if (!probe || !Array.isArray(probe.quota)) return [];
-  return probe.quota.filter((q) => Number(q.limit) > 0);
+// 模型短名只影响面板，完整 id 仍放在 title 并继续作为 API/白名单值。
+// label 是用户要看的短名或能力标签；short 存在时 label 作为标签显示。
+const MODEL_DISPLAY = {
+  'openai/gpt-5.6-luna': { label: 'Luna', showTier: false },
+  'deepseek/deepseek-v4-pro': { label: 'DS4P', showTier: false },
+  'deepseek/deepseek-v4-flash': { label: '高级', short: 'DS4F', tier: 'us_sg' },
+  'minimax/minimax-m3': { label: '已暂停', short: 'M3', tier: 'paused' },
+  'crof/kimi-k3-eco': { label: '高级', short: 'Kimi', tier: 'us_sg' },
+  'meta/muse-spark-1.2-contributor': { label: '高级', short: 'Muse', tier: 'us_sg' },
+  'mimo/mimo-v2.5': { label: '免费', short: 'MiMo', tier: 'free' },
+  'z-ai/glm-5.2': { label: '限定', short: 'GLM', tier: 'limited' },
+  'anthropic/claude-fable-5': { label: '限定', short: 'Fable', tier: 'limited' },
+};
+
+// 官方已撤回但动态目录可能不再返回的模型，保留在管理面板用于说明历史配置，
+// 不代表它仍可调用；worker /v1/models 和请求入口都会将其排除。
+const PAUSED_MODEL_IDS = new Set(['minimax/minimax-m3']);
+
+function catalogModelIds() {
+  const ids = Array.isArray(S.models) ? S.models.map((m) => m.id).filter(Boolean) : [];
+  for (const id of PAUSED_MODEL_IDS) if (!ids.includes(id)) ids.push(id);
+  return ids;
 }
 
-function accountUsage(probe) {
-  const rows = usableQuota(probe);
-  if (!rows.length) return null;
-  let top = null;
-  for (const q of rows) {
-    if (!top || Number(q.used ?? 0) > Number(top.used ?? 0)) top = q;
+const MODEL_QUOTA_POOLS = {
+  'deepseek/deepseek-v4-pro': 'deepseek_pro',
+  'openai/gpt-5.6-luna': 'luna',
+  'deepseek/deepseek-v4-flash': 'premium',
+  'crof/kimi-k3-eco': 'premium',
+  'meta/muse-spark-1.2-contributor': 'premium',
+};
+
+function modelDisplay(id, model = null) {
+  const known = MODEL_DISPLAY[id] || {};
+  const hasShort = Boolean(known.short);
+  const hasKnownDisplay = Object.prototype.hasOwnProperty.call(MODEL_DISPLAY, id);
+  const tierKey = known.tier || (hasKnownDisplay ? '' : model?.tier || '');
+  return {
+    id,
+    short: known.short || known.label || id,
+    tier: hasShort ? known.label : '',
+    tierKey,
+    fallbackTier: known.showTier === false ? '' : (MODEL_TIER_LABELS[tierKey] || ''),
+  };
+}
+
+function modelListHtml(modelIds = []) {
+  return [...new Set((Array.isArray(modelIds) ? modelIds : []).filter(Boolean))].map((id) => {
+    const display = modelDisplay(id);
+    const tier = display.tier || display.fallbackTier;
+    const tierKey = display.tierKey;
+    return `<span class="model-label" title="${esc(display.id)}">${esc(display.short)}${tier ? ` <span class="pill tier tier-${esc(tierKey)}">${esc(tier)}</span>` : ''}</span>`;
+  }).join(', ');
+}
+
+function quotaPoolForRow(row) {
+  const explicit = String(row?.pool || '').trim().toLowerCase();
+  return explicit || MODEL_QUOTA_POOLS[row?.model] || '';
+}
+
+// 额度展示按上游 pool 聚合。D/L/P 是池上限的紧凑摘要，已用/总量只放 title，
+// 避免一行账号被某个模型的计数冒充成整个账号额度。
+function quotaRows(probe) {
+  if (!probe || !Array.isArray(probe.quota)) return [];
+  return probe.quota.filter((q) => {
+    const limit = Number(q?.limit);
+    return Number.isFinite(limit) && limit >= 0 && !PAUSED_MODEL_IDS.has(String(q?.model || ''));
+  });
+}
+
+function usableQuota(probe) {
+  return quotaRows(probe).filter((q) => Number(q.limit) > 0);
+}
+
+function accountQuotaSummary(probe) {
+  const pools = new Map();
+  for (const row of quotaRows(probe)) {
+    const pool = quotaPoolForRow(row);
+    if (!['deepseek_pro', 'luna', 'premium'].includes(pool)) continue;
+    const limit = Number(row.limit);
+    const usedValue = row.used ?? row.recentCount;
+    const used = Number.isFinite(Number(usedValue)) ? Number(usedValue) : null;
+    const previous = pools.get(pool);
+    if (!previous) pools.set(pool, { limit, used });
+    else {
+      // 同一共享池的各模型行正常应完全一致。若上游短暂返回不一致快照，
+      // 用较小上限避免 UI 高估可用额度；已用量取较大值同样保持保守。
+      pools.set(pool, {
+        limit: Math.min(previous.limit, limit),
+        used: previous.used == null ? used : used == null ? previous.used : Math.max(previous.used, used),
+      });
+    }
   }
-  return top;
+  const poolOrder = [
+    ['deepseek_pro', 'D'],
+    ['luna', 'L'],
+    ['premium', 'P'],
+  ];
+  const parts = [];
+  const details = [];
+  for (const [pool, label] of poolOrder) {
+    const row = pools.get(pool);
+    if (!row) continue;
+    parts.push(`${label}${row.limit}`);
+    details.push(`${label} ${row.used == null ? '—' : row.used}/${row.limit}`);
+  }
+  if (!parts.length) return null;
+  return { text: `( ${parts.join(' ')} )`, title: `额度 ${details.join(' · ')}` };
 }
 
 // 可用模型列：只列真正有额度（limit>0）的模型，每个模型独占一行；0/0 未解锁模型
@@ -329,7 +419,7 @@ function modelsCellHtml(probe) {
     }
     return '<span class="quota">—</span>';
   }
-  const items = rows.map((q) => `<li><b>${esc(q.model)}</b></li>`).join('');
+  const items = rows.map((q) => `<li>${modelListHtml([q.model])}</li>`).join('');
   return `<ul class="quota quota-models">${items}</ul>`;
 }
 
@@ -528,9 +618,9 @@ function renderAccounts() {
   }
   $('acctBody').innerHTML = S.accounts.map(a => {
     const h = S.health[a.key];
-    const usage = accountUsage(h);
+    const usage = accountQuotaSummary(h);
     const usageHtml = usage
-      ? ` <span class="acct-usage" title="已用 / 总量（每日额度，池级共享）">( ${esc(usage.used ?? '—')} / ${esc(usage.limit ?? '—')} )</span>`
+      ? ` <span class="acct-usage" title="${esc(usage.title)}">${esc(usage.text)}</span>`
       : '';
     // 主行=备注名(或邮箱)+池级用量，次行=邮箱。
     const label = a.name || a.email || a.key;
@@ -619,6 +709,7 @@ async function saveAliases(next) {
 // 「模型与 Key」卡的第二页。一个表单管新建与编辑：keyEditing 有值就是编辑那把
 // （PATCH），空就是发新的（POST）—— 省掉第二套 DOM 和第二条提交路径。
 let keyEditing = null;
+let keyEditingPausedModels = [];
 
 function keyMask(key) {
   return `${key.slice(0, 8)}…`;
@@ -633,7 +724,7 @@ function selectedKeyModels() {
 }
 
 function setKeyModelSelection(selected = []) {
-  const wanted = new Set(selected);
+  const wanted = new Set([...selected, ...keyEditingPausedModels]);
   const hasSpecific = wanted.size > 0;
   $('newKeyModels').querySelectorAll('[data-key-model]').forEach((button) => {
     const model = button.dataset.keyModel;
@@ -643,12 +734,17 @@ function setKeyModelSelection(selected = []) {
 
 function fillKeyModelButtons(selected = []) {
   const chosen = [...new Set(selected.filter(Boolean))];
-  const ids = (Array.isArray(S.models) ? S.models.map((m) => m.id).filter(Boolean) : []).slice();
+  const ids = catalogModelIds();
   for (const id of chosen) if (!ids.includes(id)) ids.push(id);
   const root = $('newKeyModels');
   root.innerHTML = [
     `<button type="button" class="key-model-option" data-key-model="" aria-pressed="${chosen.length === 0}" title="不限模型">All</button>`,
-    ...ids.map((id) => `<button type="button" class="key-model-option" data-key-model="${esc(id)}" aria-pressed="${chosen.includes(id)}">${esc(id)}</button>`),
+    ...ids.map((id) => {
+      const display = modelDisplay(id);
+      const tier = display.tier || display.fallbackTier;
+      const paused = PAUSED_MODEL_IDS.has(id);
+      return `<button type="button" class="key-model-option${paused ? ' is-paused' : ''}" data-key-model="${esc(id)}" aria-pressed="${chosen.includes(id)}"${paused ? ' disabled aria-disabled="true"' : ''} title="${esc(id)}">${esc(display.short)}${tier ? ` · ${esc(tier)}` : ''}</button>`;
+    }),
   ].join('');
   root.querySelectorAll('[data-key-model]').forEach((button) => button.addEventListener('click', () => {
     const model = button.dataset.keyModel;
@@ -665,6 +761,7 @@ function fillKeyModelButtons(selected = []) {
 
 function resetKeyForm() {
   keyEditing = null;
+  keyEditingPausedModels = [];
   $('newKeyName').value = '';
   $('newKeyConcurrency').value = '1';   // 并发默认 1：免费通道同号并发 >1 就出问题
   $('newKeyDaily').value = '0';
@@ -675,6 +772,9 @@ function resetKeyForm() {
 
 function fillKeyForm(k) {
   keyEditing = k.key;
+  keyEditingPausedModels = Array.isArray(k.models)
+    ? k.models.filter((model) => PAUSED_MODEL_IDS.has(model))
+    : [];
   $('newKeyName').value = k.name || '';
   $('newKeyConcurrency').value = String(k.concurrency ?? 1);
   $('newKeyDaily').value = String(k.dailyLimit ?? 0);
@@ -697,7 +797,9 @@ function renderKeys() {
   } else {
     body.innerHTML = list.map((k) => {
       const st = S.keyStats[k.name] || {};
-      const models = Array.isArray(k.models) && k.models.length ? k.models.join(', ') : 'All';
+      const modelIds = Array.isArray(k.models) ? k.models : [];
+      const models = modelIds.length ? modelListHtml(modelIds) : 'All';
+      const modelsTitle = modelIds.length ? modelIds.join(', ') : 'All';
       const running = st.inFlight > 0 ? ` · <span class="key-inflight" title="在跑 ${st.inFlight}" aria-label="在跑 ${st.inFlight}">${st.inFlight}</span>` : '';
       return `<tr class="${k.disabled ? 'key-off' : ''}">
         <td><span class="nm">${esc(k.name)}</span>${k.disabled ? ' <span class="pill">已停用</span>' : ''}</td>
@@ -706,7 +808,7 @@ function renderKeys() {
         <td>${k.dailyLimit > 0 ? esc(String(k.dailyLimit)) : UNLIMITED_GLYPH}</td>
         <td class="mono">${fmtCount(st.dayCount || 0)} / ${fmtCount(st.total || 0)}${running}</td>
         <td class="mono" title="历史累计 token ${esc(fmtCount(st.totalTokens || 0))}">${fmtTokens(st.totalTokens || 0)}</td>
-        <td class="key-models-cell mono" title="${esc(models)}">${esc(models)}</td>
+        <td class="key-models-cell mono" title="${esc(modelsTitle)}">${models}</td>
         <td class="action-col"><div class="actions icon-actions">
           ${iconButton('copy', '复制 Key', `data-kcopy="${esc(k.key)}"`)}
           ${iconButton('edit', '编辑 Key', `data-kedit="${esc(k.key)}"`)}
@@ -810,20 +912,24 @@ async function submitKeyForm() {
 
 // 模型分组 tag：键与顺序由 worker 的 MODEL_TIERS 决定（/v1/models 的 tier 字段），
 // 这里只负责文案。排序已经在 worker 侧做过，前端不再二次排序。
-const MODEL_TIER_LABELS = { free: '免费', us_sg: 'US / SG', limited: '限定' };
+const MODEL_TIER_LABELS = { free: '免费', us_sg: '高级', limited: '限定' };
 
 function renderModels() {
   const ul = $('models');
-  const list = Array.isArray(S.models) ? S.models : [];
+  const known = new Map((Array.isArray(S.models) ? S.models : []).map((m) => [m.id, m]));
+  for (const id of PAUSED_MODEL_IDS) if (!known.has(id)) known.set(id, { id, tier: 'paused' });
+  const list = [...known.values()];
   const modelCount = $('modelCount');
   if (modelCount) modelCount.textContent = `${list.length} 个`;
   $('models-empty').hidden = list.length > 0;
   ul.replaceChildren(...list.map((m) => {
     const li = document.createElement('li');
-    li.textContent = m.id;
-    li.title = li.textContent;
+    const display = modelDisplay(m.id, m);
+    li.textContent = display.short;
+    li.title = m.id;
     // 未分组的模型不带任何 tag
-    if (MODEL_TIER_LABELS[m.tier]) li.append(' ', tag(`pill tier tier-${m.tier}`, MODEL_TIER_LABELS[m.tier]));
+    const tier = display.tier || display.fallbackTier;
+    if (tier) li.append(' ', tag(`pill tier tier-${display.tierKey}`, tier));
     return li;
   }));
   // 溢出项给键盘可达

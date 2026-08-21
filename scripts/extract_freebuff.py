@@ -385,7 +385,6 @@ MODEL_AGENTS = {
     "deepseek/deepseek-v4-pro": "base2-free-deepseek",
     "moonshotai/kimi-k2.6": "base2-free-kimi",
     "minimax/minimax-m2.7": "base2-free",
-    "minimax/minimax-m3": "base2-free-minimax-m3",
     "mimo/mimo-v2.5": "base2-free-mimo",
     "mimo/mimo-v2.5-pro": "base2-free-mimo-pro",
 }

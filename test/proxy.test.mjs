@@ -457,35 +457,42 @@ test('账号自动出站候选只包含测活成功的 US/SG 节点', async () =
   assert.equal(proxyModule.inferNodeRegion('🇸🇬 JP¹-SG⁰_singapore'), 'sg');
 });
 
-test('账号授权优先选择有可用额度的高级模型', () => {
+test('账号高级节点按 accessTier 判定，不因 D4P/Luna 当日额度用完降级', () => {
   assert.equal(typeof proxyModule.classifyAccountProbeAuthorization, 'function');
   assert.deepEqual(proxyModule.classifyAccountProbeAuthorization({
     state: 'ok',
+    accessTier: 'full',
     quota: [
-      { model: 'openai/gpt-5.6-luna', used: 0, limit: 5 },
-      { model: 'deepseek/deepseek-v4-pro', used: 1, limit: 5 },
+      { model: 'openai/gpt-5.6-luna', used: 1, limit: 1, pool: 'luna' },
+      { model: 'deepseek/deepseek-v4-pro', used: 1, limit: 1, pool: 'deepseek_pro' },
+      { model: 'deepseek/deepseek-v4-flash', used: 3, limit: 5, pool: 'premium' },
     ],
   }), { tier: 'advanced', model: 'deepseek/deepseek-v4-pro' });
   assert.deepEqual(proxyModule.classifyAccountProbeAuthorization({
+    state: 'ok', accessTier: 'full', quota: null,
+  }), { tier: 'advanced' },
+  'full 能力已明确时，额度快照暂缺也不得把节点卡在自动验证中');
+  assert.deepEqual(proxyModule.classifyAccountProbeAuthorization({
     state: 'ok',
+    accessTier: null,
     quota: [
-      { model: 'deepseek/deepseek-v4-pro', used: 5, limit: 5 },
-      { model: 'openai/gpt-5.6-luna', used: 4, limit: 5 },
+      { model: 'deepseek/deepseek-v4-flash', used: 3, limit: 5, pool: 'premium' },
     ],
-  }), { tier: 'advanced', model: 'openai/gpt-5.6-luna' },
-  '高级模型按 Pro、Luna 顺序选择，但必须仍有可用额度');
+  }), { tier: 'advanced', model: 'deepseek/deepseek-v4-flash' },
+  '旧响应缺少 accessTier 时，明确的高级 pool 仍可判定节点能力');
 });
 
 test('高级额度不可用时回落免费授权且不按 used 判断免费额度', () => {
   assert.deepEqual(proxyModule.classifyAccountProbeAuthorization({
     state: 'ok',
+    accessTier: 'limited',
     quota: [
-      { model: 'openai/gpt-5.6-luna', used: 5, limit: 5 },
+      { model: 'openai/gpt-5.6-luna', used: 1, limit: 1, pool: 'luna' },
       { model: 'mimo/mimo-v2.5', used: 0, limit: 6 },
-      { model: 'deepseek/deepseek-v4-flash', used: 6, limit: 6 },
+      { model: 'deepseek/deepseek-v4-flash', used: 5, limit: 5, pool: 'premium' },
     ],
   }), { tier: 'free', model: 'deepseek/deepseek-v4-flash' },
-  '免费模型按 Flash、MiMo 顺序选择，used 达到 limit 仍表示具备免费授权');
+  'limited accessTier 必须保持 Free，不能仅凭额度行误判为高级节点');
   assert.equal(proxyModule.classifyAccountProbeAuthorization({
     state: 'ok',
     quota: [{ model: 'mimo/mimo-v2.5', used: 0, limit: 0 }],
@@ -494,6 +501,15 @@ test('高级额度不可用时回落免费授权且不按 used 判断免费额�
     state: 'banned',
     quota: [{ model: 'mimo/mimo-v2.5', used: 0, limit: 6 }],
   }), null, '非存活账号不能仅凭额度表获得授权');
+});
+
+test('旧探测响应不能用已暂停 M3 作为高级节点证据', () => {
+  assert.equal(proxyModule.classifyAccountProbeAuthorization({
+    state: 'ok',
+    quota: [
+      { model: 'minimax/minimax-m3', used: 0, limit: 5, pool: 'premium' },
+    ],
+  }), null, 'M3 即使残留 Premium 行也不得让自动选点误判为高级节点');
 });
 
 test('账号自动出站优先级可持久化并切换', async () => {

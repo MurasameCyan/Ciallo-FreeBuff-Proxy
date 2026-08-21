@@ -34,6 +34,7 @@ const MAX_NAME_LEN = 40;
 const MAX_MODELS = 64;
 const MAX_CONCURRENCY = 32;
 const MAX_DAILY_LIMIT = 100000;
+const PAUSED_MODEL_IDS = new Set(['minimax/minimax-m3']);
 
 function invalid(message) {
   return Object.assign(new Error(message), { code: 'INVALID_KEY_CONFIG' });
@@ -167,7 +168,20 @@ export function createApiKeyStore(file) {
         assertNameFree(keys, next.name, key);
       }
       if (patch.concurrency !== undefined) next.concurrency = cleanConcurrency(patch.concurrency, cur.concurrency);
-      if (patch.models !== undefined) next.models = cleanModels(patch.models, cur.models);
+      if (patch.models !== undefined) {
+        const models = cleanModels(patch.models, cur.models);
+        // 旧 Key 可能只允许已经暂停的模型。前端会把该模型显示为禁用，
+        // 因而一次普通的“保存”不能把 models=[] 误解成“不限模型”。
+        // 其他 Key 显式传空数组的既有语义保持不变。
+        if (
+          models.length === 0
+          && cur.models.length > 0
+          && cur.models.every((model) => PAUSED_MODEL_IDS.has(model))
+        ) {
+          throw invalid('该 Key 只允许已暂停模型，不能改成不限模型');
+        }
+        next.models = models;
+      }
       if (patch.dailyLimit !== undefined) next.dailyLimit = cleanDailyLimit(patch.dailyLimit, cur.dailyLimit);
       if (patch.disabled !== undefined) next.disabled = patch.disabled === true;
       keys[idx] = next;

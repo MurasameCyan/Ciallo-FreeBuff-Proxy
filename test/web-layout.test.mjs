@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import vm from 'node:vm';
 
 const html = readFileSync(new URL('../web/index.html', import.meta.url), 'utf8');
 const css = readFileSync(new URL('../web/style.css', import.meta.url), 'utf8');
@@ -176,8 +177,12 @@ assert.ok(app.includes('renderQuotaHead()'), 'renderAccounts 必须刷新额度�
 assert.ok(!app.includes('quota-reset'), '重置时间已上移列标题，行内不应再有 quota-reset');
 assert.ok(!app.includes('tokenShort'),
   '账号面板不得展示或依赖 token 短哈希');
-assert.ok(app.includes('esc(usage.used') && app.includes('esc(usage.limit'),
-  '账号用量必须移动到账号名之后（池级共享，视作账号通用）呈现 (已用/总量)');
+assert.match(app, /function accountQuotaSummary\(probe\)[\s\S]*?deepseek_pro[\s\S]*?luna[\s\S]*?premium/s,
+  '账号额度必须按上游 pool 聚合为 D4P / Luna / Premium 三个独立池');
+assert.match(app, /`\( \$\{parts\.join\(' '\)\} \)`/,
+  '账号名后必须紧凑呈现 ( D1 L1 P5 ) 形式的池容量');
+assert.doesNotMatch(app, /function accountUsage\(/,
+  '不得再从所有模型行里取一个最大 used/limit 冒充账号总额度');
 assert.match(app, /class="acct-usage"/, '账号名后必须有 acct-usage 承载用量');
 assert.match(app, /class="quota quota-models"/, '可用模型列必须列出账号可用模型');
 assert.match(app, /probe\?\.isolatedPermanent/,
@@ -351,10 +356,96 @@ assert.match(css, /\.model-catalog \.models\s*\{[^}]*row-gap:\s*3px/s,
   '模型列表纵向间距必须固定为紧凑的 3px，不能被通用 gap 或 flex 剩余高度放大');
 assert.match(css, /\.model-catalog \.models li\s*\{[^}]*width:\s*fit-content/s,
   '模型列表条目不应横向拉伸并留下空白');
-assert.match(app, /MODEL_TIER_LABELS = \{ free: '免费', us_sg: 'US \/ SG', limited: '限定' \}/,
-  '模型列表的三个分组 tag 文案必须是 免费 / US / SG / 限定');
-assert.match(app, /MODEL_TIER_LABELS\[m\.tier\]/,
-  '分组 tag 必须读 /v1/models 的 tier 字段（旧的 m.free 已废弃）');
+assert.match(app, /MODEL_TIER_LABELS = \{ free: '免费', us_sg: '高级', limited: '限定' \}/,
+  '模型列表的通用分组 tag 文案必须是 免费 / 高级 / 限定');
+for (const [id, label] of [
+  ['openai/gpt-5.6-luna', 'Luna'],
+  ['deepseek/deepseek-v4-pro', 'DS4P'],
+  ['deepseek/deepseek-v4-flash', '高级'],
+  ['minimax/minimax-m3', '已暂停'],
+  ['crof/kimi-k3-eco', '高级'],
+  ['meta/muse-spark-1.2-contributor', '高级'],
+  ['mimo/mimo-v2.5', '免费'],
+  ['z-ai/glm-5.2', '限定'],
+  ['anthropic/claude-fable-5', '限定'],
+]) {
+  assert.ok(app.includes(`'${id}': { label: '${label}'`), `${id} 必须显示标签 ${label}`);
+}
+assert.match(app, /function modelDisplay\(/,
+  '模型目录、Key 选择按钮和 Key 表格必须复用统一展示映射');
+assert.match(app, /fillKeyModelButtons[\s\S]*?modelDisplay\(/s,
+  'Key 模型按钮必须使用统一标签展示');
+assert.match(app, /function renderKeys\(\)[\s\S]*?modelListHtml\(/s,
+  'Key 表格的可用模型必须使用统一标签展示');
+assert.match(app, /function renderModels\(\)[\s\S]*?modelDisplay\(/s,
+  '模型列表必须使用统一标签展示');
+assert.match(app, /PAUSED_MODEL_IDS[\s\S]*?fillKeyModelButtons[\s\S]*?disabled aria-disabled="true"/s,
+  'Key 模型列表必须展示 M3 已暂停，但不得允许新 Key 选择它');
+assert.match(app, /function selectedKeyModels\(\)[\s\S]*?\.filter\(Boolean\)/s,
+  '编辑旧 Key 时必须保留已暂停 M3 白名单，不能静默丢失');
+
+const helperSource = `const S = { models: [] };\nconst esc = (value) => String(value);\n${app.match(/const MODEL_TIER_LABELS = \{[^\n]+/)[0]}\n`
+  + `${app.slice(app.indexOf('const MODEL_DISPLAY ='), app.indexOf('function modelsCellHtml'))}\n`
+  + 'globalThis.__modelUi = { accountQuotaSummary, modelDisplay, modelListHtml };';
+const helperVm = { globalThis: null };
+helperVm.globalThis = helperVm;
+vm.runInNewContext(helperSource, helperVm);
+assert.deepEqual(
+  JSON.parse(JSON.stringify(helperVm.__modelUi.accountQuotaSummary({ quota: [
+    { model: 'deepseek/deepseek-v4-pro', used: 1, limit: 1, pool: 'deepseek_pro' },
+    { model: 'openai/gpt-5.6-luna', used: 1, limit: 1, pool: 'luna' },
+    { model: 'deepseek/deepseek-v4-flash', used: 3, limit: 5, pool: 'premium' },
+    { model: 'crof/kimi-k3-eco', used: 3, limit: 5, pool: 'premium' },
+  ] }))),
+  { text: '( D1 L1 P5 )', title: '额度 D 1/1 · L 1/1 · P 3/5' },
+  'D/L/P 摘要必须按 pool 去重，Premium 多模型行只显示一个 P5',
+);
+assert.deepEqual(
+  JSON.parse(JSON.stringify(helperVm.__modelUi.accountQuotaSummary({ quota: [
+    { model: 'deepseek/deepseek-v4-pro', used: 0, limit: 1, pool: 'deepseek_pro' },
+    { model: 'openai/gpt-5.6-luna', used: 0, limit: 1, pool: 'luna' },
+    { model: 'deepseek/deepseek-v4-flash', used: 1, limit: 4, pool: 'premium' },
+  ] }))),
+  { text: '( D1 L1 P4 )', title: '额度 D 0/1 · L 0/1 · P 1/4' },
+  'P 值必须读取上游 Premium 池 limit，不能写死为 5',
+);
+assert.deepEqual(
+  JSON.parse(JSON.stringify(helperVm.__modelUi.accountQuotaSummary({ quota: [
+    { model: 'deepseek/deepseek-v4-flash', used: null, limit: 7, pool: 'premium' },
+    { model: 'crof/kimi-k3-eco', used: 2, limit: 5, pool: 'premium' },
+  ] }))),
+  { text: '( P5 )', title: '额度 P 2/5' },
+  'Premium 行异常不一致时必须保守取最小 limit，并优先显示已知 used',
+);
+assert.deepEqual(
+  JSON.parse(JSON.stringify(helperVm.__modelUi.accountQuotaSummary({ quota: [
+    { model: 'deepseek/deepseek-v4-flash', used: 0, limit: 0, pool: 'premium' },
+    { model: 'crof/kimi-k3-eco', used: 2, limit: 5, pool: 'premium' },
+  ] }))),
+  { text: '( P0 )', title: '额度 P 2/0' },
+  'Premium 同池出现 0 与正数冲突时，UI 必须与 worker 一样保守，不能丢掉 0 后显示 P5',
+);
+assert.equal(
+  helperVm.__modelUi.accountQuotaSummary({ quota: [
+    { model: 'minimax/minimax-m3', used: 0, limit: 99, pool: 'premium' },
+  ] }),
+  null,
+  '暂停 M3 的残留额度行不得生成 P 摘要',
+);
+assert.deepEqual(
+  JSON.parse(JSON.stringify(helperVm.__modelUi.modelDisplay('minimax/minimax-m3'))),
+  { id: 'minimax/minimax-m3', short: 'M3', tier: '已暂停', tierKey: 'paused', fallbackTier: '' },
+  'M3 在模型与 Key 展示中必须标为已暂停',
+);
+assert.deepEqual(
+  JSON.parse(JSON.stringify(helperVm.__modelUi.modelDisplay('deepseek/deepseek-v4-flash'))),
+  { id: 'deepseek/deepseek-v4-flash', short: 'DS4F', tier: '高级', tierKey: 'us_sg', fallbackTier: '高级' },
+  'DS4F 必须统一展示为短名 + 高级标签',
+);
+assert.match(helperVm.__modelUi.modelListHtml(['mimo/mimo-v2.5']), /tier-free">免费<\/span>/,
+  'MiMo 的免费标签必须使用 free 配色');
+assert.match(helperVm.__modelUi.modelListHtml(['z-ai/glm-5.2']), /tier-limited">限定<\/span>/,
+  'GLM 的限定标签必须使用 limited 配色');
 assert.ok(!html.includes('class="page-intro"'), '页面顶部不应保留运行面板介绍区');
 for (const removedText of ['控制台', '运行面板', '账号、模型与出口代理集中管理']) {
   assert.ok(!html.includes(`>${removedText}<`), `页面必须移除介绍文案: ${removedText}`);
@@ -749,10 +840,16 @@ for (const label of ['每日会话上限，0 表示不限', '同一小时会话�
 assert.ok(!/<select[^>]*id="newKeyModels"/.test(html), '不得保留 Ctrl/⌘ 多选下拉');
 assert.match(app, /function fillKeyModelButtons\(selected = \[\]\)[\s\S]*?data-key-model=""[^>]*title="不限模型">All<\/button>/s,
   '模型按钮组必须提供代表 models: [] 的 All 按钮，中文口径留在 title 里');
-assert.match(app, /k\.models\.length \? k\.models\.join\(', '\) : 'All'/,
-  '可用模型列空白名单必须显示 All，与按钮组同一套说法');
+assert.match(app, /const modelIds = Array\.isArray\(k\.models\)[\s\S]*?modelListHtml\(modelIds\)/s,
+  '可用模型列必须保留 All 语义，并用统一模型标签渲染具体白名单');
 assert.match(app, /function selectedKeyModels\(\)[\s\S]*?\[data-key-model\]\[aria-pressed="true"\][\s\S]*?dataset\.keyModel/s,
   '提交时必须从 aria-pressed=true 的具体模型按钮读取白名单');
+assert.match(app, /let keyEditingPausedModels = \[\]/,
+  '编辑旧 Key 时必须单独记住暂停模型白名单');
+assert.match(app, /const chosen = \[\.\.\.new Set\(selected\.filter\(Boolean\)\)\]/,
+  '旧 Key 已存的 M3 必须保留在按钮选择状态中');
+assert.match(app, /aria-pressed="\$\{chosen\.includes\(id\)\}"[^>]*disabled aria-disabled="true"/s,
+  '旧 Key 的 M3 按钮必须保持选中但禁用，新 Key 仍不能主动选择');
 assert.match(app, /if \(!model\)[\s\S]*?setKeyModelSelection\(\[\]\)[\s\S]*?else[\s\S]*?selected\.has\(model\)[\s\S]*?setKeyModelSelection/s,
   '点击 All 须清空具体模型，具体模型须支持独立切换并在空集时回到 All');
 assert.match(app, /models:\s*selectedKeyModels\(\)/,

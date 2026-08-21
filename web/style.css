@@ -482,6 +482,7 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
 .pill.tier-free    { color: var(--mint);   border-color: color-mix(in oklab, var(--mint) 30%, transparent); }
 .pill.tier-us_sg   { color: var(--violet); border-color: color-mix(in oklab, var(--violet) 45%, transparent); }
 .pill.tier-limited { color: var(--amber);  border-color: color-mix(in oklab, var(--amber) 30%, transparent); }
+.pill.tier-paused  { color: var(--fg-2);  border-color: color-mix(in oklab, var(--fg-2) 45%, transparent); }
 /* 模型列表：纯文本清单，不再给每个模型名套卡片(边框+底色)——一屏九行卡片噪音大过信息，
    去掉包裹后行距收紧到 3px、字号降到 10px，列表宽度也跟着按最长模型名收窄。 */
 .models {
@@ -652,6 +653,9 @@ select:disabled { opacity: .5; cursor: not-allowed; }
 .key-model-option[aria-pressed="true"] {
   color: var(--mint); border-color: color-mix(in oklab, var(--mint) 45%, var(--line-2));
   background: color-mix(in oklab, var(--mint) 10%, transparent);
+}
+.key-model-option.is-paused {
+  color: var(--fg-2); border-color: var(--line); opacity: .7; cursor: not-allowed;
 }
 .key-form-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .key-form-actions .btn { margin: 0; }

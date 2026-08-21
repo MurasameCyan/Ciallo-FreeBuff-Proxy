@@ -491,13 +491,22 @@ async function probeAccount(token, {
     const rows = [];
     for (const [m, info] of Object.entries(rl)) {
       if (info && typeof info === 'object' && typeof info.limit === 'number') {
-        rows.push({
+        const row = {
           model: m,
           used: typeof info.recentCount === 'number' ? info.recentCount : null,
           limit: info.limit,
           remaining: typeof info.remaining === 'number' ? info.remaining : null,
           resetAt: info.resetAt || null,
-        });
+        };
+        // 当前上游把 premium、luna、deepseek_pro 拆成不同池；没有这些字段时
+        // 仍兼容旧响应，但不能在服务端擅自把模型行合并成一个总额度。
+        for (const key of ['pool', 'poolLabel', 'period', 'windowHours', 'resetTimeZone']) {
+          if (typeof info[key] === 'string' || typeof info[key] === 'number') row[key] = info[key];
+        }
+        if (info.entitlementBreakdown && typeof info.entitlementBreakdown === 'object') {
+          row.entitlementBreakdown = info.entitlementBreakdown;
+        }
+        rows.push(row);
       }
     }
     return rows.length ? rows : null;

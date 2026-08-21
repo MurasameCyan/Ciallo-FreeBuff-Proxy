@@ -519,8 +519,8 @@ test('管理员探测按明确结果持久隔离，自动候选验证不修改�
     data: {
       status: 'active',
       rateLimitsByModel: {
-        'openai/gpt-5.6-luna': { limit: 5, remaining: 2 },
-        'mimo/mimo-v2.5': { limit: 6 },
+        'openai/gpt-5.6-luna': { limit: 1, remaining: 0, pool: 'luna', poolLabel: 'Luna' },
+        'mimo/mimo-v2.5': { limit: 6, pool: 'standard', poolLabel: 'Standard' },
       },
     },
   };
@@ -539,8 +539,8 @@ test('管理员探测按明确结果持久隔离，自动候选验证不修改�
     data: {
       status: 'active',
       rateLimitsByModel: {
-        'openai/gpt-5.6-luna': { limit: 5, remaining: 2 },
-        'mimo/mimo-v2.5': { limit: 6 },
+        'openai/gpt-5.6-luna': { limit: 1, remaining: 0, pool: 'luna', poolLabel: 'Luna' },
+        'mimo/mimo-v2.5': { limit: 6, pool: 'standard', poolLabel: 'Standard' },
       },
     },
   };
@@ -552,9 +552,15 @@ test('管理员探测按明确结果持久隔离，自动候选验证不修改�
   });
   assert.equal(verification.state, 'ok');
   assert.deepEqual(verification.quota, [
-    { model: 'openai/gpt-5.6-luna', used: null, limit: 5, remaining: 2, resetAt: null },
-    { model: 'mimo/mimo-v2.5', used: null, limit: 6, remaining: null, resetAt: null },
-  ], '模型行即使没有 recentCount 也必须保留，供 Free 授权和 remaining 判定使用');
+    {
+      model: 'openai/gpt-5.6-luna', used: null, limit: 1, remaining: 0, resetAt: null,
+      pool: 'luna', poolLabel: 'Luna',
+    },
+    {
+      model: 'mimo/mimo-v2.5', used: null, limit: 6, remaining: null, resetAt: null,
+      pool: 'standard', poolLabel: 'Standard',
+    },
+  ], '模型行必须保留上游池标识，面板才能按 D/L/P 聚合而不混淆独立额度池');
   assert.equal(verification.isolatedPermanent, true,
     '自动选点模型验证成功不能清除管理员持久隔离');
 });

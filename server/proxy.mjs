@@ -131,28 +131,51 @@ const ACCOUNT_ADVANCED_AUTH_MODELS = [
   'deepseek/deepseek-v4-pro',
   'openai/gpt-5.6-luna',
 ];
+const ACCOUNT_PREMIUM_AUTH_MODELS = [
+  'deepseek/deepseek-v4-flash',
+  'crof/kimi-k3-eco',
+  'meta/muse-spark-1.2-contributor',
+];
 const ACCOUNT_FREE_AUTH_MODELS = [
   'deepseek/deepseek-v4-flash',
   'mimo/mimo-v2.5',
 ];
+const PAUSED_ACCOUNT_AUTH_MODELS = new Set([
+  'minimax/minimax-m3',
+]);
 
 export function classifyAccountProbeAuthorization(probe) {
   if (!probe || typeof probe !== 'object' || probe.state !== 'ok') return null;
-  if (!Array.isArray(probe.quota)) return null;
-  for (const model of ACCOUNT_ADVANCED_AUTH_MODELS) {
-    const row = probe.quota.find((entry) => entry?.model === model);
-    if (!row) continue;
-    const limit = Number(row.limit);
-    if (!(limit > 0)) continue;
-    if (row.remaining != null) {
-      if (Number(row.remaining) > 0) return { tier: 'advanced', model };
-      continue;
-    }
-    const used = Number(row.used);
-    if (Number.isFinite(used) && used >= 0 && used < limit) return { tier: 'advanced', model };
+  const accessTier = String(probe.accessTier || '').trim().toLowerCase();
+  const quota = Array.isArray(probe.quota) ? probe.quota : null;
+  const rowFor = (model) => quota?.find((entry) => entry?.model === model) || null;
+  const advancedModel = [...ACCOUNT_ADVANCED_AUTH_MODELS, ...ACCOUNT_PREMIUM_AUTH_MODELS]
+    .find((model) => rowFor(model));
+
+  // accessTier 描述的是出口/账号能力，不是当天某个模型的剩余额度。
+  // full 节点即使 D4P/Luna 为 1/1，仍应作为高级节点复用；额度耗尽由请求
+  // 调度的 pool 作用域处理，不能在这里把高级节点降级成 Free。
+  if (accessTier === 'full' || accessTier === 'advanced') {
+    return { tier: 'advanced', ...(advancedModel ? { model: advancedModel } : {}) };
   }
+
+  if (!quota) return null;
+
+  // 旧上游响应没有 accessTier 时，显式 pool 是唯一可接受的能力证据。
+  if (!accessTier) {
+    const pooledAdvanced = quota.find((entry) => (
+      !PAUSED_ACCOUNT_AUTH_MODELS.has(String(entry?.model || ''))
+      &&
+      ['deepseek_pro', 'luna', 'premium'].includes(String(entry?.pool || '').toLowerCase())
+      && Number(entry?.limit) > 0
+    ));
+    if (pooledAdvanced) return { tier: 'advanced', model: pooledAdvanced.model };
+  }
+
+  // limited/free 账号只需要确认有一个免费模型授权；used 达到 limit
+  // 不代表模型不能建会话，真正的请求额度由上游 admission 决定。
   for (const model of ACCOUNT_FREE_AUTH_MODELS) {
-    const row = probe.quota.find((entry) => entry?.model === model);
+    const row = quota.find((entry) => entry?.model === model);
     if (row && Number(row.limit) > 0) return { tier: 'free', model };
   }
   return null;

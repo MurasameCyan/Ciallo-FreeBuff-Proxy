@@ -627,7 +627,6 @@ await tAsync('模型按 免费 → US/SG → 限定 分组打 tier', async () =>
   const expected = {
     'mimo/mimo-v2.5': 'free',
     'deepseek/deepseek-v4-flash': 'free',
-    'minimax/minimax-m3': 'us_sg',
     'deepseek/deepseek-v4-pro': 'us_sg',
     'openai/gpt-5.6-luna': 'us_sg',
     'crof/kimi-k3-eco': 'us_sg',
@@ -640,6 +639,9 @@ await tAsync('模型按 免费 → US/SG → 限定 分组打 tier', async () =>
   }
   // handleModels 的拼装：带 tier、不再有旧的 free 字段、内部排序键要摘掉
   const body = await (await handleModels()).json();
+  if (body.data.some((m) => m.id === 'minimax/minimax-m3')) {
+    throw new Error('已暂停的 M3 不得出现在 /v1/models');
+  }
   const mimo = body.data.find((m) => m.id === 'mimo/mimo-v2.5');
   if (!mimo || mimo.tier !== 'free' || 'free' in mimo || '_sort' in mimo) {
     throw new Error('handleModels 输出不对: ' + JSON.stringify(mimo));
@@ -649,6 +651,14 @@ await tAsync('模型按 免费 → US/SG → 限定 分组打 tier', async () =>
   for (let i = 1; i < ranks.length; i++) {
     if (ranks[i] < ranks[i - 1]) throw new Error('模型列表没按分组排序: ' + JSON.stringify(body.data.map((m) => m.id)));
   }
+  if (await resolveModelConfig('minimax/minimax-m3') !== null) {
+    throw new Error('已暂停的 M3 必须在请求解析入口被拒绝');
+  }
+  setTestAliases('old-m3=minimax/minimax-m3');
+  if (await resolveModelConfig('old-m3') !== null) {
+    throw new Error('别名不得绕过 M3 暂停闸门');
+  }
+  setTestAliases('');
 });
 
 await tAsync('流式首 chunk 前客户端取消会停止上游并释放账号', async () => {

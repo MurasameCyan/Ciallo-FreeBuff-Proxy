@@ -125,7 +125,7 @@ Freebuff 把免费账号分成两个**访问层**（`accessTier`）：出口 IP 
 | `deepseek/deepseek-v4-flash` | DeepSeek V4 Flash 07/31 | **否** | `low` `high` `max` | ✅ 可用（limited 层默认模型） |
 | `mimo/mimo-v2.5` | MiMo 2.5 | **否** | 无档位（仅思考开/关） | ✅ 可用 |
 | `z-ai/glm-5.2` | GLM 5.2 | 否，但要邀请解锁 | 路由忽略 `reasoning_effort` | ⚠️ 额度 `0/0`，未解锁 |
-| `minimax/minimax-m3` | MiniMax M3 | **是** | 无档位（adaptive / 关） | ✅ full 层实测可用 |
+| `minimax/minimax-m3` | MiniMax M3 | **是** | 无档位（adaptive / 关） | ⏸️ 官方已暂停（2026-08-20），代理不再暴露或调用 |
 | `deepseek/deepseek-v4-pro` | DeepSeek V4 Pro 08/13 | **是** | `low` `high` `max` | ✅ full 层实测可用 |
 | `openai/gpt-5.6-luna` | GPT-5.6 Luna | **是** | 服务端钉死 `high`（见下） | ✅ full 层实测可用 |
 | `crof/kimi-k3-eco` | Kimi K3（Eco 量化版） | **是** | 路由忽略 `reasoning_effort` | ✅ full 层实测可用 |
@@ -133,7 +133,8 @@ Freebuff 把免费账号分成两个**访问层**（`accessTier`）：出口 IP 
 | `anthropic/claude-fable-5` | Claude Fable 5 | **是** | `low` `medium` `high` `xhigh` `max` | ❌ 409 `session_model_mismatch`，账号未授权 |
 
 「无档位」「路由忽略」的模型不代表不思考 —— 官方 `efforts` 字段缺省的含义是「不提供档位选择」，
-M3 与 MiMo 照样会思考，只是没有深浅可调。给这些模型发 `reasoning_effort` 是无害的空操作。
+MiMo 照样会思考，只是没有深浅可调。M3 的旧兼容 ID 仍可能出现在官方动态源码中，
+但当前已暂停，代理只在管理面板标记状态，不把它作为正常可调用模型。
 
 **Luna 的档位是假的**：官方目录里 Luna 写着 `EFFORTS_THROUGH_MAX`（`low`…`max`），那是 OpenRouter
 广告的元数据。实际链路上 Freebuff 的 `applyFreebuffReasoningDefaults` 会给这条 OpenRouter 路由注入
@@ -154,8 +155,8 @@ Luna 是**钉死**而不是 clamp —— 任何档位（含 `low` / `none` / `au
 
 | | `limited` | `full` |
 |---|---|---|
-| 额度表内容 | `deepseek-v4-flash`、`mimo-v2.5`（+ `glm-5.2` 的 `0/0`） | `minimax-m3`、`deepseek-v4-pro`、`gpt-5.6-luna`、`kimi-k3-eco`、`muse-spark` 五个 |
-| 每日额度 | 两个模型各 6 次 session | 五个模型**共享**一份 6 次，按调用加权（`used` 会是 1.3 这种小数） |
+| 额度表内容 | `deepseek-v4-flash`、`mimo-v2.5`（+ `glm-5.2` 的 `0/0`） | D4P、Luna 及共享 Premium 模型；M3 残留行会被忽略 |
+| 每日额度 | 以上游快照为准 | D4P、Luna 各有独立上限；DS4F / Kimi / Muse 共用 Premium 池，面板动态显示 `D… L… P…` |
 
 上游额度按 `America/Los_Angeles` 日历日重置；UTC 时刻随夏令时为 `07:00` 或 `08:00`（北京时间
 15:00 或 16:00），面板优先显示上游返回的 `resetAt`。代理对没有 typed 状态或时间提示的 generic
@@ -184,7 +185,7 @@ Freebuff 会把响应里的 `model` 字段改写成自己的命名，**问模型
 | `deepseek/deepseek-v4-pro` | 裸 UUID | `prompt_cache_hit_tokens` | DeepSeek 官方直连 |
 | `openai/gpt-5.6-luna` | `gen-<epoch>-<rand>` | `is_byok` | OpenRouter 中转 |
 | `crof/kimi-k3-eco` | `chatcmpl-<epoch.微秒>` | `tokens_per_second`、`prompt_cost` | CrofAI |
-| `minimax/minimax-m3` | `chatcmpl-<32 位 hex>` | 无 `completion_tokens_details` | Fireworks（官方源码注明） |
+| `minimax/minimax-m3`（历史） | `chatcmpl-<32 位 hex>` | 无 `completion_tokens_details` | Fireworks（当前已暂停） |
 
 四套 id 格式 + 四套 usage schema 互不相同 → 这几个 id 没有被偷偷合并路由到同一个后端。
 

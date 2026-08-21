@@ -113,6 +113,18 @@ test('改配置：只动传进来的字段，key 本身不可改；不存在的 
   });
 });
 
+test('旧 M3-only Key 不得被空模型更新静默扩成不限模型', async () => {
+  await withStore(async (store) => {
+    const key = store.add({ name: '旧 M3 Key', models: ['minimax/minimax-m3'] });
+    assert.throws(
+      () => store.update(key.key, { models: [] }),
+      (error) => error?.code === 'INVALID_KEY_CONFIG',
+      '暂停模型是旧 Key 的唯一白名单时，空数组不能被解释成不限模型',
+    );
+    assert.deepEqual(store.list()[0].models, ['minimax/minimax-m3'], '拒绝更新后必须保留原白名单');
+  });
+});
+
 test('手改过/旧版本写的文件也能用：缺字段补默认值，坏 JSON 当空池而不是打不开面板', async () => {
   await withStore(async (store) => {
     const list = store.list();
@@ -236,6 +248,7 @@ test('/v1/models 只列白名单里的模型：客户端选不到就少一轮 40
     SHARED,
     { ...SHARED, key: 'fbk-only-mimo', models: [MODEL.id] },
     { ...SHARED, key: 'fbk-other', models: ['deepseek/deepseek-v4-flash'] },
+    { ...SHARED, key: 'fbk-paused-m3', models: ['minimax/minimax-m3'] },
   ]);
   const ids = async (key) => {
     const r = await worker.fetch(req(key), env);
@@ -244,6 +257,7 @@ test('/v1/models 只列白名单里的模型：客户端选不到就少一轮 40
   };
   assert.deepEqual(await ids('fbk-only-mimo'), [MODEL.id]);
   assert.deepEqual(await ids('fbk-other'), [], '白名单外的模型不许露出来');
+  assert.deepEqual(await ids('fbk-paused-m3'), [], '旧 Key 白名单中的暂停 M3 不得重新出现在模型目录');
   assert.deepEqual(await ids(OWNER_KEY), [MODEL.id], '主 Key 不受白名单影响');
   assert.deepEqual(await ids(SHARED.key), [MODEL.id], '空白名单 = 不限');
 });
@@ -351,17 +365,19 @@ test('归账快照只出备注名，绝不出明文 key（GET /_api/usage 会整
 test('流式：槽位等 body 到终态才放（正常收尾走 flush，客户端断开走 cancel）', async () => {
   const { api } = createWorkerVm();
   for (const mode of ['flush', 'cancel']) {
-    let released = 0;
+    const client = api.resolveClient(req(SHARED.key), envWith([SHARED]));
+    const gate = api.openClientGate(client, MODEL);
+    assert.equal(api.clientStatsSnapshot()[0].inFlight, 1, `${mode}: 流未结束时绿色计数必须为 1`);
     const src = new ReadableStream({
       start(c) { c.enqueue(new Uint8Array([1])); if (mode === 'flush') c.close(); },
     });
-    const reader = src.pipeThrough(api.releaseOnStreamEnd(() => { released++; })).getReader();
+    const reader = src.pipeThrough(api.releaseOnStreamEnd(gate.release)).getReader();
     await reader.read();
-    assert.equal(released, 0, `${mode}: body 还在写时不能提前放槽位`);
+    assert.equal(api.clientStatsSnapshot()[0].inFlight, 1, `${mode}: body 还在写时不能提前减计数`);
     if (mode === 'flush') await reader.read(); else await reader.cancel();
     // 流的终态回调是微任务，让它跑完
     await new Promise((r) => setTimeout(r, 10));
-    assert.equal(released, 1, `${mode}: body 到终态必须放槽位`);
+    assert.equal(api.clientStatsSnapshot()[0].inFlight, 0, `${mode}: body 到终态必须减 1`);
   }
 });
 
