@@ -622,10 +622,46 @@ await tAsync('模型目录携带官方动态 pool 元数据', async () => {
       agent: 'base2-free-deepseek', root_agent: 'base2-free-deepseek',
       pool: 'premium',
     },
+    {
+      id: 'openai/gpt-5.6-luna', session: 'openai/gpt-5.6-luna',
+      agent: 'base2-free-luna', root_agent: 'base2-free-luna',
+      pool: 'premium',
+    },
+    {
+      id: 'anthropic/claude-fable-5', session: 'anthropic/claude-fable-5',
+      agent: 'base2-free-fable', root_agent: 'base2-free-fable',
+      pool: 'standard',
+    },
   ]);
   const body = await (await handleModels()).json();
   const pro = body.data.find((model) => model.id === 'deepseek/deepseek-v4-pro');
-  if (!pro || pro.pool !== 'premium') throw new Error('DS4P pool 元数据错误: ' + JSON.stringify(pro));
+  if (!pro || pro.pool !== 'premium' || pro.tier !== 'limited') {
+    throw new Error('DS4P 独立额度覆盖错误: ' + JSON.stringify(pro));
+  }
+  for (const id of ['openai/gpt-5.6-luna', 'anthropic/claude-fable-5']) {
+    const model = body.data.find((entry) => entry.id === id);
+    if (!model || model.tier !== 'limited') {
+      throw new Error(`${id} 限定 tier 错误: ` + JSON.stringify(model));
+    }
+  }
+  setTestDynamicModels(null);
+});
+
+await tAsync('动态目录中的 luna-es 不进入普通模型目录', async () => {
+  setTestDynamicModels([
+    {
+      id: 'openai/gpt-5.6-luna-es', session: 'openai/gpt-5.6-luna-es',
+      agent: 'base2-free-luna-es', root_agent: 'base2-free-luna-es',
+      pool: 'premium',
+    },
+  ]);
+  const body = await (await handleModels()).json();
+  if (body.data.some((model) => model.id === 'openai/gpt-5.6-luna-es')) {
+    throw new Error('luna-es 不得出现在普通 /v1/models: ' + JSON.stringify(body.data));
+  }
+  if (await resolveModelConfig('openai/gpt-5.6-luna-es') !== null) {
+    throw new Error('luna-es 不得进入普通请求解析入口');
+  }
   setTestDynamicModels(null);
 });
 
@@ -641,8 +677,8 @@ await tAsync('模型按 免费 → US/SG → 限定 分组打 tier', async () =>
   const expected = {
     'mimo/mimo-v2.5': 'free',
     'deepseek/deepseek-v4-flash': 'free',
-    'deepseek/deepseek-v4-pro': 'us_sg',
-    'openai/gpt-5.6-luna': 'us_sg',
+    'deepseek/deepseek-v4-pro': 'limited',
+    'openai/gpt-5.6-luna': 'limited',
     'crof/kimi-k3-eco': 'us_sg',
     'meta/muse-spark-1.2-contributor': 'us_sg',
     'z-ai/glm-5.2': 'limited',

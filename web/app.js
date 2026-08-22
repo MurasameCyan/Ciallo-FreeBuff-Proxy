@@ -293,12 +293,13 @@ function stateDot(s, detail = '') {
 }
 
 // 面板只显示模型名（去掉 provider/ 前缀）；完整 id 留在 title 和 API/白名单值里。
-// tag 只表达当前额度池：免费 / 高级 / Luna / DS4P / 限定 / 停用。
-// 上游显式 pool 优先，静态表只在旧快照或旧 Key 没有 pool 时兼容展示。
+// tag 表达访问/供给层：免费 / 高级 / 限定 / 停用。
+// D4P、Luna、Fable 的独立限次/限量 offer 是强制“限定”；pool 只用于额度摘要，
+// 不能把它们随动态 premium/standard 元数据改成“高级”或“免费”。
 const MODEL_DISPLAY = {
-  'openai/gpt-5.6-luna': { label: 'Luna', tier: 'us_sg' },
-  'deepseek/deepseek-v4-pro': { label: 'DS4P', tier: 'us_sg' },
-  'deepseek/deepseek-v4-flash': { label: '高级', tier: 'us_sg' },
+  'openai/gpt-5.6-luna': { label: '限定', tier: 'limited' },
+  'deepseek/deepseek-v4-pro': { label: '限定', tier: 'limited' },
+  'deepseek/deepseek-v4-flash': { label: '免费', tier: 'free' },
   'minimax/minimax-m3': { label: '停用', tier: 'paused' },
   'crof/kimi-k3-eco': { label: '高级', tier: 'us_sg' },
   'meta/muse-spark-1.2-contributor': { label: '高级', tier: 'us_sg' },
@@ -310,12 +311,16 @@ const MODEL_DISPLAY = {
 // 官方已撤回但动态目录可能不再返回的模型，保留在管理面板用于说明历史配置，
 // 不代表它仍可调用；worker /v1/models 和请求入口都会将其排除。
 const PAUSED_MODEL_IDS = new Set(['minimax/minimax-m3']);
-const HIDDEN_MODEL_IDS = new Set(['stealth/ox-alpha']);
+const HIDDEN_MODEL_IDS = new Set([
+  'stealth/ox-alpha',
+  'openai/gpt-5.6-luna-es',
+]);
 
 function isHiddenModelId(modelId) {
   const value = String(modelId || '').trim().toLowerCase();
   return HIDDEN_MODEL_IDS.has(value) || value === 'ox-alpha'
-    || value === 'anthropic/ox-alpha' || value.endsWith('/ox-alpha');
+    || value === 'anthropic/ox-alpha' || value.endsWith('/ox-alpha')
+    || value.startsWith('openai/gpt-5.6-luna-es');
 }
 
 function catalogModelIds() {
@@ -352,6 +357,18 @@ function modelDisplay(id, model = null) {
   const known = MODEL_DISPLAY[id] || {};
   if (PAUSED_MODEL_IDS.has(id)) {
     return { id, name: modelName(id), tierKey: 'paused', tier: '停用' };
+  }
+  // A model's access tag is authoritative. `pool` is quota accounting metadata
+  // and may describe the shared premium pool even when a per-model cap makes
+  // this model a limited offer.
+  const declaredTier = String(known.tier || model?.tier || '').trim();
+  if (declaredTier && (known.label || MODEL_TIER_LABELS[declaredTier])) {
+    return {
+      id,
+      name: modelName(id),
+      tierKey: declaredTier,
+      tier: known.label || MODEL_TIER_LABELS[declaredTier],
+    };
   }
   const rawPool = String(model?.pool || '').trim().slice(0, 64);
   const name = modelName(id);

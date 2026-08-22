@@ -432,12 +432,12 @@ const FREE_AVAILABLE_MODELS = new Set([
 const MODEL_TIERS = [
   ["free", FREE_AVAILABLE_MODELS],
   ["us_sg", new Set([
-    "deepseek/deepseek-v4-pro",
-    "openai/gpt-5.6-luna",
     "crof/kimi-k3-eco",
     "meta/muse-spark-1.2-contributor",
   ])],
   ["limited", new Set([
+    "deepseek/deepseek-v4-pro",
+    "openai/gpt-5.6-luna",
     "z-ai/glm-5.2",
     "anthropic/claude-fable-5",
   ])],
@@ -463,11 +463,16 @@ const PAUSED_QUOTA_MODELS = new Set([
 ]);
 // Freebuff 自家 Web/Cloud runner 专用模型。普通 token、CLI、Desktop 和第三方
 // 代理没有服务账号权限，动态源即使返回也必须 fail closed。
-const HIDDEN_MODEL_IDS = new Set(["stealth/ox-alpha"]);
+const HIDDEN_MODEL_IDS = new Set([
+  "stealth/ox-alpha",
+  // Official Web God-only Novita/Codex test route; it is not the public Luna model.
+  "openai/gpt-5.6-luna-es",
+]);
 function isHiddenModelId(modelId) {
   const value = String(modelId || "").trim().toLowerCase();
   return HIDDEN_MODEL_IDS.has(value) || value === "ox-alpha"
-    || value === "anthropic/ox-alpha" || value.endsWith("/ox-alpha");
+    || value === "anthropic/ox-alpha" || value.endsWith("/ox-alpha")
+    || value.startsWith("openai/gpt-5.6-luna-es");
 }
 const PREMIUM_QUOTA_MODELS = new Set([
   "deepseek/deepseek-v4-flash",

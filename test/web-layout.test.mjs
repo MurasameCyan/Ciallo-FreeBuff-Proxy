@@ -178,8 +178,8 @@ assert.match(css, /\.account-priority-toggle\s*\{[^}]*white-space:\s*nowrap/s,
   '账号优先级按钮必须保持紧凑单行');
 assert.match(css, /\.account-egress-refresh\s*\{[^}]*white-space:\s*nowrap/s,
   '刷新出站按钮必须保持紧凑单行');
-assert.ok(app.includes("const HIDDEN_MODEL_IDS = new Set(['stealth/ox-alpha'])"),
-  '面板必须过滤 service-only ox-alpha，避免旧缓存或 Key 白名单重新显示');
+assert.match(app, /const HIDDEN_MODEL_IDS = new Set\(\[[\s\S]*?'stealth\/ox-alpha'[\s\S]*?'openai\/gpt-5\.6-luna-es'[\s\S]*?\]\)/,
+  '面板必须过滤 service-only ox-alpha 与 Web-only luna-es，避免旧缓存或 Key 白名单重新显示');
 assert.match(app, /function isHiddenModelId\(modelId\)[\s\S]*?value === 'ox-alpha'[\s\S]*?value\.endsWith\('\/ox-alpha'\)/,
   '面板必须统一过滤完整 ID、供应商变体和短名 ox-alpha');
 assert.match(app, /for \(const id of chosen\) if \(!ids\.includes\(id\) && !isHiddenModelId\(id\)\) ids\.push\(id\)/,
@@ -386,9 +386,9 @@ assert.ok(!/luna|kimi-k3/i.test(availabilityNote),
 assert.match(app, /MODEL_TIER_LABELS = \{ free: '免费', us_sg: '高级', limited: '限定' \}/,
   '模型列表的通用分组 tag 文案必须是 免费 / 高级 / 限定');
 for (const [id, label] of [
-  ['openai/gpt-5.6-luna', 'Luna'],
-  ['deepseek/deepseek-v4-pro', 'DS4P'],
-  ['deepseek/deepseek-v4-flash', '高级'],
+  ['openai/gpt-5.6-luna', '限定'],
+  ['deepseek/deepseek-v4-pro', '限定'],
+  ['deepseek/deepseek-v4-flash', '免费'],
   ['minimax/minimax-m3', '停用'],
   ['crof/kimi-k3-eco', '高级'],
   ['meta/muse-spark-1.2-contributor', '高级'],
@@ -477,8 +477,8 @@ assert.match(
     ['deepseek/deepseek-v4-pro'],
     [{ id: 'deepseek/deepseek-v4-pro' }],
   ),
-  /tier-premium">高级<\/span>/,
-  '账号行缺少 pool 时模型列表也必须回退到模型目录 pool',
+  /tier-limited">限定<\/span>/,
+  '账号行缺少 pool 时模型列表也必须保留 DS4P 限定标签',
 );
 helperVm.__modelState.models = [];
 assert.deepEqual(
@@ -488,18 +488,28 @@ assert.deepEqual(
 );
 assert.deepEqual(
   JSON.parse(JSON.stringify(helperVm.__modelUi.modelDisplay('deepseek/deepseek-v4-flash'))),
-  { id: 'deepseek/deepseek-v4-flash', name: 'deepseek-v4-flash', tierKey: 'us_sg', tier: '高级' },
-  'DS4F 必须去掉 provider 前缀，只保留模型名 + 高级标签',
+  { id: 'deepseek/deepseek-v4-flash', name: 'deepseek-v4-flash', tierKey: 'free', tier: '免费' },
+  'DS4F 必须去掉 provider 前缀，只保留模型名 + 免费标签',
 );
 assert.deepEqual(
   JSON.parse(JSON.stringify(helperVm.__modelUi.modelDisplay('deepseek/deepseek-v4-pro', { pool: 'premium' }))),
-  { id: 'deepseek/deepseek-v4-pro', name: 'deepseek-v4-pro', tierKey: 'premium', tier: '高级' },
-  '实时 pool=premium 时 DS4P 必须动态显示高级，而不是静态 DS4P',
+  { id: 'deepseek/deepseek-v4-pro', name: 'deepseek-v4-pro', tierKey: 'limited', tier: '限定' },
+  '动态 pool=premium 不能覆盖 DS4P 的独立限定标签',
 );
 assert.deepEqual(
   JSON.parse(JSON.stringify(helperVm.__modelUi.modelDisplay('deepseek/deepseek-v4-pro', { pool: 'deepseek_pro' }))),
-  { id: 'deepseek/deepseek-v4-pro', name: 'deepseek-v4-pro', tierKey: 'deepseek_pro', tier: 'DS4P' },
-  '实时 pool=deepseek_pro 时 DS4P 才显示 DS4P 标签',
+  { id: 'deepseek/deepseek-v4-pro', name: 'deepseek-v4-pro', tierKey: 'limited', tier: '限定' },
+  '实时 pool=deepseek_pro 时 DS4P 显示限定标签',
+);
+assert.deepEqual(
+  JSON.parse(JSON.stringify(helperVm.__modelUi.modelDisplay('anthropic/claude-fable-5', { pool: 'standard' }))),
+  { id: 'anthropic/claude-fable-5', name: 'claude-fable-5', tierKey: 'limited', tier: '限定' },
+  'Fable 的 standard 兼容池不能覆盖限定标签',
+);
+assert.deepEqual(
+  JSON.parse(JSON.stringify(helperVm.__modelUi.modelDisplay('openai/gpt-5.6-luna', { pool: 'premium' }))),
+  { id: 'openai/gpt-5.6-luna', name: 'gpt-5.6-luna', tierKey: 'limited', tier: '限定' },
+  '动态 premium 不能覆盖 Luna 的独立限定标签',
 );
 assert.deepEqual(
   JSON.parse(JSON.stringify(helperVm.__modelUi.modelDisplay('vendor/new-model', { pool: 'preview_pool' }))),
@@ -508,8 +518,8 @@ assert.deepEqual(
 );
 assert.deepEqual(
   JSON.parse(JSON.stringify(helperVm.__modelUi.modelDisplay('deepseek/deepseek-v4-pro', { pool: 'preview_pool' }))),
-  { id: 'deepseek/deepseek-v4-pro', name: 'deepseek-v4-pro', tierKey: 'pool-other', tier: 'preview_pool' },
-  '已知模型遇到未知显式 pool 时也必须服从实时 pool，不能回退到静态 DS4P 标签',
+  { id: 'deepseek/deepseek-v4-pro', name: 'deepseek-v4-pro', tierKey: 'limited', tier: '限定' },
+  '未知 pool 仍不得覆盖已知模型的限定标签',
 );
 assert.match(app, /function modelsCellHtml[\s\S]*?modelListHtml\(\[q\.model\], \[q\]\)/s,
   '账号可用模型必须把实时额度行传给统一 Tag 解析器');
@@ -518,18 +528,20 @@ assert.match(
     ['deepseek/deepseek-v4-pro'],
     [{ id: 'deepseek/deepseek-v4-pro', pool: 'premium' }],
   ),
-  /tier-premium">高级<\/span>/,
-  '账号额度行传入 pool 后必须覆盖 DS4P 静态标签',
+  /tier-limited">限定<\/span>/,
+  '账号额度行传入 pool 后仍必须保留 DS4P 限定标签',
 );
+assert.ok(!helperVm.__modelUi.modelListHtml(['openai/gpt-5.6-luna-es']),
+  'Luna-ES 必须从面板模型标签和可用模型列表隐藏');
 assert.equal(
   helperVm.__modelUi.modelListHtml(['openai/gpt-5.6-luna']),
   '<span class="model-label" title="openai/gpt-5.6-luna">gpt-5.6-luna'
-  + ' <span class="pill tier tier-us_sg">Luna</span></span>',
-  '模型名只显示去 provider 的官方名，完整 id 留在 title，Luna 只作为 tag',
+  + ' <span class="pill tier tier-limited">限定</span></span>',
+  'Luna 必须显示模型名 + 限定 tag',
 );
 assert.match(helperVm.__modelUi.modelListHtml(['deepseek/deepseek-v4-pro']),
-  /">deepseek-v4-pro <span class="pill tier tier-us_sg">DS4P<\/span>/,
-  'DS4P 必须显示去 provider 的模型名 + DS4P tag');
+  /">deepseek-v4-pro <span class="pill tier tier-limited">限定<\/span>/,
+  'DS4P 必须显示去 provider 的模型名 + 限定 tag');
 assert.match(helperVm.__modelUi.modelListHtml(['mimo/mimo-v2.5']),
   /">mimo-v2\.5 <span class="pill tier tier-free">免费<\/span>/,
   'MiMo 的免费标签必须使用 free 配色');
