@@ -635,13 +635,38 @@ await tAsync('模型目录携带官方动态 pool 元数据', async () => {
   ]);
   const body = await (await handleModels()).json();
   const pro = body.data.find((model) => model.id === 'deepseek/deepseek-v4-pro');
-  if (!pro || pro.pool !== 'premium' || pro.tier !== 'limited') {
-    throw new Error('DS4P 独立额度覆盖错误: ' + JSON.stringify(pro));
+  if (!pro || pro.pool !== 'premium' || pro.tier !== 'us_sg') {
+    throw new Error('DS4P 共享 Premium 分组错误: ' + JSON.stringify(pro));
   }
-  for (const id of ['openai/gpt-5.6-luna', 'anthropic/claude-fable-5']) {
+  const luna = body.data.find((entry) => entry.id === 'openai/gpt-5.6-luna');
+  if (!luna || luna.pool !== 'premium' || luna.tier !== 'us_sg') {
+    throw new Error('Luna 共享 Premium 分组错误: ' + JSON.stringify(luna));
+  }
+  const fable = body.data.find((entry) => entry.id === 'anthropic/claude-fable-5');
+  if (!fable || fable.pool !== 'standard' || fable.tier !== 'limited') {
+    throw new Error('Fable 限定 tier 错误: ' + JSON.stringify(fable));
+  }
+  setTestDynamicModels(null);
+});
+
+await tAsync('DS4P/Luna 独立额度池进入限定分组', async () => {
+  setTestDynamicModels([
+    {
+      id: 'deepseek/deepseek-v4-pro', session: 'deepseek/deepseek-v4-pro',
+      agent: 'base2-free-deepseek', root_agent: 'base2-free-deepseek',
+      pool: 'deepseek_pro',
+    },
+    {
+      id: 'openai/gpt-5.6-luna', session: 'openai/gpt-5.6-luna',
+      agent: 'base2-free-luna', root_agent: 'base2-free-luna',
+      pool: 'luna',
+    },
+  ]);
+  const body = await (await handleModels()).json();
+  for (const id of ['deepseek/deepseek-v4-pro', 'openai/gpt-5.6-luna']) {
     const model = body.data.find((entry) => entry.id === id);
     if (!model || model.tier !== 'limited') {
-      throw new Error(`${id} 限定 tier 错误: ` + JSON.stringify(model));
+      throw new Error(`${id} 独立额度 tier 错误: ` + JSON.stringify(model));
     }
   }
   setTestDynamicModels(null);

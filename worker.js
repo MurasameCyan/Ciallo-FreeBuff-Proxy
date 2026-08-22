@@ -443,6 +443,20 @@ const MODEL_TIERS = [
   ])],
 ];
 
+// DS4P/Luna 的目录分组跟随实际额度池：共享 Premium 归入 US/SG，
+// 只有独立池时才留在限定组；面板再把独立池分别标成 DS4P/Luna。
+const POOL_DRIVEN_TIER_MODELS = new Set([
+  "deepseek/deepseek-v4-pro",
+  "openai/gpt-5.6-luna",
+]);
+function modelCatalogTier(modelId, pool) {
+  const id = String(modelId || "");
+  const normalizedPool = String(pool || "").trim().toLowerCase();
+  if (POOL_DRIVEN_TIER_MODELS.has(id) && normalizedPool === "premium") return "us_sg";
+  const rank = MODEL_TIERS.findIndex(([, ids]) => ids.has(id));
+  return rank >= 0 ? MODEL_TIERS[rank][0] : null;
+}
+
 // ---------------------------------------------------------------------------
 // 额度池说明（上游 rateLimitsByModel）：
 //   同一模型的 pool 会随上游 entitlement/rollout 变化；账号实时快照优先。
@@ -4798,16 +4812,17 @@ async function handleModels(client = null) {
       // 实测（2026-08-15）：免费账号只有 Flash / MiMo 2.5 两个模型能建会话
       // （上游 409 session_model_mismatch / 403 free_mode_invalid_agent_model 拒绝其余模型）。
       // 分组键与排序都取自 MODEL_TIERS：免费 → US/SG → 限定 → 未分组。
-      const rank = MODEL_TIERS.findIndex(([, ids]) => ids.has(m.id));
       const declaredPool = safePoolName(m.pool);
       const pool = declaredPool || modelPoolCategory(m.id) || "";
+      const tier = modelCatalogTier(m.id, pool);
+      const rank = tier ? MODEL_TIERS.findIndex(([key]) => key === tier) : -1;
       return {
         id: m.id,
         object: "model",
         created: Math.floor(Date.now() / 1000),
         owned_by: "freebuff",
         ...(pool ? { pool } : {}),
-        ...(rank >= 0 ? { tier: MODEL_TIERS[rank][0] } : {}),
+        ...(tier ? { tier } : {}),
         _sort: rank < 0 ? MODEL_TIERS.length : rank,
       };
     })

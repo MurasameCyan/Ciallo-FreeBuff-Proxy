@@ -293,12 +293,12 @@ function stateDot(s, detail = '') {
 }
 
 // 面板只显示模型名（去掉 provider/ 前缀）；完整 id 留在 title 和 API/白名单值里。
-// tag 表达访问/供给层：免费 / 高级 / 限定 / 停用。
-// D4P、Luna、Fable 的独立限次/限量 offer 是强制“限定”；pool 只用于额度摘要，
-// 不能把它们随动态 premium/standard 元数据改成“高级”或“免费”。
+// tag 表达访问/供给层：免费 / 高级 / DS4P / Luna / 限定 / 停用。
+// DS4P/Luna 由实时额度池决定：独立池显示模型专属 tag，共享 premium 显示高级。
+// Fable 虽沿用 standard 兼容池，访问层仍是限定，不能被错标为免费。
 const MODEL_DISPLAY = {
-  'openai/gpt-5.6-luna': { label: '限定', tier: 'limited' },
-  'deepseek/deepseek-v4-pro': { label: '限定', tier: 'limited' },
+  'openai/gpt-5.6-luna': { label: 'Luna', tier: 'luna' },
+  'deepseek/deepseek-v4-pro': { label: 'DS4P', tier: 'deepseek_pro' },
   'deepseek/deepseek-v4-flash': { label: '免费', tier: 'free' },
   'minimax/minimax-m3': { label: '停用', tier: 'paused' },
   'crof/kimi-k3-eco': { label: '高级', tier: 'us_sg' },
@@ -345,6 +345,10 @@ const KNOWN_POOL_TAGS = {
   glm: { label: '限定', tierKey: 'glm' },
   standard: { label: '免费', tierKey: 'free' },
 };
+const POOL_TAG_MODEL_IDS = new Set([
+  'deepseek/deepseek-v4-pro',
+  'openai/gpt-5.6-luna',
+]);
 
 // 未收录的动态模型退回 /v1/models 的 tier 分组文案。
 // name 只保留 provider/ 后面的模型名，完整 id 仍放在 title 并继续作为 API/白名单值。
@@ -358,9 +362,22 @@ function modelDisplay(id, model = null) {
   if (PAUSED_MODEL_IDS.has(id)) {
     return { id, name: modelName(id), tierKey: 'paused', tier: '停用' };
   }
-  // A model's access tag is authoritative. `pool` is quota accounting metadata
-  // and may describe the shared premium pool even when a per-model cap makes
-  // this model a limited offer.
+  const declaredPool = String(model?.pool || '').trim().slice(0, 64);
+  // 账号额度行（带 model 字段）的 pool 最具体，必须优先；模型目录行则允许
+  // 已加载的账号快照覆盖官方目录的通用 pool。
+  const rawPool = model?.model ? declaredPool : observedQuotaPool(id) || declaredPool;
+  const name = modelName(id);
+  // 只有 DS4P/Luna 的 tag 跟随额度池。其他已知模型仍以访问层配置为准，
+  // 例如 Fable 的兼容 pool=standard 不能把“限定”覆盖成“免费”。
+  if (POOL_TAG_MODEL_IDS.has(id) && rawPool) {
+    const poolTag = KNOWN_POOL_TAGS[rawPool.toLowerCase()];
+    return {
+      id,
+      name,
+      tierKey: poolTag?.tierKey || 'pool-other',
+      tier: poolTag?.label || rawPool,
+    };
+  }
   const declaredTier = String(known.tier || model?.tier || '').trim();
   if (declaredTier && (known.label || MODEL_TIER_LABELS[declaredTier])) {
     return {
@@ -370,8 +387,6 @@ function modelDisplay(id, model = null) {
       tier: known.label || MODEL_TIER_LABELS[declaredTier],
     };
   }
-  const rawPool = String(model?.pool || '').trim().slice(0, 64);
-  const name = modelName(id);
   if (rawPool) {
     const poolTag = KNOWN_POOL_TAGS[rawPool.toLowerCase()];
     return {
@@ -385,13 +400,36 @@ function modelDisplay(id, model = null) {
   return { id, name, tierKey, tier: known.label || MODEL_TIER_LABELS[tierKey] || '' };
 }
 
+// 模型目录没有账号上下文；从已加载的账号额度快照汇总 DS4P/Luna 的真实池。
+// 任一账号有独立池就显示专属 tag，否则共享 Premium 显示高级。
+function observedQuotaPool(modelId) {
+  const id = String(modelId || '');
+  if (!POOL_TAG_MODEL_IDS.has(id)) return '';
+  const pools = new Set();
+  for (const probe of Object.values(S.health || {})) {
+    for (const row of Array.isArray(probe?.quota) ? probe.quota : []) {
+      if (row?.model !== id) continue;
+      const pool = String(row.pool || '').trim().toLowerCase();
+      if (pool) pools.add(pool);
+    }
+  }
+  const dedicated = id === 'deepseek/deepseek-v4-pro' ? 'deepseek_pro' : 'luna';
+  if (pools.has(dedicated)) return dedicated;
+  if (pools.has('premium')) return 'premium';
+  return '';
+}
+
 function modelListHtml(modelIds = [], models = null) {
   const byId = new Map((Array.isArray(S.models) ? S.models : [])
     .filter((model) => model?.id)
-    .map((model) => [model.id, model]));
+    .map((model) => {
+      const observedPool = observedQuotaPool(model.id);
+      return [model.id, observedPool ? { ...model, pool: observedPool } : model];
+    }));
   for (const model of Array.isArray(models) ? models : []) {
-    if (!model?.id) continue;
-    byId.set(model.id, { ...byId.get(model.id), ...model });
+    const id = String(model?.id || model?.model || '').trim();
+    if (!id) continue;
+    byId.set(id, { ...byId.get(id), ...model, id });
   }
   return [...new Set((Array.isArray(modelIds) ? modelIds : []).filter((id) => {
     return id && !isHiddenModelId(id);
