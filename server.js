@@ -41,6 +41,12 @@ import { closeHttpServer } from './server/graceful-shutdown.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
+// 时区默认上海：镜像里 ENV TZ 也写了这一行的值，但已在跑的容器改不了 env
+// （要 docker run 重建），而给用户看的时间（会话解锁时间点等）不能是 UTC。
+// Node 22 支持运行时改 TZ（会重置内部缓存），且 node:alpine 不装 tzdata 也能解析
+// 命名时区（ICU 自带 tz 数据）。显式传 TZ 的部署照旧生效。
+process.env.TZ = process.env.TZ || 'Asia/Shanghai';
+
 // 持久化数据目录：账号池、API Key、模型映射、mihomo 缓存都放这里。
 // Docker 里是挂载的 /data 卷（容器内以 node 用户运行，/app 只读写不进）；
 // 本地开发默认 ./data。FREEBUFF_DATA_DIR 显式设置优先。

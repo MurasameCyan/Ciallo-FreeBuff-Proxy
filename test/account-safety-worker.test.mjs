@@ -10,7 +10,7 @@ import { createAccountStateStore } from '../server/account-state.mjs';
 const workerSource = readFileSync(new URL('../worker.js', import.meta.url), 'utf8');
 const workerWrapper = workerSource.replace('export default {', 'const __workerDefault__ = {')
   + '\n\nglobalThis.__workerDefault__ = __workerDefault__;\n'
-  + 'globalThis.__accountSafetyTestApi__ = { pickToken, pickTokenWithSessionWait, waitForAnyTokenRelease, sessionLeaseWaitMs, releaseToken, invalidateSessionCache, recordAccountObservation, cooldown, parseCooldown, accountPoolExhaustion, classifyRateLimit, quotaScopeForModel, quotaEntryForModel, modelPoolCategory, freshQuotaProbe, startRun, executeChat, executeCodeReview, createSession, clientStatsSnapshot, recordRequest, usageSnapshot, restoreUsageSnapshot, restoreKeyUsageSnapshot, authenticatedUpstreamFetch };\n';
+  + 'globalThis.__accountSafetyTestApi__ = { pickToken, pickTokenWithSessionWait, waitForAnyTokenRelease, sessionLeaseWaitMs, releaseToken, invalidateSessionCache, recordAccountObservation, cooldown, cooldownInfo, scopedCooldownInfo, parseCooldown, accountPoolExhaustion, classifyRateLimit, quotaScopeForModel, quotaEntryForModel, modelPoolCategory, freshQuotaProbe, findModelConfig, isHiddenModelId, startRun, executeChat, executeCodeReview, createSession, clientStatsSnapshot, recordRequest, usageSnapshot, restoreUsageSnapshot, restoreKeyUsageSnapshot, authenticatedUpstreamFetch };\n';
 
 const TOKEN = 'permanent-banned-account-token-123456';
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -401,7 +401,7 @@ test('quota 冷却按 D4P、Luna 独立池和当前 Premium 共池传播', () =>
     retryAfterMs: 60 * 1000,
     model: 'deepseek/deepseek-v4-flash',
   });
-  for (const model of ['crof/kimi-k3-eco', 'meta/muse-spark-1.2-contributor']) {
+  for (const model of ['meta/muse-spark-1.2-contributor']) {
     assert.equal(workerVm.api.pickToken(env, model, new Set()), null,
       `DS4F 与 ${model} 必须共享 Premium quota 冷却`);
   }
@@ -443,8 +443,12 @@ test('typed 429 按上游状态选择正确作用域', () => {
   assert.equal(workerVm.api.quotaScopeForModel('z-ai/glm-5.2'), 'pool:glm', 'GLM 静态兜底必须保持独立池');
   assert.equal(workerVm.api.quotaScopeForModel('deepseek/deepseek-v4-flash'), 'pool:premium',
     'DS4F 当前属于共享 Premium 池');
-  assert.equal(workerVm.api.quotaScopeForModel('crof/kimi-k3-eco'), 'pool:premium');
   assert.equal(workerVm.api.quotaScopeForModel('meta/muse-spark-1.2-contributor'), 'pool:premium');
+  // god-only（官方 FREEBUFF_WEB_GOD_ONLY_MODELS）已被 HIDDEN_MODEL_IDS 挡住，
+  // 不再归入任何共享池：普通 token 一定调不通它，让它写 pool:premium 冷却
+  // 只会因为一个永远失败的模型把整池真实 Premium 模型一起停掉。
+  assert.equal(workerVm.api.quotaScopeForModel('crof/kimi-k3-eco'), 'model:crof/kimi-k3-eco',
+    'god-only K3 Eco 必须按模型隔离，不得污染 Premium 池冷却');
   assert.equal(workerVm.api.quotaScopeForModel('minimax/minimax-m3'), 'model:minimax/minimax-m3',
     'M3 已暂停，静态兜底不得继续声称它占当前 Premium 池');
   assert.equal(workerVm.api.quotaScopeForModel('mimo/mimo-v2.5'), 'model:mimo/mimo-v2.5');
@@ -469,7 +473,7 @@ test('额度快照按上游 pool 选择，不再取任意 Premium 模型行', as
   );
   await assert.doesNotReject(workerVm.api.freshQuotaProbe(token, 'openai/gpt-5.6-luna'));
   await assert.rejects(
-    workerVm.api.freshQuotaProbe(token, 'crof/kimi-k3-eco'),
+    workerVm.api.freshQuotaProbe(token, 'meta/muse-spark-1.2-contributor'),
     (error) => error?.name === 'QuotaExhaustedError' && error.scope === 'pool:premium',
   );
   await assert.doesNotReject(workerVm.api.freshQuotaProbe(token, 'mimo/mimo-v2.5'));
@@ -485,6 +489,8 @@ test('账号实时 pool 覆盖 DS4P 旧静态归属并共享 Premium', async () 
   };
   workerVm.api.recordAccountObservation(token, 200, { status: 'ok' }, { quota });
 
+  // god-only 模型即使被上游标成 premium，也不参与我们的池判定（见 HIDDEN_MODEL_IDS）。
+  assert.equal(workerVm.api.modelPoolCategory('crof/kimi-k3-eco', quota), null);
   assert.equal(workerVm.api.modelPoolCategory('deepseek/deepseek-v4-pro', quota), 'premium');
   assert.equal(workerVm.api.quotaScopeForModel('deepseek/deepseek-v4-pro', quota), 'pool:premium');
   assert.deepEqual(workerVm.api.quotaEntryForModel(quota, 'deepseek/deepseek-v4-pro'), {
@@ -530,19 +536,102 @@ test('Premium 快照异常不一致时各模型使用同一保守池结论并忽
   const token = 'premium-inconsistent-snapshot-account-123456';
   workerVm.api.recordAccountObservation(token, 200, { status: 'ok' }, {
     quota: {
+      // 2026-08-23 线上形状：V4 Pro 与 Flash 同在 premium 池（deepseek_pro 已被删）。
       'deepseek/deepseek-v4-flash': { recentCount: 2, limit: 7, pool: 'premium' },
-      'crof/kimi-k3-eco': { recentCount: 5, limit: 5, pool: 'premium' },
+      'deepseek/deepseek-v4-pro': { recentCount: 5, limit: 5, pool: 'premium' },
       'minimax/minimax-m3': { recentCount: 0, limit: 99, pool: 'premium' },
     },
   });
 
-  for (const model of ['deepseek/deepseek-v4-flash', 'crof/kimi-k3-eco', 'meta/muse-spark-1.2-contributor']) {
+  for (const model of [
+    'deepseek/deepseek-v4-flash',
+    'deepseek/deepseek-v4-pro',
+    'meta/muse-spark-1.2-contributor',
+  ]) {
     await assert.rejects(
       workerVm.api.freshQuotaProbe(token, model),
       (error) => error?.name === 'QuotaExhaustedError' && error.scope === 'pool:premium',
       `${model} 必须使用同一保守 Premium 池结论`,
     );
   }
+});
+
+// 反向锁：暂停 / god-only 的行不参与聚合，所以它们的计数不能把真实 Premium 池
+// 判成耗尽。这两行如果漏进 pooled 聚合，recentCount 会取到 99 而误报耗尽。
+test('暂停与 god-only 额度行不得把真实 Premium 池算成耗尽', async () => {
+  const workerVm = createWorkerVm();
+  const token = 'premium-ghost-rows-account-1234567890';
+  const quota = {
+    'deepseek/deepseek-v4-flash': { recentCount: 1, limit: 4, pool: 'premium' },
+    'deepseek/deepseek-v4-pro': { recentCount: 3, limit: 6, pool: 'premium' },
+    'minimax/minimax-m3': { recentCount: 99, limit: 6, pool: 'premium' },
+    'crof/kimi-k3-eco': { recentCount: 99, limit: 6, pool: 'premium' },
+  };
+  workerVm.api.recordAccountObservation(token, 200, { status: 'ok' }, { quota });
+
+  // 聚合结果是 vm 内新建的对象（原型属于 vm），比较前先做一次 JSON 归一。
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(workerVm.api.quotaEntryForModel(quota, 'deepseek/deepseek-v4-pro'))),
+    { recentCount: 3, limit: 4, pool: 'premium' },
+  );
+  await assert.doesNotReject(workerVm.api.freshQuotaProbe(token, 'deepseek/deepseek-v4-flash'));
+  await assert.doesNotReject(workerVm.api.freshQuotaProbe(token, 'deepseek/deepseek-v4-pro'));
+  // 目录侧同样 fail closed：god-only 模型解析不出配置，请求在扣 admission 前就被拒。
+  assert.equal(workerVm.api.isHiddenModelId('crof/kimi-k3-eco'), true);
+  assert.equal(workerVm.api.isHiddenModelId('crof/kimi-k3-eco-0820'), true,
+    '带日期后缀的变体同样要挡住');
+  assert.equal(workerVm.api.findModelConfig('crof/kimi-k3-eco'), null);
+  assert.equal(workerVm.api.quotaEntryForModel(quota, 'crof/kimi-k3-eco'), null);
+});
+
+// 429 额度冷却的写入与读取必须用同一个池口径。写入侧（cooldownScopeFor）以前不带
+// 账号实时额度快照，只能看静态兜底表；读取侧（scopedCooldownInfo）却带快照。DS4P 正好
+// 踩中：静态表说 deepseek_pro，2026-08-23 起线上说 premium —— 于是冷却写进
+// `pool:deepseek_pro`、查的是 `pool:premium`，一次真实的额度耗尽等于没冷却。
+test('429 额度冷却的写入池与读取池一致（DS4P 实时归属 premium）', () => {
+  const workerVm = createWorkerVm();
+  const token = 'quota-scope-symmetry-account-1234567890';
+  const DS4P = 'deepseek/deepseek-v4-pro';
+  const DS4F = 'deepseek/deepseek-v4-flash';
+  workerVm.api.recordAccountObservation(token, 200, { status: 'ok' }, {
+    quota: {
+      [DS4P]: { recentCount: 5, limit: 5, pool: 'premium' },
+      [DS4F]: { recentCount: 5, limit: 5, pool: 'premium' },
+    },
+  });
+  assert.equal(workerVm.api.quotaScopeForModel(DS4P, { [DS4P]: { pool: 'premium' } }), 'pool:premium');
+
+  workerVm.api.cooldown(token, 60 * 1000, { reason: 'quota', retryAfterMs: 60 * 1000, model: DS4P });
+
+  const lock = workerVm.api.scopedCooldownInfo(token, DS4P);
+  assert.ok(lock, 'DS4P 的额度冷却必须能被 DS4P 自己读到');
+  assert.equal(lock.reason, 'quota');
+  assert.equal(lock.scope, 'pool:premium', '写入侧要跟读取侧一样使用实时 pool');
+  assert.ok(workerVm.api.scopedCooldownInfo(token, DS4F),
+    '同一 premium 池的 DS4F 也应看到这次池级冷却');
+  assert.equal(workerVm.api.scopedCooldownInfo(token, 'openai/gpt-5.6-luna'), null,
+    'luna 是独立池，不该被 premium 冷却牵连');
+  assert.equal(workerVm.api.cooldownInfo(token), null, '不得升级成账号级冷却');
+});
+
+// 反向：没有实时快照时写下的静态池冷却（DS4P → deepseek_pro），在快照到达、
+// 归属变成 premium 之后仍然必须被读到，否则冷却会在切换瞬间凭空消失。
+test('实时 pool 归属变化后，先前写下的池级冷却仍然有效', () => {
+  const workerVm = createWorkerVm();
+  const token = 'quota-scope-migration-account-1234567890';
+  const DS4P = 'deepseek/deepseek-v4-pro';
+
+  workerVm.api.cooldown(token, 60 * 1000, { reason: 'quota', retryAfterMs: 60 * 1000, model: DS4P });
+  const before = workerVm.api.scopedCooldownInfo(token, DS4P);
+  assert.ok(before, '无快照时按静态兜底池写入，也要能读到');
+  assert.equal(before.scope, 'pool:deepseek_pro');
+
+  workerVm.api.recordAccountObservation(token, 200, { status: 'ok' }, {
+    quota: { [DS4P]: { recentCount: 5, limit: 5, pool: 'premium' } },
+  });
+  const after = workerVm.api.scopedCooldownInfo(token, DS4P);
+  assert.ok(after, '池归属变化不得让还没到期的冷却失效');
+  assert.equal(after.scope, 'pool:deepseek_pro');
 });
 
 test('generic 429 按 Retry-After 锁定当前模型并在到期时恢复', () => {

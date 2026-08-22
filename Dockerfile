@@ -60,7 +60,8 @@ RUN chmod +x /app/scripts/docker-entrypoint.sh
 RUN mkdir -p /data && chown -R node:node /data
 
 ENV NODE_ENV=production \
-    PORT=8787
+    PORT=8787 \
+    TZ=Asia/Shanghai
 
 # 数据目录固定指到挂载卷（账号池/API Key/模型映射/内核缓存都落这里，
 # /app 对 node 用户是只读的）

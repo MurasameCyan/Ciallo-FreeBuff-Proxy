@@ -314,13 +314,16 @@ const PAUSED_MODEL_IDS = new Set(['minimax/minimax-m3']);
 const HIDDEN_MODEL_IDS = new Set([
   'stealth/ox-alpha',
   'openai/gpt-5.6-luna-es',
+  // 官方 FREEBUFF_WEB_GOD_ONLY_MODELS（0766319c）：god 账号专属，且不在 CLI 目录里。
+  'crof/kimi-k3-eco',
 ]);
 
 function isHiddenModelId(modelId) {
   const value = String(modelId || '').trim().toLowerCase();
   return HIDDEN_MODEL_IDS.has(value) || value === 'ox-alpha'
     || value === 'anthropic/ox-alpha' || value.endsWith('/ox-alpha')
-    || value.startsWith('openai/gpt-5.6-luna-es');
+    || value.startsWith('openai/gpt-5.6-luna-es')
+    || value.startsWith('crof/kimi-k3-eco');
 }
 
 function catalogModelIds() {

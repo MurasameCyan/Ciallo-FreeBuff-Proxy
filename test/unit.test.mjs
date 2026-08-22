@@ -704,7 +704,6 @@ await tAsync('模型按 免费 → US/SG → 限定 分组打 tier', async () =>
     'deepseek/deepseek-v4-flash': 'free',
     'deepseek/deepseek-v4-pro': 'limited',
     'openai/gpt-5.6-luna': 'limited',
-    'crof/kimi-k3-eco': 'us_sg',
     'meta/muse-spark-1.2-contributor': 'us_sg',
     'z-ai/glm-5.2': 'limited',
     'anthropic/claude-fable-5': 'limited',
@@ -756,6 +755,41 @@ await tAsync('服务专用 ox-alpha 不出现在目录且不能经直接 ID、�
   setTestAliases('old-ox=stealth/ox-alpha');
   if (await resolveModelConfig('old-ox') !== null) {
     throw new Error('别名不得绕过 ox-alpha 闸门');
+  }
+  setTestAliases('');
+  setTestDynamicModels(null);
+});
+
+// 官方 FREEBUFF_WEB_GOD_ONLY_MODELS（0766319c）= K3 Eco + luna-es：god 账号专属的
+// Web/Cloud 路由，且都不在 CLI 目录 FREEBUFF_MODELS 里。普通 token 一定调不通，
+// 所以按 fail closed 处理 —— 留在目录里只会让客户端反复选中它、白扣 admission。
+await tAsync('god-only K3 Eco / luna-es 不出现在目录且不能经直接 ID、短名或别名调用', async () => {
+  setTestDynamicModels([
+    {
+      id: 'crof/kimi-k3-eco', session: 'crof/kimi-k3-eco', agent: 'base2-free-kimi',
+      root_agent: 'base2-free-kimi', upstream: 'crof/kimi-k3-eco', pool: 'premium',
+    },
+    {
+      id: 'openai/gpt-5.6-luna-es', session: 'openai/gpt-5.6-luna-es', agent: 'base2-free-luna',
+      root_agent: 'base2-free-luna', upstream: 'openai/gpt-5.6-luna-es',
+    },
+  ]);
+  const body = await (await handleModels()).json();
+  for (const id of ['crof/kimi-k3-eco', 'openai/gpt-5.6-luna-es']) {
+    if (body.data.some((model) => model.id === id)) {
+      throw new Error(`god-only ${id} 不得出现在 /v1/models`);
+    }
+    if (await resolveModelConfig(id) !== null) {
+      throw new Error(`${id} 直接 ID 必须在请求解析入口被拒绝`);
+    }
+  }
+  // 短名走 Anthropic 入口时仍会命中动态表，必须在 resolveModelConfig 兜住。
+  if (await resolveModelConfig(anthropicModelToOpenAI('kimi-k3-eco')) !== null) {
+    throw new Error('Anthropic 短名不得绕过 K3 Eco 闸门');
+  }
+  setTestAliases('old-kimi=crof/kimi-k3-eco');
+  if (await resolveModelConfig('old-kimi') !== null) {
+    throw new Error('别名不得绕过 K3 Eco 闸门');
   }
   setTestAliases('');
   setTestDynamicModels(null);

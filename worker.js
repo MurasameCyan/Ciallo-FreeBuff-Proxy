@@ -432,7 +432,6 @@ const FREE_AVAILABLE_MODELS = new Set([
 const MODEL_TIERS = [
   ["free", FREE_AVAILABLE_MODELS],
   ["us_sg", new Set([
-    "crof/kimi-k3-eco",
     "meta/muse-spark-1.2-contributor",
   ])],
   ["limited", new Set([
@@ -481,19 +480,22 @@ const HIDDEN_MODEL_IDS = new Set([
   "stealth/ox-alpha",
   // Official Web God-only Novita/Codex test route; it is not the public Luna model.
   "openai/gpt-5.6-luna-es",
+  // 同在官方 FREEBUFF_WEB_GOD_ONLY_MODELS 里（0766319c）：god 账号专属的 Web/Cloud
+  // 路由，且**不在 CLI 目录 FREEBUFF_MODELS 里**，普通 token 一定调不通。
+  // 旧 08-16 观测里它曾经能调通，之后被划成 god-only —— 按 fail closed 处理。
+  "crof/kimi-k3-eco",
 ]);
 function isHiddenModelId(modelId) {
   const value = String(modelId || "").trim().toLowerCase();
   return HIDDEN_MODEL_IDS.has(value) || value === "ox-alpha"
     || value === "anthropic/ox-alpha" || value.endsWith("/ox-alpha")
-    || value.startsWith("openai/gpt-5.6-luna-es");
+    || value.startsWith("openai/gpt-5.6-luna-es")
+    // 官方模型判定都是 suffix/前缀容错的，免得带日期的 provider 快照绕过分类。
+    || value.startsWith("crof/kimi-k3-eco");
 }
 const PREMIUM_QUOTA_MODELS = new Set([
   "deepseek/deepseek-v4-flash",
-  "crof/kimi-k3-eco",
   "meta/muse-spark-1.2-contributor",
-  "poolside/laguna-s-2.1",
-  "openrouter/poolside/laguna-s-2.1",
 ]);
 const STANDARD_MODELS = new Set([
   "mimo/mimo-v2.5",
@@ -1380,6 +1382,29 @@ function clientModelAllowed(client, mc) {
   return client.models.includes(mc && mc.id);
 }
 
+// 把毫秒说成人话：解锁剩余时间要让人一眼看出是「还要等一小时」还是「马上就好」，
+// 3598s 这种数字读不出来。秒/分/小时三档，只保留两级，不凑第三级。
+function humanDuration(ms) {
+  const sec = Math.max(0, Math.ceil(ms / 1000));
+  if (sec < 60) return `${sec} 秒`;
+  const min = Math.floor(sec / 60);
+  if (min < 60) return sec % 60 ? `${min} 分 ${sec % 60} 秒` : `${min} 分`;
+  return min % 60 ? `${Math.floor(min / 60)} 小时 ${min % 60} 分` : `${Math.floor(min / 60)} 小时`;
+}
+
+// 报错里的解锁时间点。按进程时区渲染（镜像 ENV 与 server.js 默认都是 Asia/Shanghai），
+// 并把实际偏移标出来 —— 万一部署在别的时区，用户能看出这是哪个钟，不会差几小时还看不出。
+function lockTimeText(ms) {
+  const d = new Date(ms);
+  const p = (n) => String(n).padStart(2, "0");
+  // getTimezoneOffset 返回「UTC 减本地」的分钟数，符号与展示习惯相反。
+  const offset = -d.getTimezoneOffset();
+  const abs = Math.abs(offset);
+  const label = `UTC${offset < 0 ? "-" : "+"}${Math.floor(abs / 60)}${abs % 60 ? ":" + p(abs % 60) : ""}`;
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} `
+    + `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())} (${label})`;
+}
+
 // 准入闸门只管模型与并发。每日 session 预算必须等 createSession 知道是否复用后再判。
 function openClientGate(client, mc) {
   if (!client) return { release: () => {} };   // 没有 key 上下文（内部调用）不设限
@@ -1395,6 +1420,31 @@ function openClientGate(client, mc) {
   }
   const now = Date.now();
   const st = clientStat(client, now);
+  // 会话存续期内这把 Key 只能用一个模型：换模型要么等会话到期，要么用 Master Key。
+  // 这里就地回中文提示，不进选号/建会话流程 —— 换模型的代价是删会话重建，
+  // 白扣一份 admission（见 deleteUpstreamSession 的注释）。
+  const lock = clientModelLock(client, now);
+  if (lock && lock.model !== (mc && mc.session)) {
+    const waitMs = Math.max(1000, lock.until - now);
+    const waitSec = Math.ceil(waitMs / 1000);
+    return {
+      error: jsonResponse({
+        error: {
+          message: `当前 Key 已锁定模型 ${lock.model},会话存续期内只能用这一个模型。\n`
+            + `· 锁定模型: ${lock.model}\n`
+            + `· 本次请求: ${(mc && mc.session) || "未知"}（已拒绝）\n`
+            + `· 解锁时间: ${lockTimeText(lock.until)},还需 ${humanDuration(waitMs)}（${waitSec}s）\n`
+            + `在此之前请继续用 ${lock.model};需要立刻换模型请改用 Master Key`,
+          type: "key_model_locked",
+          currentModel: lock.model,
+          requestedModel: (mc && mc.session) || null,
+          // 客户端可以直接读这两个字段做等待/倒计时，不用去解析中文句子。
+          retryAfterSec: waitSec,
+          unlockAt: new Date(lock.until).toISOString(),
+        },
+      }, 409, { "Retry-After": String(waitSec), "X-RateLimit-Scope": "api-key" }),
+    };
+  }
   if (client.concurrency > 0 && st.live.length >= client.concurrency) {
     // 不排队：排队只会让客户端自己超时，还看不出是被自己的并发限住了。
     return {
@@ -1457,11 +1507,18 @@ function claimClientSession(client, token, model, session, now = Date.now()) {
   if (!client || !session?.instanceId) return session;
   const st = clientStat(client, now);
   const identity = clientSessionIdentity(token, model, session);
-  if (st.seenSessions.has(identity)) return session;
-  if (client.dailyLimit > 0 && st.daySessions.size >= client.dailyLimit) {
+  const expiresAt = Date.parse(session.expiresAt || "");
+  const fresh = !st.seenSessions.has(identity);
+  if (fresh && client.dailyLimit > 0 && st.daySessions.size >= client.dailyLimit) {
     throw new ClientSessionLimitError(client, now);
   }
-  const expiresAt = Date.parse(session.expiresAt || "");
+  // 单 Key 在会话存续期内只允许一个模型。这里是这把 Key「拿到会话」的唯一入口，
+  // 所以锁只写在这里（复用同一条会话也会走到，顺便刷新）。Master Key 不锁。
+  // 过期时间读不出来的会话在 isLiveSession 眼里本来就不算活着，锁它没有意义。
+  if (client.owner !== true && Number.isFinite(expiresAt)) {
+    st.modelLock = { model: String(model || ""), token, until: expiresAt };
+  }
+  if (!fresh) return session;
   st.seenSessions.set(identity, Number.isFinite(expiresAt) ? expiresAt : null);
   st.daySessions.add(identity);
   st.dayCount = st.daySessions.size;
@@ -1469,6 +1526,31 @@ function claimClientSession(client, token, model, session, now = Date.now()) {
   st.lastAt = now;
   usageSaveHook();   // 今日/累计要跨重启活下来，新会话落一次盘（一天最多几次，不是每请求）
   return session;
+}
+
+// 这把 Key 当前被绑在哪个模型上（会话存续期内）。Master Key 永不受限。
+// 会话过期、或本地缓存里那条会话已经不在了（换模型删掉 / 被顶替 / 进程重启），
+// 都算解锁 —— 宁可放开，也不要把用户锁在一条已经不存在的会话上。
+function clientModelLock(client, now = Date.now()) {
+  if (!client || client.owner === true) return null;
+  const st = clientStats.get(client.key);
+  const lock = st?.modelLock;
+  if (!lock) return null;
+  if (!(lock.until > now) || !isLiveSession(sessCache.get(lock.token + ":" + lock.model), now)) {
+    st.modelLock = null;
+    return null;
+  }
+  return lock;
+}
+
+// 这个号上该模型的活跃会话是不是这把 Key 自己开的。别的 Key 开的不复用：
+// 同一个 instanceId 会把两边的上下文串在一起。宁可换个干净的号新建会话，
+// 代价是多花一份 admission —— 这是用户明确要的取舍（避免上下文污染）。
+// 没有 key 上下文（内部调用）时一律当自己的，保持原有复用行为。
+function sessionOwnedByClient(client, token, model, session) {
+  if (!client || !session?.instanceId) return true;
+  const st = clientStats.get(client.key);
+  return Boolean(st?.seenSessions?.has(clientSessionIdentity(token, model, session)));
 }
 
 // 只在确定要发 fresh-session POST 时预留预算。失败会取消；成功后用真实 instanceId 提交。
@@ -1593,6 +1675,9 @@ async function pickTokenWithSessionWait(
         return !accountIsBlocked(acct.token)
           && !inScopedCooldown(acct.token, sessionModel)
           && (preserveBudget ? isLiveSession(session) : isUsableSession(session))
+          // 别的 Key 开的同模型会话不等也不复用：共用一个 instanceId 会串上下文。
+          // 这种号交给 pickToken 排到候选末尾，优先换个干净的号新建会话。
+          && sessionOwnedByClient(client, acct.token, sessionModel, session)
           ? [{ acct, session }] : [];
       });
       if (!active.length) break;
@@ -1630,7 +1715,7 @@ async function pickTokenWithSessionWait(
       if (!preserveBudget) break;
     }
   }
-  return pickToken(env, sessionModel, attempted);
+  return pickToken(env, sessionModel, attempted, client);
 }
 
 function sessionLeaseWaitMs(env) {
@@ -1662,13 +1747,15 @@ function isTransientUpstreamError(error) {
     || error instanceof TransientAccountAuthError
     || error instanceof EgressRejectedError
     || error instanceof WaitingRoomError
+    || error instanceof ModelLockedError
+    || error instanceof ModelUnavailableError
     || error instanceof EmptyUpstreamStreamError) return false;
   const msg = String((error && error.message) || error);
   if (/\b429\b/.test(msg) || /stayed queued|waiting.room/i.test(msg)) return false;
   return /create session failed|start_run failed|timeout|timed out|terminated|abort|fetch failed|ECONNRESET|socket hang up/i.test(msg);
 }
 
-function pickToken(env, sessionModel, attempted = new Set()) {
+function pickToken(env, sessionModel, attempted = new Set(), client = null) {
   if (PAUSED_QUOTA_MODELS.has(String(sessionModel || '')) || isHiddenModelId(sessionModel)) return null;
   syncAccountState(env);
   const pool = parseAccounts(env);
@@ -1692,30 +1779,43 @@ function pickToken(env, sessionModel, attempted = new Set()) {
   // 优先复用已有活跃 session 缓存的号：一个 session 约 1 小时有效，创建 session 才扣
   // 免费额度（如 v4-pro 每天 6 次）。纯轮询会让每个请求都切号、各建一个 session，
   // 浪费创建额度。只要当前模型的 session 缓存还活跃就钉在同一个号上，用满再换。
+  // ⚠️ 只钉自己开的会话：别的 Key 的会话复用了会串上下文，那种号往下排到候选末尾。
   if (sessionModel) {
     for (const acct of finalPool) {
       const t = acct.token;
       if (inScopedCooldown(t, sessionModel) || !acquireToken(t)) continue;
       const cached = sessCache.get(t + ":" + sessionModel);
-      if (isUsableSession(cached)) {
+      if (isUsableSession(cached) && sessionOwnedByClient(client, t, sessionModel, cached)) {
         return acct;
       }
       releaseToken(t);
     }
   }
 
-  // 没有活跃缓存才轮询（跳过冷却中的号）。先生成稳定轮询序列，
-  // 再把新鲜的正剩余额度按降序提到前面；未知仍在已知 0 之前。
+  // 没有活跃缓存才轮询（跳过冷却中的号）。先生成稳定轮询序列，再排序：
+  // ① 没有被别的模型会话占住的号优先（避免删别人的会话、白烧一份 admission）；
+  // ② 然后是该模型上没挂着别的 Key 会话的号（避免上下文污染，同模型优先换号新建）；
+  // ③ 最后把新鲜的正剩余额度按降序提到前面；未知仍在已知 0 之前。
+  // ①在②前面：抢占别人的会话既毁掉对方的上下文又白扣一份额度，比共用一条会话更糟。
   const candidates = [];
   for (let k = 0; k < finalPool.length; k++) {
     const acct = finalPool[accountIdx % finalPool.length];
     accountIdx = (accountIdx + 1) % finalPool.length;
     const t = acct.token;
     if (!inScopedCooldown(t, sessionModel) && !tokenBusy(t)) {
-      candidates.push({ acct, order: candidates.length, remaining: remainingQuota(t, sessionModel) });
+      const cached = sessionModel ? sessCache.get(t + ":" + sessionModel) : null;
+      candidates.push({
+        acct,
+        order: candidates.length,
+        conflict: hasConflictingSession(t, sessionModel) ? 1 : 0,
+        foreign: isLiveSession(cached) && !sessionOwnedByClient(client, t, sessionModel, cached) ? 1 : 0,
+        remaining: remainingQuota(t, sessionModel),
+      });
     }
   }
   candidates.sort((a, b) => {
+    if (a.conflict !== b.conflict) return a.conflict - b.conflict;
+    if (a.foreign !== b.foreign) return a.foreign - b.foreign;
     const rank = (item) => item.remaining == null ? 1 : item.remaining > 0 ? 0 : 2;
     const rankDiff = rank(a) - rank(b);
     if (rankDiff) return rankDiff;
@@ -1851,6 +1951,22 @@ function isLiveSession(session, now = Date.now()) {
   return Boolean(session?.instanceId) && Number.isFinite(expiryMs) && expiryMs > now;
 }
 
+// 这个号是否已经被另一个模型的会话占住。CLI 通道一个号同时只能有一个会话，
+// 所以在它上面开新模型必须先 DELETE 旧会话 —— 而重建一次要扣一份 premium
+// admission（每天只有 4~7 份）。选号时把这种号排到最后，让「换模型」优先落到
+// 干净的空闲号上：这才是两个模型真正并行的方式，也是不白烧额度的方式。
+function hasConflictingSession(token, sessionModel, now = Date.now()) {
+  const id = String(sessionModel || "");
+  if (!id) return false;
+  const prefix = token + ":";
+  for (const [cacheKey, session] of sessCache) {
+    if (!cacheKey.startsWith(prefix)) continue;
+    if (cacheKey.slice(prefix.length) === id) continue;
+    if (isLiveSession(session, now)) return true;
+  }
+  return false;
+}
+
 function accountSlot(pool, token) {
   const index = pool.findIndex((acct) => acct.token === token);
   return index >= 0 ? `${index + 1}/${pool.length}` : `?/${pool.length}`;
@@ -1884,17 +2000,19 @@ function quotaScopeForModel(model, quota = null) {
   return "model:" + id;
 }
 
-function cooldownScopeFor(model, reason, explicitScope) {
+function accountQuotaSnapshot(token) {
+  return acctHealth.get(token)?.quota || null;
+}
+
+// 写入侧必须和读取侧（scopedCooldownInfo）用同一个池口径，否则冷却写进一个 key、
+// 查的是另一个 key，等于没冷却。DS4P 就踩过：静态兜底表说 deepseek_pro，
+// 2026-08-23 起线上 rateLimitsByModel 说 premium。
+function cooldownScopeFor(model, reason, explicitScope, quota = null) {
   if (explicitScope) return String(explicitScope);
   if (!model) return "account";
   // Only typed quota responses may use a shared pool. Transport/session errors
   // stay model-scoped so one broken model cannot disable the account's others.
-  return reason === "quota" ? quotaScopeForModel(model) : "model:" + String(model);
-}
-
-function modelCooldownKey(token, model, reason = "error", explicitScope = null) {
-  const scope = cooldownScopeFor(model, reason, explicitScope);
-  return scope === "account" ? token : scopedCooldownKey(token, scope);
+  return reason === "quota" ? quotaScopeForModel(model, quota) : "model:" + String(model);
 }
 
 function cooldown(token, ms, opts) {
@@ -1915,10 +2033,10 @@ function cooldown(token, ms, opts) {
     reason = opts;
   }
   const until = Date.now() + ms;
-  const key = modelCooldownKey(token, model, reason, scope);
+  const storedScope = cooldownScopeFor(model, reason, scope, accountQuotaSnapshot(token));
+  const key = storedScope === "account" ? token : scopedCooldownKey(token, storedScope);
   const prev = cooldowns.get(key);
   if (prev && prev.until > until) return; // 已有更长的冷却，保留
-  const storedScope = key === token ? "account" : (scope || cooldownScopeFor(model, reason, null));
   cooldowns.set(key, {
     until,
     retryAfterMs,
@@ -1937,12 +2055,19 @@ function cooldownInfo(token, now = Date.now()) {
 
 // 当前模型同时看模型级冷却和显式账号级冷却；模型级 SDK/session 故障
 // 不应把同一账号仍有额度的其他模型一起摘掉。
+// 池 key 要查两份：实时快照口径 + 静态兜底口径。上游改过池归属（DS4P 的
+// deepseek_pro → premium），只查一份会让归属切换的瞬间把还没到期的冷却丢掉。
 function scopedCooldownInfo(token, model, now = Date.now()) {
   const keys = [token];
   if (model) {
     keys.push(scopedCooldownKey(token, "model:" + String(model)));
-    const quota = acctHealth.get(token)?.quota || null;
-    keys.push(scopedCooldownKey(token, quotaScopeForModel(model, quota)));
+    const scopes = new Set([
+      quotaScopeForModel(model, accountQuotaSnapshot(token)),
+      quotaScopeForModel(model, null),
+    ]);
+    for (const scope of scopes) {
+      if (scope !== "account") keys.push(scopedCooldownKey(token, scope));
+    }
   }
   let selected = null;
   for (const key of keys) {
@@ -2367,6 +2492,87 @@ class EmptyUpstreamStreamError extends Error {
   }
 }
 
+// 上游 `model_locked`：该账号已有一个绑在别的模型上的会话。CLI/web 通道一个号
+// 同时只能有一个会话（官方 premium_slot_taken 注释：多会话只给 Desktop，
+// "Never returned to CLI/web, which run one session per user."），官方唯一处置是
+// DELETE 旧会话再 POST 新模型。DELETE + 重发一次仍然锁着，才抛这个错误。
+//
+// ⚠️ 它不是"上游抖动"也不是这个号的问题：绝不能原地重试同号（重试必然再锁），
+// 也绝不能写冷却（写了会把整池按模型冷却，看起来像"这个模型彻底不可用"）。
+// 正确做法是换一个没有会话冲突的账号——那才是两个模型真正并行的方式。
+class ModelLockedError extends Error {
+  constructor(currentModel, requestedModel) {
+    super(`model_locked: account session is bound to ${currentModel || "another model"}`);
+    this.name = "ModelLockedError";
+    this.currentModel = currentModel || null;
+    this.requestedModel = requestedModel || null;
+  }
+}
+
+// POST /session 的 model_locked 判定。只看 body 的联合体判别式，HTTP status
+// 不参与：私有服务端把它挂在 200 或 409 上都要能识别，挂在 409 上时更不能被
+// 下面那条 session_model_mismatch 分支吞掉（那条会写 60s 冷却，等于整池按模型封住）。
+//
+// 线上实测（2026-08-23，ellamorris5186）：上游真的挂在 **409** 上 ——
+// `HTTP 409 {"status":"model_locked","currentModel":…,"requestedModel":…}`，
+// 且**不带 currentInstanceId**，所以要 DELETE 必须先 GET 拿 instanceId。
+function isModelLockedResponse(resp) {
+  return String(resp?.data?.status || "") === "model_locked";
+}
+
+// 上游 `model_unavailable`：模型本身当前不可选（已从 free mode 撤下，或只在
+// 某些时段开放，联合体里带 `availableHours`）。这是**全局**结果，和账号无关。
+//
+// ⚠️ 官方 FREEBUFF_GATE_CODES 把它定成 `{status: 410, endsTheSession: false}`，
+// 注释写明为什么不能置 true：已发布客户端的编译期目录里还留着被下线的 id，
+// 客户端下次发送还会再问一次；置 true 会让每次重发都变成一次新 admission ——
+// 正是 #1801 里让 limited tier admissions 涨 2.5 倍、91% 会话卡在 0.1 unit
+// 下限的那个循环。所以拿到它绝不能删会话/重建会话，也绝不能冷却账号或换号
+// （换号只是把同一个全局结果再要一遍），只能立刻把原因回给客户端。
+class ModelUnavailableError extends Error {
+  constructor(requestedModel, availableHours, detail) {
+    super(`model_unavailable: ${requestedModel || "model"} is not selectable right now`);
+    this.name = "ModelUnavailableError";
+    this.requestedModel = requestedModel || null;
+    this.availableHours = availableHours || null;
+    this.detail = detail || "";
+  }
+}
+
+// session 联合体形态（POST/GET /session）：判别式同样只看 body 的 status。
+function throwIfModelUnavailableResponse(resp, sessionModel) {
+  const data = resp?.data;
+  if (String(data?.status || "") !== "model_unavailable") return;
+  throw new ModelUnavailableError(data.requestedModel || sessionModel, data.availableHours);
+}
+
+// chat gate 形态：必须 code + HTTP status **同时**匹配（官方注释：410 本身也是
+// 普通 provider 结果，且上游 error body 可能回显同名 code，只对一半会让无关故障
+// 冒充 gate）。410 上的另一个 code 是 session_expired，由 isStaleSessionGate 处理，
+// 两者互不干扰。
+function isModelUnavailableGate(status, body) {
+  if (status !== 410) return false;
+  let parsed = null;
+  try { parsed = JSON.parse(body); } catch {}
+  return hasExactErrorCode(parsed, "model_unavailable");
+}
+
+function modelUnavailableResponse(error) {
+  const model = error?.requestedModel ? String(error.requestedModel) : "该模型";
+  const hours = error?.availableHours ? `，开放时段：${error.availableHours}` : "";
+  return jsonResponse({
+    error: {
+      message: `上游当前不提供 ${model}（model_unavailable）${hours}。`
+        + `这是上游的全局状态，换账号也一样，请改用其他模型。`,
+      type: "model_unavailable",
+      requestedModel: error?.requestedModel || null,
+      ...(error?.availableHours ? { availableHours: error.availableHours } : {}),
+    },
+  }, 503);
+}
+
+
+
 // 上游始终以 SSE 返回，即使客户端请求的是非流式响应。HTTP 200 或首个字节
 // 本身并不代表模型真的开始输出：角色、usage、finish-only 和 [DONE] 都可能
 // 在额度/会话异常时单独出现。预读到首个有意义增量后再把原始字节重放给下游，
@@ -2490,6 +2696,8 @@ function isExpectedFlowError(error) {
     || error instanceof QuotaExhaustedError
     || error instanceof WaitingRoomError
     || error instanceof ClientSessionLimitError
+    || error instanceof ModelLockedError
+    || error instanceof ModelUnavailableError
     || error instanceof EmptyUpstreamStreamError;
 }
 
@@ -2511,15 +2719,24 @@ function invalidateSessionCache(token) {
   }
 }
 
-async function deleteUpstreamSession(token, instanceId, model) {
+async function deleteUpstreamSession(token, instanceId, model, { force = false } = {}) {
   invalidateSessionCache(token);
   if (!instanceId) return;
   // 失效安全窗口内同一 token:model 不重复 DELETE 上游（避免连续 409 时
   // 疯狂 DELETE+POST 循环打爆上游）。窗口信息在调用方重建前用
   // wasRecentlyInvalidated 检查，这里只是记录时间戳 + 跳过重复 DELETE。
+  //
+  // ⚠️ `model` 必须是**被删掉的那个会话**的模型，不能传"接下来要建的模型"：
+  // 换模型（ds4p → luna）是一次合法切换，不是同模型重建循环。传错会让
+  // luna 的窗口被 ds4p 的切换动作占住，30s 内再要 luna 时 DELETE 被当成
+  // 重复调用跳过，POST 必然拿到 model_locked。
+  //
+  // force：上游已经明确告诉我们"有一个别的模型的会话挡着"（GET 看到 active
+  // 换模型、或 POST 回 model_locked）。那是权威事实而不是猜测性重建，必须真删，
+  // 否则窗口会把换模型永久锁死。窗口只用来防同模型的 DELETE+POST 循环。
   const key = token + ":" + (model || "");
   const last = sessionInvalidated.get(key);
-  if (last && Date.now() - last < INVALIDATION_WINDOW_MS) return;
+  if (!force && last && Date.now() - last < INVALIDATION_WINDOW_MS) return;
   sessionInvalidated.set(key, Date.now());
   try {
     await enqueueUp("DELETE", "/api/v1/freebuff/session", token, undefined,
@@ -2959,6 +3176,7 @@ async function createSession(token, sessionModel, forceCreate = false, client = 
       throwIfTerminalResponse(token, cur.status, cur.data);
       throwIfAdmissionResponse(cur.status, cur.data, cur.headers, sessionModel,
         cur.data?.rateLimitsByModel || acctHealth.get(token)?.quota || null);
+      throwIfModelUnavailableResponse(cur, sessionModel);
       if (cur.status === 200 && cur.data?.status === "active" && cur.data?.instanceId) {
         const cm = cur.data.model;
         if (!cm || cm === sessionModel) {
@@ -2966,7 +3184,9 @@ async function createSession(token, sessionModel, forceCreate = false, client = 
           sessCache.set(key, s);
           return s;
         }
-        await deleteUpstreamSession(token, cur.data.instanceId, sessionModel);
+        // 换模型：删掉的是 cm 那个会话，窗口就要记在 cm 头上（见 deleteUpstreamSession）。
+        // GET 已经确认它 active，是权威事实 → force 真删，否则 POST 必然 model_locked。
+        await deleteUpstreamSession(token, cur.data.instanceId, cm, { force: true });
       }
     }
 
@@ -2975,20 +3195,56 @@ async function createSession(token, sessionModel, forceCreate = false, client = 
     //    （服务端 chat gate 不识别多会话实例），所以这里用单会话 + 预生成 instance-id：
     //    既保留桌面版客户端预生成实例的指纹，又确保 chat 能被识别。
     reservation = reserveClientSession(client, flightKey);
-    const instId = crypto.randomUUID();
-    const r = await enqueueUp("POST", "/api/v1/freebuff/session", token, undefined,
-      { "x-freebuff-model": sessionModel, "x-freebuff-instance-id": instId, "Content-Type": "application/json" }, SESSION_TIMEOUT_MS);
-    recordAccountObservation(token, r.status, r.data, {
-      quota: r.data?.rateLimitsByModel || null,
-      uid: r.data?.uid || null,
-      retryAfterMs: r.data?.retryAfterMs,
-      headers: r.headers,
-      model: sessionModel,
-    });
-    if (r.status === 401) await confirmTokenInvalid(token, sessionModel);
-    throwIfTerminalResponse(token, r.status, r.data);
-    throwIfAdmissionResponse(r.status, r.data, r.headers, sessionModel,
-      r.data?.rateLimitsByModel || acctHealth.get(token)?.quota || null);
+    const postSession = async () => {
+      const instId = crypto.randomUUID();
+      const resp = await enqueueUp("POST", "/api/v1/freebuff/session", token, undefined,
+        { "x-freebuff-model": sessionModel, "x-freebuff-instance-id": instId, "Content-Type": "application/json" }, SESSION_TIMEOUT_MS);
+      recordAccountObservation(token, resp.status, resp.data, {
+        quota: resp.data?.rateLimitsByModel || null,
+        uid: resp.data?.uid || null,
+        retryAfterMs: resp.data?.retryAfterMs,
+        headers: resp.headers,
+        model: sessionModel,
+      });
+      if (resp.status === 401) await confirmTokenInvalid(token, sessionModel);
+      throwIfTerminalResponse(token, resp.status, resp.data);
+      throwIfAdmissionResponse(resp.status, resp.data, resp.headers, sessionModel,
+        resp.data?.rateLimitsByModel || acctHealth.get(token)?.quota || null);
+      // model_unavailable：模型全局不可选（联合体里带 availableHours）。不是这个号
+      // 的问题，换号只会把同一个结果再要一遍，所以直接抛到最外层回客户端。
+      throwIfModelUnavailableResponse(resp, sessionModel);
+      return resp;
+    };
+    let r = await postSession();
+    // model_locked：账号还挂着另一个模型的会话（上面的 GET 没看到，或 forceCreate
+    // 跳过了 GET）。官方唯一处置是 DELETE 旧会话再 POST —— 这里补一次 GET 拿
+    // instanceId（model_locked 本身不带 currentInstanceId），删掉再发一次。
+    //
+    // ⚠️ 只认 body 里的 status，不绑 HTTP status：POST /session 的响应是
+    // FreebuffSessionServerResponse 联合体，判别式就是 body 的 `status` 字段
+    // （官方那条「code + HTTP status 必须同时匹配」的规则是给 chat 的
+    // FREEBUFF_GATE_CODES 的，不是给 session 联合体的）。私有服务端把
+    // model_locked 挂在 200 还是 409 上都能正确恢复。
+    if (isModelLockedResponse(r)) {
+      const lockedModel = String(r.data.currentModel || "").trim() || null;
+      const cur = await enqueueUp("GET", "/api/v1/freebuff/session", token, undefined,
+        undefined, SESSION_TIMEOUT_MS);
+      recordAccountObservation(token, cur.status, cur.data, {
+        quota: cur.data?.rateLimitsByModel || null,
+        headers: cur.headers,
+        model: sessionModel,
+      });
+      throwIfTerminalResponse(token, cur.status, cur.data);
+      const lockedInstance = cur.data?.instanceId || null;
+      if (lockedInstance) {
+        await deleteUpstreamSession(token, lockedInstance, cur.data?.model || lockedModel,
+          { force: true });
+        r = await postSession();
+      }
+      if (isModelLockedResponse(r)) {
+        throw new ModelLockedError(r.data.currentModel || lockedModel, sessionModel);
+      }
+    }
     if (r.status === 200 && r.data?.status === "active" && r.data?.instanceId) {
       const s = normalizeSession(r.data, sessionModel);
       sessCache.set(key, s);
@@ -3550,6 +3806,14 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode, requestSig
         throwIfAdmissionResponse(resp.status, text, resp.headers, mc.session,
           acctHealth.get(token)?.quota || null);
         lastErrMsg = "reviewer upstream error: " + text.slice(0, 300);
+        // 410 model_unavailable：模型全局不可选，换号/重建都拿同一个结果。
+        // 与 400 同口径就地收尾原文回传，绝不冷却账号（见 ModelUnavailableError）。
+        if (isModelUnavailableGate(resp.status, text)) {
+          if (reviewerRunId) await finishRun(token, reviewerRunId, 1).catch(() => {});
+          if (rootRunId) await finishRun(token, rootRunId, 1).catch(() => {});
+          recordRequest(mc && mc.id ? mc.id : "", null, false);
+          return modelUnavailableResponse(new ModelUnavailableError(mc.session, null, text));
+        }
         if (resp.status === 400) {
           // 与 executeChat 同口径：400 是「请求本身不合法」，和账号无关。
           // 冷却+换号只会把整池冷掉（连别的模型一起打不通），换号也是同一个 400，
@@ -3610,6 +3874,16 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode, requestSig
         lastEgressUnavailable = false;
       }
       if (e instanceof ClientSessionLimitError) return clientSessionLimitResponse(e);
+      // model_unavailable：模型被上游下线/当前时段不可选，是全局结果。换号拿到的
+      // 还是同一个答案，重建会话更是白扣 admission，所以先收尾 run 再原文回传，
+      // 绝不冷却账号（见 ModelUnavailableError）。
+      if (e instanceof ModelUnavailableError) {
+        if (reviewerRunId) await finishRun(token, reviewerRunId, 1).catch(() => {});
+        if (rootRunId) await finishRun(token, rootRunId, 1).catch(() => {});
+        callTotals.upstreamError++;
+        recordRequest(mc && mc.id ? mc.id : "", null, false);
+        return modelUnavailableResponse(e);
+      }
       if (e instanceof WaitingRoomError || /session stayed queued|waiting.room/i.test(lastErrMsg)) {
         lastWaitingRetryAfter = e.retryAfterMs || 30 * 1000;
       } else lastWaitingRetryAfter = null;
@@ -3693,6 +3967,7 @@ async function executeChatPooled(env, chatParams, mc, isStream, mode, requestSig
   let lastErrMsg = "";
   let lastWaitingRetryAfter = null;
   let lastEgressUnavailable = false;
+  let lastModelLocked = null;
   const attempted = new Set();
   let pinnedToken = null; // 上游抖动后待重试的同一个号
   let sameAccountRetries = 0;
@@ -3812,6 +4087,12 @@ async function executeChatPooled(env, chatParams, mc, isStream, mode, requestSig
         if (resp.status === 401) await confirmTokenInvalid(token, mc.session);
         throwIfAdmissionResponse(resp.status, errText, resp.headers, mc.session,
           acctHealth.get(token)?.quota || null);
+        // 410 model_unavailable：模型被上游下线/当前时段不可选。endsTheSession 为
+        // false —— 会话还是好的，绝不能删会话重建（那是 #1801 的 admission 循环），
+        // 也不能冷却这个号或换号。直接抛出去，让外层立刻回客户端。
+        if (isModelUnavailableGate(resp.status, errText)) {
+          throw new ModelUnavailableError(mc.session, null, errText);
+        }
         // 428 waiting_room_required（无活跃 session）/ 409 session_superseded（被新 session 顶替）
         // 都说明缓存 instance 已失效 → 清缓存强制重建后重试一次；不是限流，不计冷却。
         // 失效安全窗口：该号刚才（30s 内）已经失效重建过一次还再次失效，
@@ -3897,6 +4178,17 @@ async function executeChatPooled(env, chatParams, mc, isStream, mode, requestSig
         lastEgressUnavailable = false;
       }
       if (e instanceof ClientSessionLimitError) return clientSessionLimitResponse(e);
+      // model_unavailable：模型被上游下线/当前时段不可选，是全局结果。换号拿到的
+      // 还是同一个答案，重建会话更是白扣 admission（#1801 的循环），所以既不冷却
+      // 也不换号，立刻把原因回给客户端。
+      if (e instanceof ModelUnavailableError) {
+        callTotals.upstreamError++;
+        recordRequest(mc && mc.id ? mc.id : "", null, false);
+        return modelUnavailableResponse(e);
+      }
+      // model_locked：这个号被别的模型占着。换号继续（另一个号就是真正的并行），
+      // 但不写冷却、不原地重试 —— 见 ModelLockedError 的注释。
+      if (e instanceof ModelLockedError) lastModelLocked = e;
       if (e instanceof WaitingRoomError || /session stayed queued|waiting.room/i.test(msg)) {
         lastWaitingRetryAfter = e.retryAfterMs || 30 * 1000;
       } else lastWaitingRetryAfter = null;
@@ -3959,6 +4251,20 @@ async function executeChatPooled(env, chatParams, mc, isStream, mode, requestSig
   if (lastEgressUnavailable) {
     recordRequest(mc && mc.id ? mc.id : "", null, false);
     return egressRejectedResponse("egress_unavailable");
+  }
+  // 全池都被别的模型的会话占着：这是上游"一个号同时只能一个会话"的硬约束，
+  // 不是额度问题也不是账号故障。给一句能照做的话，别伪装成 503 无可用账号。
+  if (lastModelLocked) {
+    recordRequest(mc && mc.id ? mc.id : "", null, false);
+    return jsonResponse({
+      error: {
+        message: `所有账号当前都被其他模型的会话占用（上游一个账号同时只能有一个会话）。`
+          + `等正在跑的请求结束，或增加账号数量后重试。`,
+        type: "model_locked",
+        currentModel: lastModelLocked.currentModel,
+        requestedModel: lastModelLocked.requestedModel,
+      },
+    }, 409);
   }
   // 全池换号仍失败：该请求的失败终态，记一次失败（每个客户端请求只落一次）。
   recordRequest(mc && mc.id ? mc.id : "", null, false);

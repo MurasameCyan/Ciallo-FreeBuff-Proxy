@@ -178,10 +178,12 @@ assert.match(css, /\.account-priority-toggle\s*\{[^}]*white-space:\s*nowrap/s,
   '账号优先级按钮必须保持紧凑单行');
 assert.match(css, /\.account-egress-refresh\s*\{[^}]*white-space:\s*nowrap/s,
   '刷新出站按钮必须保持紧凑单行');
-assert.match(app, /const HIDDEN_MODEL_IDS = new Set\(\[[\s\S]*?'stealth\/ox-alpha'[\s\S]*?'openai\/gpt-5\.6-luna-es'[\s\S]*?\]\)/,
-  '面板必须过滤 service-only ox-alpha 与 Web-only luna-es，避免旧缓存或 Key 白名单重新显示');
+assert.match(app, /const HIDDEN_MODEL_IDS = new Set\(\[[\s\S]*?'stealth\/ox-alpha'[\s\S]*?'openai\/gpt-5\.6-luna-es'[\s\S]*?'crof\/kimi-k3-eco'[\s\S]*?\]\)/,
+  '面板必须过滤 service-only ox-alpha 与 god-only luna-es / K3 Eco，避免旧缓存或 Key 白名单重新显示');
 assert.match(app, /function isHiddenModelId\(modelId\)[\s\S]*?value === 'ox-alpha'[\s\S]*?value\.endsWith\('\/ox-alpha'\)/,
   '面板必须统一过滤完整 ID、供应商变体和短名 ox-alpha');
+assert.match(app, /function isHiddenModelId\(modelId\)[\s\S]*?value\.startsWith\('crof\/kimi-k3-eco'\)/,
+  'god-only K3 Eco 的日期/变体后缀同样要挡住，与 worker.js 保持一致');
 assert.match(app, /for \(const id of chosen\) if \(!ids\.includes\(id\) && !isHiddenModelId\(id\)\) ids\.push\(id\)/,
   '旧 Key 白名单里的短名 ox-alpha 不得被重新加入模型按钮');
 assert.match(app, /function quotaRows\(probe\)[\s\S]*?!isHiddenModelId\(q\?\.model\)/,
@@ -427,7 +429,7 @@ assert.deepEqual(
     { model: 'deepseek/deepseek-v4-pro', used: 1, limit: 1, pool: 'deepseek_pro' },
     { model: 'openai/gpt-5.6-luna', used: 1, limit: 1, pool: 'luna' },
     { model: 'deepseek/deepseek-v4-flash', used: 3, limit: 5, pool: 'premium' },
-    { model: 'crof/kimi-k3-eco', used: 3, limit: 5, pool: 'premium' },
+    { model: 'meta/muse-spark-1.2-contributor', used: 3, limit: 5, pool: 'premium' },
   ] }))),
   { text: '( D1 L1 P5 )', title: '额度 D 1/1 · L 1/1 · P 3/5' },
   'D/L/P 摘要必须按 pool 去重，Premium 多模型行只显示一个 P5',
@@ -441,10 +443,12 @@ assert.deepEqual(
   { text: '( D1 L1 P4 )', title: '额度 D 0/1 · L 0/1 · P 1/4' },
   'P 值必须读取上游 Premium 池 limit，不能写死为 5',
 );
+// 2026-08-23 线上实测：DS4P 的 deepseek_pro 独立池已被上游删除，V4 Pro 与 Flash
+// 同在 premium 池，所以「同池多行」的保守取值用这两行才是现实形状。
 assert.deepEqual(
   JSON.parse(JSON.stringify(helperVm.__modelUi.accountQuotaSummary({ quota: [
     { model: 'deepseek/deepseek-v4-flash', used: null, limit: 7, pool: 'premium' },
-    { model: 'crof/kimi-k3-eco', used: 2, limit: 5, pool: 'premium' },
+    { model: 'deepseek/deepseek-v4-pro', used: 2, limit: 5, pool: 'premium' },
   ] }))),
   { text: '( P5 )', title: '额度 P 2/5' },
   'Premium 行异常不一致时必须保守取最小 limit，并优先显示已知 used',
@@ -452,10 +456,27 @@ assert.deepEqual(
 assert.deepEqual(
   JSON.parse(JSON.stringify(helperVm.__modelUi.accountQuotaSummary({ quota: [
     { model: 'deepseek/deepseek-v4-flash', used: 0, limit: 0, pool: 'premium' },
-    { model: 'crof/kimi-k3-eco', used: 2, limit: 5, pool: 'premium' },
+    { model: 'deepseek/deepseek-v4-pro', used: 2, limit: 5, pool: 'premium' },
   ] }))),
   { text: '( P0 )', title: '额度 P 2/0' },
   'Premium 同池出现 0 与正数冲突时，UI 必须与 worker 一样保守，不能丢掉 0 后显示 P5',
+);
+// god-only（官方 FREEBUFF_WEB_GOD_ONLY_MODELS）行必须整行丢掉：普通账号一定调不通，
+// 把它算进 premium 摘要只会让面板显示一个永远用不到的额度。
+assert.equal(
+  helperVm.__modelUi.accountQuotaSummary({ quota: [
+    { model: 'crof/kimi-k3-eco', used: 0, limit: 9, pool: 'premium' },
+  ] }),
+  null,
+  'god-only K3 Eco 不得单独撑起 Premium 摘要',
+);
+assert.deepEqual(
+  JSON.parse(JSON.stringify(helperVm.__modelUi.accountQuotaSummary({ quota: [
+    { model: 'deepseek/deepseek-v4-flash', used: 1, limit: 4, pool: 'premium' },
+    { model: 'crof/kimi-k3-eco', used: 3, limit: 9, pool: 'premium' },
+  ] }))),
+  { text: '( P4 )', title: '额度 P 1/4' },
+  'god-only 行不得参与同池保守取值，否则会污染真实 Premium 数字',
 );
 assert.equal(
   helperVm.__modelUi.accountQuotaSummary({ quota: [
