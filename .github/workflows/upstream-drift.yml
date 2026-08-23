@@ -1,0 +1,42 @@
+name: 上游契约漂移检查
+
+# worker.js 的解析器、模型目录、gate 分类全部针对 CodebuffAI/freebuff@main 的
+# 常量/类型文件编写；上游改一行我们就可能静默解析错。这里每周把 5 个钉死文件
+# （scripts/upstream-pins.json）与官方 main 做 sha256 对比，漂移即红。
+# 判定细节与退出码见 scripts/check-upstream.mjs 头注释。
+on:
+  workflow_dispatch:
+  schedule:
+    # 每天 22:17 UTC = 北京 06:17。官方近两周的契约变更（池结构、luna 上限、
+    # god-only 名单）都发生在北京白天到深夜之间，次日清晨看到红最合适。
+    - cron: '17 22 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-drift
+  cancel-in-progress: false
+
+jobs:
+  drift-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      # 零依赖（只用 node:crypto/fs/path），不需要 npm ci。
+      # 退出码语义：0=SAME；1=DRIFT/MISSING（真漂移，要跟版）；
+      # 2=网络环境错误（不能证明漂移，不标红为失败——重跑即可）。
+      - name: 对比钉死哈希 vs 官方 main
+        run: |
+          set +e
+          node scripts/check-upstream.mjs
+          code=$?
+          set -e
+          if [ "$code" -eq 2 ]; then
+            echo "::warning::上游抓取失败（网络环境错误），本次无法判定漂移，重跑即可"
+            exit 0
+          fi
+          exit "$code"

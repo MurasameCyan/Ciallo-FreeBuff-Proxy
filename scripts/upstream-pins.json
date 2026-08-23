@@ -1,0 +1,32 @@
+{
+  "pinnedAgainst": "fe102b1caf67",
+  "pinnedAt": "2026-08-23T09:41:27.530Z",
+  "note": "由 scripts/check-upstream.mjs --update 生成；哈希基于 LF 归一化后的文件内容。",
+  "files": {
+    "common/src/constants/free-agents.ts": {
+      "why": "Buffy 开头校验串（403 free_mode_cli_required 的判据）、agent 映射",
+      "sha256": "e7925e63eda2d74538ff6953901cd5ad9b4fe5eb34ceae25af11581d58f25936",
+      "bytes": 41048
+    },
+    "common/src/constants/freebuff-models.ts": {
+      "why": "模型目录、premium/luna 池、per-model 上限、god-only/web-only 名单",
+      "sha256": "5e1a9ab161623a7eef69d8624b279b135b7cd3bb3c12108f537797b62349162a",
+      "bytes": 136612
+    },
+    "common/src/constants/freebuff-model-ids.ts": {
+      "why": "deepseek/mimo 等 wire ID 常量（被 models.ts re-export）",
+      "sha256": "b4a0f2aca8ea66c1d2dcbba74003f310fd95185e60839a560115068c4493409b",
+      "bytes": 491
+    },
+    "common/src/types/freebuff-session.ts": {
+      "why": "session/gate wire 契约：banned、model_locked 等全部 gate code",
+      "sha256": "6a6bb8c801aaebffb6477339958370e80cbc13faa26d8c5e4c739780aa5a31b1",
+      "bytes": 30740
+    },
+    "common/src/constants/freebuff-levels.ts": {
+      "why": "Access Level → premiumSessionsPerDay 浮动额度（4~7）",
+      "sha256": "6d8a5e1237c8c17a889d1cff3b331dd007efbc88b2bd9f64d00072918f3e2fa5",
+      "bytes": 21195
+    }
+  }
+}
