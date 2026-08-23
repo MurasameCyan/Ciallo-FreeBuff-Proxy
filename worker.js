@@ -186,22 +186,34 @@ function parseModelPools(source, modelIdConstants) {
   return { premium: [...premium], glm: [...glm] };
 }
 
+// 上游把这些模型的 base2 root agent 在服务端下线了：session 200、agent-runs 200，
+// 只有 POST /chat/completions 回 403 free_mode_legacy_luna_agent
+// （"This conversation uses a retired Luna agent."）。公开常量里 root 映射照旧指向
+// base2，目录和漂移巡检都看不出来，只能按实测结果改路由到 base3 root。
+// ponytail: 手工名单。下一个模型的 base2 被下线还得再加一行；要自动化就得在收到
+// free_mode_legacy_*_agent 时回落到 base3_agent 重试一次（代价是每次多一轮上游往返）。
+const RETIRED_BASE2_ROOT_MODEL_IDS = new Set(["openai/gpt-5.6-luna"]);
+
 // 动态模型表：分别记录普通 root、base3 root、reviewer。
 function buildDynamicModelTable(agentMappings) {
   // 兼容旧调用：传入单张 root mapping 时仍可正常构建。
   const mappings = agentMappings && agentMappings.root
     ? agentMappings
     : { root: agentMappings || {}, base3: {}, reviewer: {} };
-  return Object.entries(mappings.root).map(([modelId, rootAgent]) => ({
-    id: modelId,
-    session: modelId,
-    // 旧字段保留为普通 root，普通 chat 永远使用它。
-    agent: rootAgent,
-    root_agent: rootAgent,
-    base3_agent: mappings.base3[modelId] || null,
-    reviewer_agent: mappings.reviewer[modelId] || null,
-    upstream: modelId,
-  }));
+  return Object.entries(mappings.root).map(([modelId, rootAgent]) => {
+    const base3Agent = mappings.base3[modelId] || null;
+    const root = base3Agent && RETIRED_BASE2_ROOT_MODEL_IDS.has(modelId) ? base3Agent : rootAgent;
+    return {
+      id: modelId,
+      session: modelId,
+      // 旧字段保留为普通 root，普通 chat 永远使用它。
+      agent: root,
+      root_agent: root,
+      base3_agent: base3Agent,
+      reviewer_agent: mappings.reviewer[modelId] || null,
+      upstream: modelId,
+    };
+  });
 }
 
 function annotateDynamicModelPools(models, pool) {
@@ -2229,7 +2241,12 @@ function isPriorityStructuredState(state) {
 function findStructuredState(value, depth = 0) {
   if (!value || typeof value !== "object" || depth > 5) return null;
   let fallback = null;
-  for (const name of ["status", "state", "code", "errorCode", "error_code", "type"]) {
+  for (const name of ["status", "state", "code", "errorCode", "error_code", "type", "error"]) {
+    // `error` 只认 code 形态（不含空白）：chat gate 的 wire shape 就是
+    // {error:"free_mode_legacy_luna_agent", message:"..."}，漏掉它整个 body 会被当成
+    // 「403 但没给名字」，也就是 WAF 级拦截，冤枉出口节点。反过来 {error:"edge rejected"}
+    // 那种自由文本是 message 不是状态，认了它真正的裸 403 就不再判定为出口拦截。
+    if (name === "error" && (typeof value[name] !== "string" || /\s/.test(value[name]))) continue;
     const candidate = normalizeStructuredState(value[name]);
     if (!candidate) continue;
     if (isPriorityStructuredState(candidate)) return candidate;
@@ -2555,6 +2572,17 @@ function isModelUnavailableGate(status, body) {
   let parsed = null;
   try { parsed = JSON.parse(body); } catch {}
   return hasExactErrorCode(parsed, "model_unavailable");
+}
+
+// free mode 的请求级 gate：403 且 body 报了 free_mode_* 名字
+// （free_mode_legacy_luna_agent / free_mode_cli_required / free_mode_invalid_agent_model…）。
+// 这类结果跟账号、跟出口节点都无关 —— 全池每个号问到的都是同一句话，而每次换号重试
+// 都要先建一次会话（真扣 admission 额度：luna 一天只有 3 次）。所以与 400 同口径：
+// 不冷却、不换号，直接把上游原文回给客户端。
+function isFreeModeGate(status, body) {
+  if (status !== 403) return false;
+  const state = findStructuredState(parseJsonBody(body));
+  return typeof state === "string" && state.startsWith("free_mode_");
 }
 
 function modelUnavailableResponse(error) {
@@ -3333,7 +3361,11 @@ async function startRunChain(token, agentId, sessionModel = null) {
   }
   const startedAt = utcNow();
   const runId = await startRun(token, agentId, [], sessionModel);
-  const childRunId = await startRun(token, CONTEXT_PRUNER_AGENT, [runId], sessionModel);
+  // base3 harness 是单循环：不 spawn 子 agent，压缩在 harness 内部机械完成。
+  // 给它挂 context-pruner 子 run 会多烧一次上游调用，实测也不需要。
+  const childRunId = agentId.startsWith("base3")
+    ? null
+    : await startRun(token, CONTEXT_PRUNER_AGENT, [runId], sessionModel);
   runCache.set(key, { runId, childRunId, ts: Date.now() });
   return { runId, agentId, startedAt, childRunId, cached: false };
 }
@@ -3814,14 +3846,20 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode, requestSig
           recordRequest(mc && mc.id ? mc.id : "", null, false);
           return modelUnavailableResponse(new ModelUnavailableError(mc.session, null, text));
         }
-        if (resp.status === 400) {
+        if (resp.status === 400 || isFreeModeGate(resp.status, text)) {
           // 与 executeChat 同口径：400 是「请求本身不合法」，和账号无关。
           // 冷却+换号只会把整池冷掉（连别的模型一起打不通），换号也是同一个 400，
           // 最后还把上游原文换成"当前没有可用账号"。先收尾 run，再原文回传。
+          // 403 free_mode_* gate 也是全池一致的答案，同样就地收尾。
           if (reviewerRunId) await finishRun(token, reviewerRunId, 1).catch(() => {});
           if (rootRunId) await finishRun(token, rootRunId, 1).catch(() => {});
           recordRequest(mc && mc.id ? mc.id : "", null, false);
-          return jsonResponse({ error: { message: lastErrMsg, type: "invalid_request_error" } }, 400);
+          return jsonResponse({
+            error: {
+              message: lastErrMsg,
+              type: resp.status === 400 ? "invalid_request_error" : "permission_error",
+            },
+          }, resp.status);
         } else {
           cooldown(token, parseCooldown(text, resp.status, resp.headers), { model: mc.session });
         }
@@ -4116,10 +4154,11 @@ async function executeChatPooled(env, chatParams, mc, isStream, mode, requestSig
         }
         // 重建后仍失败：该号 session 状态异常，冷却交给外层换号
         if (staleSession) cooldown(token, 60 * 1000, { reason: "invalidation", retryAfterMs: 60 * 1000, model: mc.session });
-        if (resp.status !== 400) {
+        if (resp.status !== 400 && !isFreeModeGate(resp.status, errText)) {
           // 400 是「请求本身不合法」，和账号无关：冷却这个号毫无意义，
           // 换号重试只会把整池 60s 全冷掉（连别的模型一起打不通），
           // 最后还把上游原文换成"当前没有可用账号"，真实原因彻底看不见。
+          // free_mode_* gate 同理，而且它每换一个号都要先建一次会话，是真烧额度。
           cooldown(token, parseCooldown(errText, resp.status, resp.headers), { model: mc.session });
         }
         break;
@@ -4131,9 +4170,15 @@ async function executeChatPooled(env, chatParams, mc, isStream, mode, requestSig
         else callTotals.upstreamError++;
         lastErrMsg = "upstream error: " + (errText || "").slice(0, 300);
         // 400 换号也是同一个 400，直接把上游原文回给客户端，别再试剩下的号。
-        if (resp.status === 400) {
+        // free_mode_* gate（403）同样是全池一致的答案，一起走这条快速失败路径。
+        if (resp.status === 400 || isFreeModeGate(resp.status, errText)) {
           recordRequest(mc && mc.id ? mc.id : "", null, false);
-          return jsonResponse({ error: { message: lastErrMsg, type: "invalid_request_error" } }, 400);
+          return jsonResponse({
+            error: {
+              message: lastErrMsg,
+              type: resp.status === 400 ? "invalid_request_error" : "permission_error",
+            },
+          }, resp.status);
         }
         if (debug) console.log(`[acct ${acctTry + 1}] failed ${resp.status}, switch account`);
         continue;

@@ -18,7 +18,8 @@ const workerSource = readFileSync(new URL('../worker.js', import.meta.url), 'utf
 const workerWrapper = workerSource.replace('export default {', 'const __workerDefault__ = {')
   + '\n\nglobalThis.__workerDefault__ = __workerDefault__;\n'
   + 'globalThis.__gateTestApi__ = { executeChat, createSession, cooldownInfo, '
-  + 'scopedCooldownInfo, isModelUnavailableGate, isStaleSessionGate, sessCache };\n';
+  + 'scopedCooldownInfo, isModelUnavailableGate, isStaleSessionGate, isFreeModeGate, '
+  + 'classifyRateLimit, buildDynamicModelTable, startRunChain, acctHealth, sessCache };\n';
 
 const LUNA = 'openai/gpt-5.6-luna';
 const DS4P = 'deepseek/deepseek-v4-pro';
@@ -213,5 +214,98 @@ test('gate 判定必须 code + HTTP status 同时匹配', () => {
   assert.equal(api.isModelUnavailableGate(410, 'not json'), false);
   assert.equal(api.isStaleSessionGate(410, GATE_BODY), false,
     'model_unavailable 不是失效会话，不能触发删除/重建');
+});
+
+// ---------------------------------------------------------------------------
+// 403 free_mode_* gate（2026-08-23 实测）：上游把 luna 的 base2 root agent 下线了，
+// session 200、agent-runs 200，只有 chat 回
+//   {"error":"free_mode_legacy_luna_agent","message":"This conversation uses a retired
+//    Luna agent. Update Freebuff if needed, then start a new conversation."}
+// 换成 base3-free-luna（且不挂 context-pruner 子 run）同一条链路就是 200 SSE。
+// ---------------------------------------------------------------------------
+const LEGACY_LUNA_BODY = JSON.stringify({
+  error: 'free_mode_legacy_luna_agent',
+  message: 'This conversation uses a retired Luna agent. Update Freebuff if needed, then start a new conversation.',
+});
+// Cloudflare/WAF 那种不解释的拦截：403 + 非 JSON，没有任何名字。
+const WAF_BODY = '<html><head><title>403 Forbidden</title></head></html>';
+
+test('报了名字的 403 是模型/模式问题，不能算到出口节点头上', () => {
+  const { api } = createWorkerVm({ fetchImpl: async () => upstreamResponse(200, {}) });
+  assert.equal(api.isFreeModeGate(403, LEGACY_LUNA_BODY), true);
+  assert.equal(api.isFreeModeGate(410, LEGACY_LUNA_BODY), false, 'gate 必须 code + status 同时匹配');
+  assert.equal(api.isFreeModeGate(403, WAF_BODY), false);
+  assert.equal(api.classifyRateLimit(LEGACY_LUNA_BODY, 403).reason, 'error',
+    'free_mode_* 走普通错误路径，绝不能是 egress —— 那会把节点拉黑 10 分钟并雪崩成 503');
+  assert.equal(api.classifyRateLimit(WAF_BODY, 403).reason, 'egress',
+    '没名字的 403 仍要判定为 IP 级拦截，换节点才有用');
+  assert.equal(api.classifyRateLimit(JSON.stringify({ error: 'edge rejected' }), 403).reason, 'egress',
+    'error 里是自由文本（带空格）就还是 message 不是 code，裸 403 的判定不能被它顶掉');
+});
+
+test('luna 的 root agent 走 base3（上游已下线 base2-free-luna）', () => {
+  const { api } = createWorkerVm({ fetchImpl: async () => upstreamResponse(200, {}) });
+  const table = api.buildDynamicModelTable({
+    root: { [LUNA]: 'base2-free-luna', [DS4P]: 'base2-free-deepseek' },
+    base3: { [LUNA]: 'base3-free-luna', [DS4P]: 'base3-free-deepseek' },
+    reviewer: {},
+  });
+  const luna = table.find((m) => m.id === LUNA);
+  assert.equal(luna.agent, 'base3-free-luna', '普通 chat 必须用 base3 root');
+  assert.equal(luna.root_agent, 'base3-free-luna');
+  const ds4p = table.find((m) => m.id === DS4P);
+  assert.equal(ds4p.agent, 'base2-free-deepseek', '只改被下线的那个，别的模型不动');
+});
+
+test('base3 root 不 spawn context-pruner 子 run', async () => {
+  const log = [];
+  const { api } = createWorkerVm({
+    fetchImpl: async (url, init) => {
+      const path = new URL(String(url)).pathname;
+      if (path === '/api/v1/agent-runs') {
+        log.push(JSON.parse(init.body).agentId);
+        return upstreamResponse(200, { runId: 'run-1' });
+      }
+      return upstreamResponse(200, {});
+    },
+  });
+
+  const base3 = await api.startRunChain('run-chain-token-base3-aaaa', 'base3-free-luna', LUNA);
+  assert.deepEqual(log, ['base3-free-luna'], 'base3 harness 自带机械压缩，不需要 pruner 子 run');
+  assert.equal(base3.childRunId, null);
+
+  log.length = 0;
+  await api.startRunChain('run-chain-token-base2-aaaa', 'base2-free-deepseek', DS4P);
+  assert.deepEqual(log, ['base2-free-deepseek', 'context-pruner'], 'base2 链路保持原样');
+});
+
+test('chat 403 free_mode_legacy_luna_agent：原文回客户端，不换号、不冷却、不拉黑节点', async () => {
+  const start = Date.UTC(2030, 0, 1);
+  const tokens = ['gate-legacy-token-aaaaaaaaaaaaaa', 'gate-legacy-token-bbbbbbbbbbbbbb'];
+  const log = [];
+  const rejects = [];
+  const upstream = createFakeUpstream({
+    start, log, chatResponder: () => upstreamResponse(403, LEGACY_LUNA_BODY),
+  });
+  const workerVm = createWorkerVm({ now: start, fetchImpl: upstream.fetch });
+  workerVm.worker.configureUpstreamRouting({ onReject: (info) => rejects.push(info) });
+
+  const response = await workerVm.api.executeChat(
+    envFor(tokens), chatParams(LUNA), modelCfg(LUNA, 'base2-free-luna'), true, 'chat',
+  );
+  const body = await response.json();
+
+  assert.equal(response.status, 403, '不能伪装成 503「当前出口被上游拒绝」');
+  assert.match(body.error.message, /free_mode_legacy_luna_agent/, '上游原文必须透出去');
+  assert.equal(body.error.type, 'permission_error');
+  assert.deepEqual(rejects, [],
+    '报了名字的 403 不得触发 onEgressReject —— 那会把节点拉黑 10 分钟，逐个节点重试到耗尽再回 503');
+  const chatTokens = new Set(log.filter((e) => e.path === '/api/v1/chat/completions').map((e) => e.token));
+  assert.equal(chatTokens.size, 1, '全池答案一致，换号只是把同一句话再要一遍');
+  assert.equal(upstream.created, 1, '每换一个号都要先建会话：luna 一天只有 3 次 admission');
+  for (const token of tokens) {
+    assert.equal(workerVm.api.cooldownInfo(token), null, `${token} 不该被冷却`);
+    assert.equal(workerVm.api.scopedCooldownInfo(token, LUNA), null, `${token}:LUNA 不该被冷却`);
+  }
 });
 
