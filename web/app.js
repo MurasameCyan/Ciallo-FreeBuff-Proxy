@@ -452,8 +452,8 @@ function quotaPoolForRow(row) {
   return String(model?.pool || '').trim().toLowerCase() || MODEL_QUOTA_POOLS[row?.model] || '';
 }
 
-// 额度展示按上游 pool 聚合。D/L/P 是池上限的紧凑摘要，已用/总量只放 title，
-// 避免一行账号被某个模型的计数冒充成整个账号额度。
+// 额度展示按上游 pool 聚合。D/L/P 给的是「还能开几次会话」：徽标只出剩余数，
+// 上限和已用放 title。只按 pool 汇总，避免一行账号被某个模型的计数冒充成整个账号额度。
 function quotaRows(probe) {
   if (!probe || !Array.isArray(probe.quota)) return [];
   return probe.quota.filter((q) => {
@@ -471,7 +471,7 @@ function accountQuotaSummary(probe) {
   const pools = new Map();
   for (const row of quotaRows(probe)) {
     const pool = quotaPoolForRow(row);
-    if (!['deepseek_pro', 'luna', 'premium'].includes(pool)) continue;
+    if (!['deepseek_pro', 'luna', 'premium', 'limited'].includes(pool)) continue;
     const limit = Number(row.limit);
     const usedValue = row.used ?? row.recentCount;
     const used = Number.isFinite(Number(usedValue)) ? Number(usedValue) : null;
@@ -490,14 +490,22 @@ function accountQuotaSummary(probe) {
     ['deepseek_pro', 'D'],
     ['luna', 'L'],
     ['premium', 'P'],
+    // accessTier=limited 的号只有这一个池（上游 poolLabel "Daily"，只覆盖 flash/mimo）。
+    // 不列出来的话这类账号整行没有任何剩余数字，看起来像探测失败。
+    ['limited', 'Ltd'],
   ];
   const parts = [];
   const details = [];
   for (const [pool, label] of poolOrder) {
     const row = pools.get(pool);
     if (!row) continue;
-    parts.push(`${label}${row.limit}`);
-    details.push(`${label} ${row.used == null ? '—' : row.used}/${row.limit}`);
+    // 上游 rateLimitsByModel 只给 recentCount，remaining 一直是 null，所以剩余现算。
+    // recentCount 是 0.1 粒度的小数，直接相减会冒出 5-3.7=1.2999999999999998 这种浮点渣，
+    // 所以按 0.1 归整。ponytail: 已用未知就显示 ?，不猜成满额；上游哪天真给 remaining 再优先读它。
+    const round1 = (v) => Math.round(v * 10) / 10;
+    const left = row.used == null ? null : Math.max(0, round1(row.limit - row.used));
+    parts.push(`${label}${left == null ? '?' : left}`);
+    details.push(`${label} 剩 ${left == null ? '—' : left} / 已用 ${row.used == null ? '—' : round1(row.used)} / 上限 ${row.limit}`);
   }
   if (!parts.length) return null;
   return { text: `( ${parts.join(' ')} )`, title: `额度 ${details.join(' · ')}` };

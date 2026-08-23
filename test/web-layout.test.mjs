@@ -201,7 +201,9 @@ assert.ok(!app.includes('tokenShort'),
 assert.match(app, /function accountQuotaSummary\(probe\)[\s\S]*?deepseek_pro[\s\S]*?luna[\s\S]*?premium/s,
   '账号额度必须按上游 pool 聚合为 D4P / Luna / Premium 三个独立池');
 assert.match(app, /`\( \$\{parts\.join\(' '\)\} \)`/,
-  '账号名后必须紧凑呈现 ( D1 L1 P5 ) 形式的池容量');
+  '账号名后必须紧凑呈现 ( D1 L0 P2 ) 形式的剩余可开会话数');
+assert.doesNotMatch(app, /parts\.push\([^)]*\/\$\{row\.limit\}/,
+  '徽标只显示剩余，上限只出现在 title 里');
 assert.doesNotMatch(app, /function accountUsage\(/,
   '不得再从所有模型行里取一个最大 used/limit 冒充账号总额度');
 assert.match(app, /class="acct-usage"/, '账号名后必须有 acct-usage 承载用量');
@@ -449,8 +451,8 @@ assert.deepEqual(
     { model: 'deepseek/deepseek-v4-flash', used: 3, limit: 5, pool: 'premium' },
     { model: 'meta/muse-spark-1.2-contributor', used: 3, limit: 5, pool: 'premium' },
   ] }))),
-  { text: '( D1 L1 P5 )', title: '额度 D 1/1 · L 1/1 · P 3/5' },
-  'D/L/P 摘要必须按 pool 去重，Premium 多模型行只显示一个 P5',
+  { text: '( D0 L0 P2 )', title: '额度 D 剩 0 / 已用 1 / 上限 1 · L 剩 0 / 已用 1 / 上限 1 · P 剩 2 / 已用 3 / 上限 5' },
+  'D/L/P 摘要必须按 pool 去重，Premium 多模型行只显示一个 P',
 );
 assert.deepEqual(
   JSON.parse(JSON.stringify(helperVm.__modelUi.accountQuotaSummary({ quota: [
@@ -458,7 +460,7 @@ assert.deepEqual(
     { model: 'openai/gpt-5.6-luna', used: 0, limit: 1, pool: 'luna' },
     { model: 'deepseek/deepseek-v4-flash', used: 1, limit: 4, pool: 'premium' },
   ] }))),
-  { text: '( D1 L1 P4 )', title: '额度 D 0/1 · L 0/1 · P 1/4' },
+  { text: '( D1 L1 P3 )', title: '额度 D 剩 1 / 已用 0 / 上限 1 · L 剩 1 / 已用 0 / 上限 1 · P 剩 3 / 已用 1 / 上限 4' },
   'P 值必须读取上游 Premium 池 limit，不能写死为 5',
 );
 // 2026-08-23 线上实测：DS4P 的 deepseek_pro 独立池已被上游删除，V4 Pro 与 Flash
@@ -468,7 +470,7 @@ assert.deepEqual(
     { model: 'deepseek/deepseek-v4-flash', used: null, limit: 7, pool: 'premium' },
     { model: 'deepseek/deepseek-v4-pro', used: 2, limit: 5, pool: 'premium' },
   ] }))),
-  { text: '( P5 )', title: '额度 P 2/5' },
+  { text: '( P3 )', title: '额度 P 剩 3 / 已用 2 / 上限 5' },
   'Premium 行异常不一致时必须保守取最小 limit，并优先显示已知 used',
 );
 assert.deepEqual(
@@ -476,8 +478,45 @@ assert.deepEqual(
     { model: 'deepseek/deepseek-v4-flash', used: 0, limit: 0, pool: 'premium' },
     { model: 'deepseek/deepseek-v4-pro', used: 2, limit: 5, pool: 'premium' },
   ] }))),
-  { text: '( P0 )', title: '额度 P 2/0' },
+  { text: '( P0 )', title: '额度 P 剩 0 / 已用 2 / 上限 0' },
   'Premium 同池出现 0 与正数冲突时，UI 必须与 worker 一样保守，不能丢掉 0 后显示 P5',
+);
+// 2026-08-23 线上实测形状：luna 池打满（3/3），premium 池按半次计费出现小数。
+// 剩余必须原样给小数，四舍五入会把「还能开」说成「不能开」或反过来。
+assert.deepEqual(
+  JSON.parse(JSON.stringify(helperVm.__modelUi.accountQuotaSummary({ quota: [
+    { model: 'openai/gpt-5.6-luna', used: 3, limit: 3, pool: 'luna' },
+    { model: 'deepseek/deepseek-v4-flash', used: 2.5, limit: 5, pool: 'premium' },
+  ] }))),
+  { text: '( L0 P2.5 )', title: '额度 L 剩 0 / 已用 3 / 上限 3 · P 剩 2.5 / 已用 2.5 / 上限 5' },
+  '打满的池必须显示剩余 0，小数用量不得被取整',
+);
+// 2026-08-23 线上实测：premium limit 5 / used 3.7 直接相减是 1.2999999999999998，
+// 徽标必须按 0.1 粒度归整，否则账号行会甩出一串浮点渣。
+assert.deepEqual(
+  JSON.parse(JSON.stringify(helperVm.__modelUi.accountQuotaSummary({ quota: [
+    { model: 'deepseek/deepseek-v4-pro', used: 3.7, limit: 5, pool: 'premium' },
+  ] }))),
+  { text: '( P1.3 )', title: '额度 P 剩 1.3 / 已用 3.7 / 上限 5' },
+  '小数剩余必须归整到 0.1，不能出现 1.2999999999999998',
+);
+// accessTier=limited 的号只有 pool="limited"（poolLabel Daily，只覆盖 flash/mimo）。
+// 不认这个池会让这类账号整行没有剩余数字，看着像探测失败。
+assert.deepEqual(
+  JSON.parse(JSON.stringify(helperVm.__modelUi.accountQuotaSummary({ quota: [
+    { model: 'deepseek/deepseek-v4-flash', used: 0.2, limit: 6, pool: 'limited' },
+    { model: 'mimo/mimo-v2.5', used: 0.2, limit: 6, pool: 'limited' },
+    { model: 'z-ai/glm-5.2', used: 0, limit: 0, pool: 'glm' },
+  ] }))),
+  { text: '( Ltd5.8 )', title: '额度 Ltd 剩 5.8 / 已用 0.2 / 上限 6' },
+  'limited 档账号必须显示 Daily 池剩余，不能整行空白',
+);
+assert.deepEqual(
+  JSON.parse(JSON.stringify(helperVm.__modelUi.accountQuotaSummary({ quota: [
+    { model: 'deepseek/deepseek-v4-flash', used: null, limit: 5, pool: 'premium' },
+  ] }))),
+  { text: '( P? )', title: '额度 P 剩 — / 已用 — / 上限 5' },
+  '已用未知时不得把剩余猜成满额',
 );
 // god-only（官方 FREEBUFF_WEB_GOD_ONLY_MODELS）行必须整行丢掉：普通账号一定调不通，
 // 把它算进 premium 摘要只会让面板显示一个永远用不到的额度。
@@ -493,7 +532,7 @@ assert.deepEqual(
     { model: 'deepseek/deepseek-v4-flash', used: 1, limit: 4, pool: 'premium' },
     { model: 'crof/kimi-k3-eco', used: 3, limit: 9, pool: 'premium' },
   ] }))),
-  { text: '( P4 )', title: '额度 P 1/4' },
+  { text: '( P3 )', title: '额度 P 剩 3 / 已用 1 / 上限 4' },
   'god-only 行不得参与同池保守取值，否则会污染真实 Premium 数字',
 );
 assert.equal(
@@ -508,7 +547,7 @@ assert.deepEqual(
   JSON.parse(JSON.stringify(helperVm.__modelUi.accountQuotaSummary({ quota: [
     { model: 'deepseek/deepseek-v4-pro', used: 2, limit: 5 },
   ] }))),
-  { text: '( P5 )', title: '额度 P 2/5' },
+  { text: '( P3 )', title: '额度 P 剩 3 / 已用 2 / 上限 5' },
   '账号行缺少 pool 时必须使用模型目录的实时 pool，而不是静态 DS4P 归属',
 );
 assert.match(
