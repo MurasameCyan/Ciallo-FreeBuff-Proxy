@@ -53,6 +53,9 @@ jobs:
       - run: node --test test/server-api.test.mjs
       - run: node test/proxy.test.mjs
       - run: node --test test/usage-persistence.test.mjs
+      - run: node --test test/model-unavailable-gate.test.mjs
+      - run: node --test test/model-switch-parallel.test.mjs
+      - run: node --test test/stream-convergence.test.mjs
       - run: node test/web-layout.test.mjs
 
   build:

@@ -2793,6 +2793,58 @@ const SESSION_TIMEOUT_MS = 10000;  // session/run 等短交互更快失败
 // 额度仍在时不 abort、不切号，继续等待上游。
 const STREAM_NO_DATA_PROBE_DELAY_MS = 20000;
 
+// 流式收敛护栏（思考循环兜底）。上游一旦陷入推理自环，连接会一直活着、字节一直在流，
+// 客户端 signal 不动就没人喊停 —— 账号租约被无限占用。这里只做两条纯收敛判据，
+// 不解析内容、不改正常路径：
+//   - 空闲：连续 STREAM_IDLE_TIMEOUT_MS 没有任何字节 → 判定卡死
+//   - 总时长：超过 STREAM_MAX_DURATION_MS → 判定失控
+// 两者都按"优雅结束"处理：cancel 上游 reader 并正常 close 下游，让既有 pipe 的
+// finally 照常跑完（记账 + releaseToken + [DONE]/response.completed）。
+// ponytail: 时长上限是钝器 —— 它拦得住"一直吐推理"的自环，但也会截断真正需要
+// 超过 10 分钟的单次回答。真正精确的判据是"只出 reasoning、零 content 且超过 N
+// 字符"，那需要在护栏里再解析一遍 SSE；等出现被误伤的实例再升级。
+const STREAM_IDLE_TIMEOUT_MS = 60000;
+const STREAM_MAX_DURATION_MS = 600000;
+
+function guardStreamConvergence(body, label = "", opts = {}) {
+  if (!body || typeof body.getReader !== "function") return body;
+  const idleMs = Number.isFinite(opts.idleMs) ? opts.idleMs : STREAM_IDLE_TIMEOUT_MS;
+  const maxMs = Number.isFinite(opts.maxMs) ? opts.maxMs : STREAM_MAX_DURATION_MS;
+  const reader = body.getReader();
+  const startedAt = Date.now();
+  return new ReadableStream({
+    async pull(controller) {
+      let timer = null;
+      const idle = new Promise((resolve) => {
+        timer = setTimeout(() => resolve({ __guard: "idle" }), idleMs);
+      });
+      let next;
+      try {
+        next = await Promise.race([reader.read(), idle]);
+      } finally {
+        if (timer !== null) clearTimeout(timer);
+      }
+      if (next && next.__guard === "idle") {
+        console.warn(`[stream-guard] idle >${idleMs}ms, closing${label ? " " + label : ""}`);
+        try { await reader.cancel(new Error("stream idle timeout")); } catch {}
+        controller.close();
+        return;
+      }
+      if (next.done) { controller.close(); return; }
+      if (Date.now() - startedAt > maxMs) {
+        console.warn(`[stream-guard] exceeded ${maxMs}ms, closing${label ? " " + label : ""}`);
+        try { await reader.cancel(new Error("stream duration cap")); } catch {}
+        controller.close();
+        return;
+      }
+      controller.enqueue(next.value);
+    },
+    async cancel(reason) {
+      try { await reader.cancel(reason); } catch {}
+    },
+  });
+}
+
 // ── 出站 header 清洗 + 请求抖动（轻量 stealth，v1.9.1）──────────────────
 // 纯应用层隐身：规范化出站 header（不留代理特征）、给串行队列的请求间隔加
 // 轻微随机抖动（降低被上游按"恒定节奏批量请求"风控的概率）。
@@ -3413,6 +3465,13 @@ function normalizeMessages(messages) {
   for (const m of messages) {
     if (!m || typeof m !== "object") continue;
     const item = { ...m };
+    // 历史里的思考痕迹绝不回灌上游。DeepSeek 官方要求多轮请求不要带回上一轮的
+    // reasoning_content：模型看到自己上一轮未收束的思考，会倾向接着想下去，这是
+    // ds4p/ds4f 思考循环在第二轮更易复现的原因。Anthropic 入站（anthropicText 只留
+    // type==="text"）和 Responses 入站（显式 skip reasoning 条目）本来就不带，这里
+    // 把 OpenAI 这条路径对齐。reasoning_used_as_content 是我们自己打的标记，同样不外发。
+    delete item.reasoning_content;
+    delete item.reasoning_used_as_content;
     if (item.role === "developer") item.role = "system";
     if (item.role === "system") {
       hasSystem = true;
@@ -3887,8 +3946,9 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode, requestSig
             await finalize(info);
           } finally { releaseToken(token); }
         };
-        if (mode === "responses") pipeUpstreamToResponsesStream(resp.body, writable, mc, onDone);
-        else pipeUpstreamToClient(resp.body, writable, onDone, !!chatParams?.stream_options?.include_usage);
+        const guardedBody = guardStreamConvergence(resp.body, mc.id);
+        if (mode === "responses") pipeUpstreamToResponsesStream(guardedBody, writable, mc, onDone);
+        else pipeUpstreamToClient(guardedBody, writable, onDone, !!chatParams?.stream_options?.include_usage);
         leaseTransferred = true;
         return new Response(readable, {
           status: 200,
@@ -4198,8 +4258,9 @@ async function executeChatPooled(env, chatParams, mc, isStream, mode, requestSig
             releaseToken(token);
           }
         };
-        if (mode === "responses") pipeUpstreamToResponsesStream(resp.body, writable, mc, onDone);
-        else pipeUpstreamToClient(resp.body, writable, onDone, !!chatParams?.stream_options?.include_usage);
+        const guardedBody = guardStreamConvergence(resp.body, mc.id);
+        if (mode === "responses") pipeUpstreamToResponsesStream(guardedBody, writable, mc, onDone);
+        else pipeUpstreamToClient(guardedBody, writable, onDone, !!chatParams?.stream_options?.include_usage);
         leaseTransferred = true;
         return new Response(readable, { status: 200, headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", ...corsHeaders() } });
       }
@@ -4802,9 +4863,12 @@ async function streamToNonStream(upstreamBody, upstreamModel) {
     }
   }
   const msg = { role: "assistant", content };
-  if (reasoning && !content) { msg.content = reasoning; msg.reasoning_used_as_content = true; }
-  else if (reasoning) msg.reasoning_content = reasoning;
+  if (reasoning) msg.reasoning_content = reasoning;
+  // 只有思考、没有正文、也没有工具调用 = 这一轮被截断在思考阶段（思考循环撞上收敛护栏就是这个形态）。
+  // 旧行为把未完成的思考塞进 content 冒充答案，客户端下一轮会把它当助手发言回传，模型接着想 —— 放大循环。
+  // 改用标准字段表达：content 留空 + finish_reason=length，思考只留在 reasoning_content 里。
   if (toolItems.size) msg.tool_calls = [...toolItems.values()];
+  if (reasoning && !content && !toolItems.size) finishReason = "length";
   return {
     id: id || "gen_" + Date.now(),
     object: "chat.completion",

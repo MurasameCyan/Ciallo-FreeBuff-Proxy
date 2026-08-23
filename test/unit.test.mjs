@@ -495,6 +495,74 @@ await tAsync('Chat 非流式：usage-only 块不能被 choices 判空丢掉', as
   if (out.choices?.[0]?.message?.content !== 'hi') throw new Error('正文被丢: ' + JSON.stringify(out.choices));
 });
 
+// ---------------------------------------------------------------------------
+// 思考阶段被截断的表达（选项 2 完整形态）。只有 reasoning、没有 content、也没有
+// 工具调用，就是这一轮被截断在思考里 —— 思考循环撞上收敛护栏正是这个形态。
+function buildReasoningOnlyStream() {
+  return new ReadableStream({
+    start(controller) {
+      const enc = new TextEncoder();
+      controller.enqueue(enc.encode('data: ' + JSON.stringify({
+        id: 'chatcmpl-r', model: 'deepseek/deepseek-v4-pro',
+        choices: [{ index: 0, delta: { reasoning_content: '让我想想…' }, finish_reason: null }],
+      }) + '\n\n'));
+      controller.enqueue(enc.encode('data: ' + JSON.stringify({
+        id: 'chatcmpl-r', model: 'deepseek/deepseek-v4-pro',
+        choices: [{ index: 0, delta: { reasoning_content: '再想想…' }, finish_reason: null }],
+      }) + '\n\ndata: [DONE]\n\n'));
+      controller.close();
+    },
+  });
+}
+
+await tAsync('只有思考没有正文：content 留空、思考进 reasoning_content、finish_reason=length', async () => {
+  const out = await streamToNonStream(buildReasoningOnlyStream(), 'deepseek/deepseek-v4-pro');
+  const choice = out.choices?.[0];
+  if (choice.message.content !== '') throw new Error('思考不得冒充正文，content=' + JSON.stringify(choice.message.content));
+  if (choice.message.reasoning_content !== '让我想想…再想想…') throw new Error('思考应留在 reasoning_content: ' + JSON.stringify(choice.message.reasoning_content));
+  if (choice.finish_reason !== 'length') throw new Error('截断应表达为 finish_reason=length，实际 ' + choice.finish_reason);
+});
+
+await tAsync('自造字段 reasoning_used_as_content 已彻底移除', async () => {
+  const out = await streamToNonStream(buildReasoningOnlyStream(), 'deepseek/deepseek-v4-pro');
+  if ('reasoning_used_as_content' in out.choices[0].message) throw new Error('仍在下发自造字段');
+});
+
+await tAsync('思考 + 正文都有时：正文照常、finish_reason 不被改写', async () => {
+  const stream = new ReadableStream({
+    start(controller) {
+      const enc = new TextEncoder();
+      controller.enqueue(enc.encode('data: ' + JSON.stringify({
+        id: 'c', model: 'm',
+        choices: [{ index: 0, delta: { reasoning_content: '想', content: '答' }, finish_reason: 'stop' }],
+      }) + '\n\ndata: [DONE]\n\n'));
+      controller.close();
+    },
+  });
+  const out = await streamToNonStream(stream, 'deepseek/deepseek-v4-pro');
+  const choice = out.choices[0];
+  if (choice.message.content !== '答') throw new Error('正文被改: ' + choice.message.content);
+  if (choice.message.reasoning_content !== '想') throw new Error('思考丢失');
+  if (choice.finish_reason !== 'stop') throw new Error('正常回答的 finish_reason 被改成 ' + choice.finish_reason);
+});
+
+await tAsync('只有思考但带工具调用时不算截断（工具调用就是这轮的产出）', async () => {
+  const stream = new ReadableStream({
+    start(controller) {
+      const enc = new TextEncoder();
+      controller.enqueue(enc.encode('data: ' + JSON.stringify({
+        id: 'c', model: 'm',
+        choices: [{ index: 0, delta: { reasoning_content: '该调工具', tool_calls: [{ index: 0, id: 'call_x', type: 'function', function: { name: 'f', arguments: '{}' } }] }, finish_reason: 'tool_calls' }],
+      }) + '\n\ndata: [DONE]\n\n'));
+      controller.close();
+    },
+  });
+  const out = await streamToNonStream(stream, 'deepseek/deepseek-v4-pro');
+  const choice = out.choices[0];
+  if (choice.finish_reason !== 'tool_calls') throw new Error('有工具调用不该判成 length，实际 ' + choice.finish_reason);
+  if (choice.message.tool_calls?.[0]?.id !== 'call_x') throw new Error('tool_calls 丢失');
+});
+
 await tAsync('Anthropic 流式：usage-only 块转成 message_delta.usage', async () => {
   const piped = new Response(buildUsageOnlyStream()).body.pipeThrough(anthropicStream({ id: 'deepseek/deepseek-v4-pro' }));
   const events = parseSseData(await new Response(piped).text());
