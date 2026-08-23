@@ -66,6 +66,7 @@ const ICONS = {
   eye: '<path d="M1.5 12S5 5.5 12 5.5 22.5 12 22.5 12 19 18.5 12 18.5 1.5 12 1.5 12Z"/><circle cx="12" cy="12" r="3"/>',
   eyeOff: '<path d="M4 4l16 16"/><path d="M9.9 5.9A9.6 9.6 0 0 1 12 5.5c7 0 10.5 6.5 10.5 6.5a18 18 0 0 1-3.3 4.1"/><path d="M6.4 7.7A17.8 17.8 0 0 0 1.5 12S5 18.5 12 18.5a9.7 9.7 0 0 0 3.6-.66"/><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2"/>',
   route: '<circle cx="6" cy="19" r="3"/><path d="M9 19h8.5a3.5 3.5 0 0 0 0-7h-11a3.5 3.5 0 0 1 0-7H15"/><circle cx="18" cy="5" r="3"/>',
+  refresh: '<path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/>',
 };
 
 function iconSvg(icon, size = 15) {
@@ -616,10 +617,41 @@ function accountEgressSummary(account) {
   const node = egress.currentNode || (egress.mode === 'manual' ? '未设置' : accountEgressStateLabel(egress.state));
   const failed = egress.error || ['error', 'failed', 'unavailable', 'proxy_offline', 'rejected'].includes(egress.state);
   const title = [mode, egress.currentNode, egress.error || egress.reject?.state].filter(Boolean).join(' · ');
+  // 「自动」右边的行内刷新：点一下走弹窗保存同款 PATCH（auto 服务端带 force 重选节点）。
+  // 手动模式节点是固定的，没有可探测的东西；只读模式整列操作都已禁掉。
+  const rechecking = egressRechecking.has(account.key);
+  const recheck = !S.readonly && egress.mode === 'auto'
+    ? `<button type="button" class="account-egress-recheck${rechecking ? ' spin' : ''}" data-egress-refresh="${esc(account.key)}" title="立即重新检测该账号的自动出站节点" aria-label="重新检测出站节点"${rechecking ? ' disabled' : ''}>${iconSvg('refresh', 12)}</button>`
+    : '';
   return `<div class="account-egress-summary ${failed ? 'error' : egress.currentNode ? 'ready' : 'pending'}" title="${esc(title || `${mode} · ${node}`)}">
-    <span class="account-egress-mode-label">${mode}</span>
+    <span class="account-egress-mode-row"><span class="account-egress-mode-label">${mode}</span>${recheck}</span>
     <span class="account-egress-node mono">${esc(node)}</span>
   </div>`;
+}
+
+// 行内「重新检测」进行中的账号 key。轮询重渲染会整体重建表格行，
+// 用它让转圈/disabled 态跨渲染存活，而不是绑死在某一次生成的 DOM 上。
+const egressRechecking = new Set();
+
+async function recheckAccountEgress(key) {
+  const acct = S.accounts.find((item) => item.key === key);
+  if (!acct || S.readonly || egressRechecking.has(key)) return;
+  egressRechecking.add(key);
+  renderAccounts();
+  try {
+    const r = await api('/accounts/' + encodeURIComponent(key), {
+      method: 'PATCH',
+      body: JSON.stringify({ egressMode: 'auto', egressNode: '' }),
+    });
+    if (r?.egress) S.accountEgress[key] = r.egress;
+    const node = r?.egress?.currentNode;
+    toast(node ? `已重测出站节点,当前 ${node}` : '已重测出站节点', 'ok');
+  } catch (e) {
+    toast(`重新检测失败:${e.message}`, 'err');
+  } finally {
+    egressRechecking.delete(key);
+    renderAccounts();
+  }
 }
 
 function proxyNodesForAccount() {
@@ -747,6 +779,11 @@ function renderAccounts() {
   // 轮询（每小时）和概况区的立即刷新一起更新，手动逐个探测是多余的一层
   $('acctBody').querySelectorAll('[data-egress]').forEach((button) =>
     button.addEventListener('click', () => openAccountEgress(button.dataset.egress)));
+  $('acctBody').querySelectorAll('[data-egress-refresh]').forEach((button) =>
+    button.addEventListener('click', (event) => {
+      event.stopPropagation();
+      recheckAccountEgress(button.dataset.egressRefresh);
+    }));
   $('acctBody').querySelectorAll('[data-del]').forEach(b =>
     b.addEventListener('click', async () => {
       const key = b.dataset.del;

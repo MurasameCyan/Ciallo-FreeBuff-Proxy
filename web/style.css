@@ -453,7 +453,23 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
   display: grid; gap: 2px; min-width: 92px; max-width: 150px;
   line-height: 1.25;
 }
+/* 「自动」标签 + 行内重测图标同一行；按钮贴着标签，不撑宽列 */
+.account-egress-mode-row {
+  display: flex; align-items: center; gap: 5px; min-width: 0;
+}
 .account-egress-mode-label { font-size: 11px; color: var(--fg); }
+.account-egress-recheck {
+  display: inline-grid; place-items: center;
+  width: 18px; height: 18px; padding: 0;
+  border: none; border-radius: 5px;
+  background: transparent; color: var(--fg-2);
+  cursor: pointer; opacity: .55;
+  transition: background .13s, color .13s, opacity .13s;
+}
+.account-egress-recheck:hover:not(:disabled) { background: var(--line); color: var(--fg); opacity: 1; }
+.account-egress-recheck:disabled { cursor: default; opacity: .55; }
+.account-egress-recheck svg { pointer-events: none; }
+.account-egress-recheck.spin svg { animation: spin .9s linear infinite; }
 .account-egress-node {
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }

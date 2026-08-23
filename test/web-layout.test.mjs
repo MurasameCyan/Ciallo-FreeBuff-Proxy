@@ -289,6 +289,24 @@ assert.match(css, /\.account-egress-summary\s*\{[^}]*display:\s*grid/s,
   '账号行出站摘要必须紧凑分两行，不能挤占可用模型列');
 assert.match(css, /\.account-egress-modal \.modal-box\s*\{[^}]*width:\s*min\(/s,
   '账号出站弹窗必须有稳定的响应式宽度');
+// ── 出站摘要行内「重测」按钮 ──────────────────────────────
+assert.match(app, /refresh:\s*'<[\s\S]*?'/,
+  '行内重测图标必须进统一图标集，不得在渲染处内联散落 svg');
+assert.match(app, /iconSvg\('refresh',\s*12\)/,
+  '出站摘要的刷新按钮必须复用统一图标集里的 refresh 线框图标');
+assert.match(app, /!S\.readonly\s*&&\s*egress\.mode === 'auto'/,
+  '只读模式和手动模式都不得渲染行内重测按钮（手动节点是固定的）');
+assert.match(app, /data-egress-refresh="\$\{esc\(account\.key\)\}"/,
+  '行内重测按钮必须携带账号 key 供事件委托定位');
+assert.match(app, /const egressRechecking = new Set\(\)/,
+  '轮询会整体重建表格行，重测进行中的转圈态必须用 key 集合跨渲染存活');
+assert.match(app, /recheckAccountEgress[\s\S]*?if \(!acct \|\| S\.readonly \|\| egressRechecking\.has\(key\)\) return;/,
+  '同一账号的重测请求必须互斥，连点不得叠加上游探测');
+assert.match(app,
+  /recheckAccountEgress[\s\S]*?method:\s*'PATCH'[\s\S]*?JSON\.stringify\(\{\s*egressMode:\s*'auto',\s*egressNode:\s*''\s*\}\)/s,
+  '行内重测必须走弹窗保存同款 PATCH（服务端对 auto 强制重选节点），不得另开接口');
+assert.match(app, /if \(r\?\.egress\) S\.accountEgress\[key\] = r\.egress/,
+  '重测成功必须立即用响应里的单账号 egress 状态回填，不等下一拍轮询');
 // 授权链接显示框：框内是「可点开的链接文字 + 纯图标复制按钮」两颗 button，
 // 框自身必须是 div —— button 套 button 是非法 HTML，浏览器会把内层拆出去。
 assert.match(html, /<div class="login-url" id="loginUrl" hidden>/,
