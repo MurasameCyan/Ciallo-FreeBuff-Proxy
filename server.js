@@ -811,7 +811,9 @@ async function configureAccountEgress(account, {
           timeoutMs: ACCOUNT_EGRESS_PROBE_TIMEOUT_MS,
           queueKey: account.key,
         });
-        if (['banned', 'token_invalid', 'manual_disabled'].includes(probe.state)) {
+        // allowTerminal 的整个意义就是「明知是终态也要探一次上游」——管理面板要看真实状态，
+        // 也是上游解封后自动恢复的唯一路径。这里漏了这个守卫，banned 号的管理探测会被自己挡回 503。
+        if (!allowTerminal && ['banned', 'token_invalid', 'manual_disabled'].includes(probe.state)) {
           throw Object.assign(new Error('账号已进入终态'), { code: 'ACCOUNT_EGRESS_TERMINAL' });
         }
         if (!allowTerminal && isTerminalAccount(account)) {
