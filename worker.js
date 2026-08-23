@@ -3513,6 +3513,10 @@ function buildUpstreamPayload(params, mc, sess, runId) {
   payload.model = mc.upstream;
   payload.messages = normalizeMessages(params.messages);
   payload.stream = true;
+  // 上游永远是流式（见上一行），而流式只有显式 include_usage 才会在末尾发 usage 块。
+  // 不带它 → 调用日志和概况/Key 累计全部记 0 token（成功但 0 消耗）。客户端自己
+  // 有没有要 usage 是另一回事，透传时再按客户端口径决定要不要把这个块发下去。
+  payload.stream_options = { ...(payload.stream_options || {}), include_usage: true };
   if (!payload.stop) payload.stop = ['"cb_easp"'];
   payload.provider = { data_collection: "deny" };
   // 工具集签名：Freebuff 对「带 tools 但无官方专属工具名」的请求会判定为
@@ -3884,7 +3888,7 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode, requestSig
           } finally { releaseToken(token); }
         };
         if (mode === "responses") pipeUpstreamToResponsesStream(resp.body, writable, mc, onDone);
-        else pipeUpstreamToClient(resp.body, writable, onDone);
+        else pipeUpstreamToClient(resp.body, writable, onDone, !!chatParams?.stream_options?.include_usage);
         leaseTransferred = true;
         return new Response(readable, {
           status: 200,
@@ -4195,7 +4199,7 @@ async function executeChatPooled(env, chatParams, mc, isStream, mode, requestSig
           }
         };
         if (mode === "responses") pipeUpstreamToResponsesStream(resp.body, writable, mc, onDone);
-        else pipeUpstreamToClient(resp.body, writable, onDone);
+        else pipeUpstreamToClient(resp.body, writable, onDone, !!chatParams?.stream_options?.include_usage);
         leaseTransferred = true;
         return new Response(readable, { status: 200, headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", ...corsHeaders() } });
       }
@@ -4696,7 +4700,10 @@ function writerClosedSignal(writer) {
 }
 
 // 流式：把上游 SSE 剥 {data:...} 包装后透传
-function pipeUpstreamToClient(upstreamBody, writable, onComplete) {
+// wantUsage：客户端自己有没有要 stream_options.include_usage。上游一律带 include_usage
+// （为了记账），所以没要的客户端要把末尾那个 choices:[] 的 usage 块过滤掉 —— 按 OpenAI
+// 语义它本不该出现，只认 chunk.choices[0] 的客户端会当场炸。
+function pipeUpstreamToClient(upstreamBody, writable, onComplete, wantUsage = false) {
   const reader = upstreamBody.getReader();
   const writer = writable.getWriter();
   const closed = writerClosedSignal(writer);
@@ -4725,6 +4732,8 @@ function pipeUpstreamToClient(upstreamBody, writable, onComplete) {
                 if (d && (d.content || d.reasoning_content)) firstTokenAt = Date.now();
               }
               if (normalized?.usage) usage = normalized.usage;
+              // usage-only 块（choices 为空）：记账已经收下了，客户端没要就别下发。
+              if (!wantUsage && normalized?.usage && !normalized?.choices?.length) continue;
               await writer.write(encoder.encode("data: " + JSON.stringify(normalized) + "\n\n"));
             } catch { await writer.write(encoder.encode(line + "\n")); }
           } else {
@@ -4761,6 +4770,9 @@ async function streamToNonStream(upstreamBody, upstreamModel) {
       if (payload === "" || payload === "[DONE]") continue;
       try {
         const obj = unwrapData(JSON.parse(payload));
+        // usage 必须在 choices 判空之前收：include_usage 的末尾块只有 usage、choices 是空数组，
+        // 放到 !choice 之后就永远读不到（成功调用记 0 token 的根因之一）。
+        if (obj?.usage) usage = obj.usage;
         const choice = obj?.choices?.[0];
         if (!choice) continue;
         const delta = choice.delta || {};
@@ -4931,6 +4943,8 @@ function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onComplete) {
           if (payload === "" || payload === "[DONE]") continue;
           try {
             const obj = unwrapData(JSON.parse(payload));
+            // 同 streamToNonStream：usage-only 末尾块的 choices 是空数组，先收 usage 再判空。
+            if (obj?.usage) usage = obj.usage;
             const choice = obj?.choices?.[0];
             if (!choice) continue;
             const delta = choice.delta || {};
@@ -5060,6 +5074,9 @@ async function responsesToNonStream(upstreamBody, mc) {
       if (payload === "" || payload === "[DONE]") continue;
       try {
         const obj = unwrapData(JSON.parse(payload));
+        // usage 必须在 choices 判空之前收：include_usage 的末尾块只有 usage、choices 是空数组，
+        // 放到 !choice 之后就永远读不到（成功调用记 0 token 的根因之一）。
+        if (obj?.usage) usage = obj.usage;
         const choice = obj?.choices?.[0];
         if (!choice) continue;
         const delta = choice.delta || {};

@@ -8,7 +8,7 @@ const src = readFileSync(new URL('../worker.js', import.meta.url), 'utf-8');
 // 使内部函数在沙箱全局可见，供单测直接调用。
 const wrapper = src.replace('export default {', 'const __workerDefault__ = {') +
   '\n\nglobalThis.__workerDefault__ = __workerDefault__;\n' +
-  'globalThis.__unitTestApi__ = { normalizeChatThinking, anthropicThinkingToEffort, namedEffort, normalizeReasoningEffort, collectReasoningTexts, anthropicStopReason, anthropicModelToOpenAI, parseModelAliases, resolveModelAlias, resolveModelConfig, findModelConfig, setTestAliases: (raw) => { currentAliases = parseModelAliases(raw); }, setTestDynamicModels: (models) => { dynamicModelsCache = { fetchedAt: Date.now(), models, pool: { premium: new Set(), standard: null, glm: new Set() } }; }, cooldown, cooldownInfo, inCooldown, parseCooldown, nextPacificMidnight: typeof nextPacificMidnight === "function" ? nextPacificMidnight : null, pickToken, releaseToken: typeof releaseToken === "function" ? releaseToken : null, accountPoolExhaustion: typeof accountPoolExhaustion === "function" ? accountPoolExhaustion : null, waitingRoomResponse: typeof waitingRoomResponse === "function" ? waitingRoomResponse : null, pipeUpstreamToClient, pipeUpstreamToResponsesStream, anthropicStream, streamToNonStream, anthropicFromChat, responsesToNonStream, markSessionInvalidated, wasRecentlyInvalidated, singleFlight, sessionRemainingMs, INVALIDATION_WINDOW_MS, SESSION_REUSE_SAFE_MS, SESSION_VERIFY_WINDOW_MS, executeChat, readCallUsage, accountLabel, summarizeAccountHealth, logCall, callLogSnapshot, readUsageFull, recordRequest, blankUsageTotals, recordAccountObservation, configureUsagePersistence, restoreUsageSnapshot, usageSnapshot, setTestEgressReject: (fn) => { onEgressReject = fn; }, MODEL_TIERS, handleModels };\n';
+  'globalThis.__unitTestApi__ = { normalizeChatThinking, anthropicThinkingToEffort, namedEffort, normalizeReasoningEffort, collectReasoningTexts, anthropicStopReason, anthropicModelToOpenAI, parseModelAliases, resolveModelAlias, resolveModelConfig, findModelConfig, setTestAliases: (raw) => { currentAliases = parseModelAliases(raw); }, setTestDynamicModels: (models) => { dynamicModelsCache = { fetchedAt: Date.now(), models, pool: { premium: new Set(), standard: null, glm: new Set() } }; }, cooldown, cooldownInfo, inCooldown, parseCooldown, nextPacificMidnight: typeof nextPacificMidnight === "function" ? nextPacificMidnight : null, pickToken, releaseToken: typeof releaseToken === "function" ? releaseToken : null, accountPoolExhaustion: typeof accountPoolExhaustion === "function" ? accountPoolExhaustion : null, waitingRoomResponse: typeof waitingRoomResponse === "function" ? waitingRoomResponse : null, pipeUpstreamToClient, pipeUpstreamToResponsesStream, anthropicStream, streamToNonStream, buildUpstreamPayload, anthropicFromChat, responsesToNonStream, markSessionInvalidated, wasRecentlyInvalidated, singleFlight, sessionRemainingMs, INVALIDATION_WINDOW_MS, SESSION_REUSE_SAFE_MS, SESSION_VERIFY_WINDOW_MS, executeChat, readCallUsage, accountLabel, summarizeAccountHealth, logCall, callLogSnapshot, readUsageFull, recordRequest, blankUsageTotals, recordAccountObservation, configureUsagePersistence, restoreUsageSnapshot, usageSnapshot, setTestEgressReject: (fn) => { onEgressReject = fn; }, MODEL_TIERS, handleModels };\n';
 
 // 可编程 fetch mock：测试里可替换 sandbox.fetch，返回可定制的 Response 形状
 // （worker 里用的是 { status, ok, headers, text() } 简化形状）。
@@ -30,7 +30,7 @@ sandbox.globalThis = sandbox;
 vm.createContext(sandbox);
 vm.runInContext(wrapper, sandbox);
 
-const { normalizeChatThinking, anthropicThinkingToEffort, namedEffort, normalizeReasoningEffort, collectReasoningTexts, anthropicStopReason, anthropicModelToOpenAI, parseModelAliases, resolveModelAlias, resolveModelConfig, findModelConfig, setTestAliases, setTestDynamicModels, cooldown, cooldownInfo, inCooldown, parseCooldown, nextPacificMidnight, pickToken, releaseToken, accountPoolExhaustion, waitingRoomResponse, pipeUpstreamToClient, pipeUpstreamToResponsesStream, anthropicStream, streamToNonStream, anthropicFromChat, responsesToNonStream, markSessionInvalidated, wasRecentlyInvalidated, singleFlight, sessionRemainingMs, INVALIDATION_WINDOW_MS, SESSION_REUSE_SAFE_MS, SESSION_VERIFY_WINDOW_MS, executeChat, readCallUsage, accountLabel, summarizeAccountHealth, logCall, callLogSnapshot, readUsageFull, recordRequest, blankUsageTotals, recordAccountObservation, configureUsagePersistence, restoreUsageSnapshot, usageSnapshot, setTestEgressReject, MODEL_TIERS, handleModels } = sandbox.__unitTestApi__;
+const { normalizeChatThinking, anthropicThinkingToEffort, namedEffort, normalizeReasoningEffort, collectReasoningTexts, anthropicStopReason, anthropicModelToOpenAI, parseModelAliases, resolveModelAlias, resolveModelConfig, findModelConfig, setTestAliases, setTestDynamicModels, cooldown, cooldownInfo, inCooldown, parseCooldown, nextPacificMidnight, pickToken, releaseToken, accountPoolExhaustion, waitingRoomResponse, pipeUpstreamToClient, pipeUpstreamToResponsesStream, anthropicStream, streamToNonStream, buildUpstreamPayload, anthropicFromChat, responsesToNonStream, markSessionInvalidated, wasRecentlyInvalidated, singleFlight, sessionRemainingMs, INVALIDATION_WINDOW_MS, SESSION_REUSE_SAFE_MS, SESSION_VERIFY_WINDOW_MS, executeChat, readCallUsage, accountLabel, summarizeAccountHealth, logCall, callLogSnapshot, readUsageFull, recordRequest, blankUsageTotals, recordAccountObservation, configureUsagePersistence, restoreUsageSnapshot, usageSnapshot, setTestEgressReject, MODEL_TIERS, handleModels } = sandbox.__unitTestApi__;
 
 let pass = 0, fail = 0;
 function t(name, fn) {
@@ -421,6 +421,98 @@ await tAsync('Responses 非流式工具参数聚合一次', async () => {
   const tools = response.output.filter((item) => item.type === 'function_call');
   if (tools.length !== 1) throw new Error('function_call 数量应为 1，实际 ' + tools.length);
   if (tools[0].arguments !== '{"command":"echo hello"}') throw new Error('工具参数丢失或重复: ' + tools[0].arguments);
+});
+
+// ---------------------------------------------------------------------------
+// include_usage：上游一律流式，末尾 usage 块是唯一的 token 来源
+const USAGE_BLOCK = { prompt_tokens: 11, completion_tokens: 31, total_tokens: 42 };
+
+// include_usage 的真实形状：最后一个 chunk 只有 usage，choices 是空数组。
+function buildUsageOnlyStream() {
+  return new ReadableStream({
+    start(controller) {
+      const enc = new TextEncoder();
+      controller.enqueue(enc.encode('data: ' + JSON.stringify({
+        id: 'chatcmpl-u', model: 'deepseek/deepseek-v4-pro',
+        choices: [{ index: 0, delta: { content: 'hi' }, finish_reason: null }],
+      }) + '\n\n'));
+      controller.enqueue(enc.encode('data: ' + JSON.stringify({
+        id: 'chatcmpl-u', model: 'deepseek/deepseek-v4-pro',
+        choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+      }) + '\n\n'));
+      controller.enqueue(enc.encode('data: ' + JSON.stringify({
+        id: 'chatcmpl-u', model: 'deepseek/deepseek-v4-pro', choices: [], usage: USAGE_BLOCK,
+      }) + '\n\ndata: [DONE]\n\n'));
+      controller.close();
+    },
+  });
+}
+
+async function pipeUsageOnly(startPipe) {
+  const { readable, writable } = new TransformStream();
+  let info = null;
+  startPipe(buildUsageOnlyStream(), writable, (result) => { info = result; });
+  const text = await new Response(readable).text();
+  return { info, text, events: parseSseData(text) };
+}
+
+t('上游 payload 必须带 stream_options.include_usage，否则流式全程记 0 token', () => {
+  const payload = buildUpstreamPayload({ messages: [{ role: 'user', content: 'hi' }] },
+    { id: 'deepseek/deepseek-v4-pro', upstream: 'deepseek/deepseek-v4-pro', session: 'deepseek/deepseek-v4-pro' },
+    { instanceId: 'inst-1' }, 'run-1');
+  if (payload.stream !== true) throw new Error('上游必须流式');
+  if (payload.stream_options?.include_usage !== true) throw new Error('缺少 include_usage: ' + JSON.stringify(payload.stream_options));
+});
+
+t('客户端自带的 stream_options 其它字段不被 include_usage 覆盖掉', () => {
+  const payload = buildUpstreamPayload({ messages: [], stream_options: { include_obfuscation: false } },
+    { id: 'x', upstream: 'x', session: 'x' }, { instanceId: 'i' }, 'r');
+  if (payload.stream_options.include_obfuscation !== false) throw new Error('客户端字段被丢弃');
+  if (payload.stream_options.include_usage !== true) throw new Error('include_usage 未注入');
+});
+
+await tAsync('Chat 流式：usage-only 块进记账，但客户端没要就不下发', async () => {
+  const { info, events } = await pipeUsageOnly((body, writable, onComplete) =>
+    pipeUpstreamToClient(body, writable, onComplete));
+  if (info?.usage?.total_tokens !== 42) throw new Error('记账拿不到 usage: ' + JSON.stringify(info?.usage));
+  if (events.some((e) => e.usage)) throw new Error('未请求 include_usage 的客户端收到了 usage 块');
+  if (events.some((e) => Array.isArray(e.choices) && e.choices.length === 0)) throw new Error('下发了 choices 为空的块');
+  if (events.length !== 2) throw new Error('正常内容块被误删，剩 ' + events.length);
+});
+
+await tAsync('Chat 流式：客户端要了 include_usage 就照实下发', async () => {
+  const { info, events } = await pipeUsageOnly((body, writable, onComplete) =>
+    pipeUpstreamToClient(body, writable, onComplete, true));
+  if (info?.usage?.total_tokens !== 42) throw new Error('记账拿不到 usage');
+  const usageEvents = events.filter((e) => e.usage);
+  if (usageEvents.length !== 1) throw new Error('usage 块应下发 1 次，实际 ' + usageEvents.length);
+  if (usageEvents[0].usage.total_tokens !== 42) throw new Error('usage 内容被改写');
+});
+
+await tAsync('Chat 非流式：usage-only 块不能被 choices 判空丢掉', async () => {
+  const out = await streamToNonStream(buildUsageOnlyStream(), 'deepseek/deepseek-v4-pro');
+  if (out.usage?.total_tokens !== 42) throw new Error('聚合结果 usage 为 ' + JSON.stringify(out.usage));
+  if (out.choices?.[0]?.message?.content !== 'hi') throw new Error('正文被丢: ' + JSON.stringify(out.choices));
+});
+
+await tAsync('Anthropic 流式：usage-only 块转成 message_delta.usage', async () => {
+  const piped = new Response(buildUsageOnlyStream()).body.pipeThrough(anthropicStream({ id: 'deepseek/deepseek-v4-pro' }));
+  const events = parseSseData(await new Response(piped).text());
+  const delta = events.find((e) => e.type === 'message_delta');
+  if (delta?.usage?.output_tokens !== 31) throw new Error('message_delta.usage 缺失: ' + JSON.stringify(delta));
+  const start = events.find((e) => e.type === 'message_start');
+  if (start?.message?.usage?.input_tokens == null) throw new Error('message_start 缺 input_tokens');
+});
+
+await tAsync('Responses 流式：usage-only 块进记账', async () => {
+  const { info } = await pipeUsageOnly((body, writable, onComplete) =>
+    pipeUpstreamToResponsesStream(body, writable, { id: 'deepseek/deepseek-v4-pro' }, onComplete));
+  if (info?.usage?.total_tokens !== 42) throw new Error('记账拿不到 usage: ' + JSON.stringify(info?.usage));
+});
+
+await tAsync('Responses 非流式：usage-only 块进 resp.usage', async () => {
+  const out = await responsesToNonStream(buildUsageOnlyStream(), { id: 'deepseek/deepseek-v4-pro' });
+  if (out.usage?.total_tokens !== 42) throw new Error('resp.usage 为 ' + JSON.stringify(out.usage));
 });
 
 const T = 't-integration-token';
