@@ -688,6 +688,37 @@ const ACTIVE_SESSION_LEASE_WAIT_MS = 120 * 1000;
 // 上游抖动（session/run 5xx、超时）不是账号自身的问题，换号只会白扣一份新账号的
 // 创建额度，所以先重试同一个号；用尽后才换号，保留跨账号故障转移。
 const SAME_ACCOUNT_TRANSIENT_RETRIES = 1;
+// 单个客户端请求内最多换几个账号。每换一个号都要 createSession，而建会话就是扣
+// admission 的动作 —— 旧上界是 pool.length（18），一条失败请求能连开 18 个会话，
+// 上游会把这种「秒级跨账号会话爆发」判成滥用并一次封一串（实测 2026-08-24 的
+// 07:02Z / 08:45:59Z / 08:46:10Z 三笔封禁，后两笔相隔 11 秒）。
+// 只统计「换到一个新号并建会话」：同号原地重试（retakeToken）和同号会话重建都不算，
+// 它们复用已有会话，不烧 admission。
+// ponytail: 固定小上限，不是自适应策略。代价是上游整片抖动时成功率不如试满全池；
+// 不够用就调大 FREEBUFF_MAX_ACCOUNT_SWITCHES。
+const MAX_ACCOUNT_SWITCHES = 2;
+// 换号之间的随机间隔：抹掉「N 秒内多个账号连续建会话」这个时间特征。只在真正
+// 换号时等，同号重试不等 —— 同号重试不产生新会话，没有需要打散的特征。
+const ACCOUNT_SWITCH_JITTER_MIN_MS = 800;
+const ACCOUNT_SWITCH_JITTER_MAX_MS = 2500;
+
+function maxAccountSwitches(env) {
+  // 空串陷阱同 sessionLeaseWaitMs：docker-compose 里写 `FREEBUFF_MAX_ACCOUNT_SWITCHES=`
+  // 会传进来空串，而 Number("") 是 0 —— 那会静默变成「一个号都不许换」。
+  const raw = String((env && env.FREEBUFF_MAX_ACCOUNT_SWITCHES) ?? "").trim();
+  const n = Number(raw);
+  return raw !== "" && Number.isInteger(n) && n >= 1 ? n : MAX_ACCOUNT_SWITCHES;
+}
+
+function accountSwitchJitterMs(env) {
+  // 固定值覆盖：给测试一个确定的间隔，也给运维一个按上游脾气调节的旋钮。
+  // 空串同样要当"没设"处理，否则 Number("")===0 会静默关掉抖动。
+  const raw = String((env && env.FREEBUFF_ACCOUNT_SWITCH_JITTER_MS) ?? "").trim();
+  const fixed = Number(raw);
+  if (raw !== "" && Number.isFinite(fixed) && fixed >= 0) return fixed;
+  const span = ACCOUNT_SWITCH_JITTER_MAX_MS - ACCOUNT_SWITCH_JITTER_MIN_MS;
+  return ACCOUNT_SWITCH_JITTER_MIN_MS + Math.floor(Math.random() * (span + 1));
+}
 const TERMINAL_ACCOUNT_STATES = new Set(["banned", "token_invalid", "manual_disabled"]);
 let accountStateSet = null;
 let accountStateClear = null;
@@ -3823,12 +3854,20 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode, requestSig
   const attempted = new Set();
   let pinnedToken = null; // 上游抖动后待重试的同一个号
   let sameAccountRetries = 0;
-  for (let acctTry = 0; acctTry < pool.length + SAME_ACCOUNT_TRANSIENT_RETRIES; acctTry++) {
+  const switchBudget = Math.min(maxAccountSwitches(env), pool.length);
+  let accountSwitches = 0;
+  for (let acctTry = 0; acctTry < switchBudget + SAME_ACCOUNT_TRANSIENT_RETRIES; acctTry++) {
     throwIfRequestAborted(requestSignal);
     // 上游抖动过的号优先原地重试；拿不回来（被隔离/冷却/占用）才正常选号。
     let acct = pinnedToken ? retakeToken(env, pinnedToken, mc.session) : null;
     pinnedToken = null;
     if (!acct) {
+      // 换号计数只在这里：pinnedToken 命中走的是同号原地重试，复用已有会话，不烧
+      // admission，也就不该占换号预算、不需要抖动。
+      if (accountSwitches >= switchBudget) break;
+      // 第一个号不是「换号」，不等；之后每次换号前打散时间特征。
+      if (accountSwitches > 0) await sleep(accountSwitchJitterMs(env));
+      accountSwitches += 1;
       acct = await pickTokenWithSessionWait(
         env, mc.session, attempted, requestSignal,
         attempted.size === 0 ? sessionLeaseWaitMs(env) : 0,
@@ -4073,12 +4112,20 @@ async function executeChatPooled(env, chatParams, mc, isStream, mode, requestSig
   const attempted = new Set();
   let pinnedToken = null; // 上游抖动后待重试的同一个号
   let sameAccountRetries = 0;
-  for (let acctTry = 0; acctTry < pool.length + SAME_ACCOUNT_TRANSIENT_RETRIES; acctTry++) {
+  const switchBudget = Math.min(maxAccountSwitches(env), pool.length);
+  let accountSwitches = 0;
+  for (let acctTry = 0; acctTry < switchBudget + SAME_ACCOUNT_TRANSIENT_RETRIES; acctTry++) {
     throwIfRequestAborted(requestSignal);
     // 上游抖动过的号优先原地重试；拿不回来（被隔离/冷却/占用）才正常选号。
     let acct = pinnedToken ? retakeToken(env, pinnedToken, mc.session) : null;
     pinnedToken = null;
     if (!acct) {
+      // 换号计数只在这里：pinnedToken 命中走的是同号原地重试，复用已有会话，不烧
+      // admission，也就不该占换号预算、不需要抖动。
+      if (accountSwitches >= switchBudget) break;
+      // 第一个号不是「换号」，不等；之后每次换号前打散时间特征。
+      if (accountSwitches > 0) await sleep(accountSwitchJitterMs(env));
+      accountSwitches += 1;
       acct = await pickTokenWithSessionWait(
         env, mc.session, attempted, requestSignal,
         attempted.size === 0 ? sessionLeaseWaitMs(env) : 0,
