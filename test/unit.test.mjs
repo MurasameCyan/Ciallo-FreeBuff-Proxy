@@ -1244,6 +1244,9 @@ await tAsync('waiting-room 返回结构化 503 和 Retry-After', async () => {
   if (response.headers.get('Retry-After') !== '45') throw new Error('Retry-After 不正确');
   const body = await response.json();
   if (body.error?.type !== 'waiting_room') throw new Error('错误类型不正确: ' + JSON.stringify(body));
+  if (!/Freebuff/.test(body.error.message)) throw new Error('文案必须点名上游 Freebuff（用户反馈会被误读成网关排队）');
+  const hinted = waitingRoomResponse(45000, 'stealth/ox-alpha');
+  if (!/模型 stealth\/ox-alpha /.test((await hinted.json()).error.message)) throw new Error('带 modelHint 的文案应包含模型名');
 });
 async function assertCanceledPipeCancelsUpstream(startPipe) {
   let cancelCalls = 0;

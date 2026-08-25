@@ -2006,12 +2006,15 @@ function poolExhaustionResponse(env, sessionModel = null) {
   return jsonResponse({ error: { message, type: info.type } }, 503);
 }
 
-function waitingRoomResponse(retryAfterMs = 30 * 1000) {
+// 文案要点名上游（Freebuff）：503 waiting_room 是官方按模型后端的容量闸，
+// 不是本网关在限流——不点名会被客户端当成我们网关排队（2026-08-26 用户反馈）。
+function waitingRoomResponse(retryAfterMs = 30 * 1000, modelHint = "") {
   const ms = Math.max(1000, Number(retryAfterMs) || 30 * 1000);
   const seconds = Math.max(1, Math.ceil(ms / 1000));
+  const hint = modelHint ? `模型 ${modelHint} ` : "";
   return jsonResponse({
     error: {
-      message: `上游会话仍在排队，请 ${seconds}s 后重试`,
+      message: `上游（Freebuff）${hint}后端容量已满，会话请求被官方排队拦截，非本网关限流；请约 ${seconds}s 后重试`,
       type: "waiting_room",
       retryAfterMs: ms,
     },
@@ -3957,7 +3960,7 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode, requestSig
     const token = acct ? acct.token : null;
     if (!token) {
       recordRequest(mc && mc.id ? mc.id : "", null, false);
-      if (lastWaitingRetryAfter) return waitingRoomResponse(lastWaitingRetryAfter);
+      if (lastWaitingRetryAfter) return waitingRoomResponse(lastWaitingRetryAfter, mc.session);
       if (lastEgressUnavailable) return egressRejectedResponse("egress_unavailable");
       return poolExhaustionResponse(env, mc.session);
     }
@@ -4138,7 +4141,7 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode, requestSig
   }
   if (lastWaitingRetryAfter) {
     recordRequest(mc && mc.id ? mc.id : "", null, false);
-    return waitingRoomResponse(lastWaitingRetryAfter);
+    return waitingRoomResponse(lastWaitingRetryAfter, mc.session);
   }
   if (lastEgressUnavailable) {
     recordRequest(mc && mc.id ? mc.id : "", null, false);
@@ -4229,7 +4232,7 @@ async function executeChatPooled(env, chatParams, mc, isStream, mode, requestSig
     const token = acct ? acct.token : null;
     if (!token) {
       recordRequest(mc && mc.id ? mc.id : "", null, false);
-      if (lastWaitingRetryAfter) return waitingRoomResponse(lastWaitingRetryAfter);
+      if (lastWaitingRetryAfter) return waitingRoomResponse(lastWaitingRetryAfter, mc.session);
       if (lastEgressUnavailable) return egressRejectedResponse("egress_unavailable");
       return poolExhaustionResponse(env, mc.session);
     }
@@ -4497,7 +4500,7 @@ async function executeChatPooled(env, chatParams, mc, isStream, mode, requestSig
   }
   if (lastWaitingRetryAfter) {
     recordRequest(mc && mc.id ? mc.id : "", null, false);
-    return waitingRoomResponse(lastWaitingRetryAfter);
+    return waitingRoomResponse(lastWaitingRetryAfter, mc.session);
   }
   if (lastEgressUnavailable) {
     recordRequest(mc && mc.id ? mc.id : "", null, false);
