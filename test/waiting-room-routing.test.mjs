@@ -22,7 +22,7 @@ const workerWrapper = workerSource.replace('export default {', 'const __workerDe
   + '\n\nglobalThis.__workerDefault__ = __workerDefault__;\n'
   + 'globalThis.__waitingRoomTestApi__ = { pickToken, releaseToken, executeChat, '
   + 'recentlyWaitingRoom, maxWaitingRoomSwitches, waitingRoomDeprioritizeMs, '
-  + 'recordAccountObservation, acctHealth };\n';
+  + 'retryChainBudgetMs, recordAccountObservation, acctHealth };\n';
 
 const DS4P = 'deepseek/deepseek-v4-pro';
 
@@ -210,4 +210,54 @@ test('两个环境变量都不会被空串静默关掉（Number("") 陷阱）', 
   // 显式覆盖生效。
   assert.equal(api.maxWaitingRoomSwitches({ FREEBUFF_MAX_WAITING_ROOM_SWITCHES: '5' }), 5);
   assert.equal(api.waitingRoomDeprioritizeMs({ FREEBUFF_WAITING_ROOM_DEPRIORITIZE_MS: '90000' }), 90000);
+});
+
+// 实测背景（2026-08-25 20:38 北京时间）：整池排队时重试链烧了 74.7s 颗粒无收，
+// 客户端首字超时约 75s —— 差 1s 被 499 掐断，错误和 Retry-After 都没送到。
+// 预算到顶就停手，让循环后的兜底分支回 503 waiting_room。
+test('重试链时间预算到顶就停手，不再起新号的尝试', async () => {
+  const start = Date.UTC(2030, 0, 1);
+  const log = [];
+  const upstream = createQueueingUpstream({ start, queuedTokens: new Set(POOL), log });
+  const workerVm = createWorkerVm({ now: start, fetchImpl: upstream.fetch });
+  // 沙箱时钟钉死 → 预算判定里的 Date.now() 不走。用预算 0（「第一个号之后立即停手」）
+  // 确定性等价于「时间到顶」：同一个 break 分支，不依赖时钟推进。
+  const env = envFor(POOL, { FREEBUFF_ACCOUNT_SWITCH_JITTER_MS: '0', FREEBUFF_RETRY_CHAIN_BUDGET_MS: '0' });
+
+  const response = await workerVm.api.executeChat(
+    env, chatParams(DS4P), modelCfg(DS4P, 'base2-free-deepseek'), false, 'chat',
+  );
+
+  assert.equal(response.status, 503, '预算耗尽后仍应回 waiting_room 503（兜底分支）');
+  const body = JSON.parse(await response.text());
+  assert.equal(body.error.type, 'waiting_room');
+  const posts = log.filter((e) => e.path === '/api/v1/freebuff/session' && e.method === 'POST');
+  assert.equal(posts.length, 1, `预算 0 = 只试第一个号，实际 POST /session ${posts.length} 次`);
+  assert.ok(posts.length < POOL.length);
+});
+
+test('预算 0 也不拦第一个号：单号可用时请求照常成功', async () => {
+  const start = Date.UTC(2030, 0, 1);
+  const upstream = createQueueingUpstream({ start, queuedTokens: new Set() });
+  const workerVm = createWorkerVm({ now: start, fetchImpl: upstream.fetch });
+  const env = envFor(POOL, { FREEBUFF_ACCOUNT_SWITCH_JITTER_MS: '0', FREEBUFF_RETRY_CHAIN_BUDGET_MS: '0' });
+
+  const response = await workerVm.api.executeChat(
+    env, chatParams(DS4P), modelCfg(DS4P, 'base2-free-deepseek'), false, 'chat',
+  );
+  assert.equal(response.status, 200, '预算只拦换号链，不拦首个尝试');
+  assert.equal(upstream.created, 1);
+});
+
+test('retryChainBudgetMs 的空串陷阱与显式覆盖', async () => {
+  const workerVm = createWorkerVm({ now: Date.UTC(2030, 0, 1) });
+  const { api } = workerVm;
+  assert.equal(api.retryChainBudgetMs({ FREEBUFF_RETRY_CHAIN_BUDGET_MS: '' }), 45 * 1000,
+    '空串必须当「没设」处理，不能静默变成 0');
+  assert.equal(api.retryChainBudgetMs({}), 45 * 1000);
+  assert.equal(api.retryChainBudgetMs({ FREEBUFF_RETRY_CHAIN_BUDGET_MS: '0' }), 0,
+    '显式 0 = 只试第一个号，是合法意图');
+  assert.equal(api.retryChainBudgetMs({ FREEBUFF_RETRY_CHAIN_BUDGET_MS: '30000' }), 30000);
+  assert.equal(api.retryChainBudgetMs({ FREEBUFF_RETRY_CHAIN_BUDGET_MS: 'abc' }), 45 * 1000,
+    '非数字同样当「没设」');
 });

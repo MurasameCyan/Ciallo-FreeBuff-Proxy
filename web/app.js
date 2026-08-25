@@ -312,8 +312,8 @@ const MODEL_DISPLAY = {
 // 官方已撤回但动态目录可能不再返回的模型，保留在管理面板用于说明历史配置，
 // 不代表它仍可调用；worker /v1/models 和请求入口都会将其排除。
 const PAUSED_MODEL_IDS = new Set(['minimax/minimax-m3']);
+// stealth/ox-alpha 已开放（官方 2026-08-24 放进 CLI 目录并清空 service-only 名单）。
 const HIDDEN_MODEL_IDS = new Set([
-  'stealth/ox-alpha',
   'openai/gpt-5.6-luna-es',
   // 官方 FREEBUFF_WEB_GOD_ONLY_MODELS（0766319c）：god 账号专属，且不在 CLI 目录里。
   'crof/kimi-k3-eco',
@@ -321,8 +321,7 @@ const HIDDEN_MODEL_IDS = new Set([
 
 function isHiddenModelId(modelId) {
   const value = String(modelId || '').trim().toLowerCase();
-  return HIDDEN_MODEL_IDS.has(value) || value === 'ox-alpha'
-    || value === 'anthropic/ox-alpha' || value.endsWith('/ox-alpha')
+  return HIDDEN_MODEL_IDS.has(value)
     || value.startsWith('openai/gpt-5.6-luna-es')
     || value.startsWith('crof/kimi-k3-eco');
 }

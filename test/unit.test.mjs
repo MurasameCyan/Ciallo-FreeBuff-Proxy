@@ -895,28 +895,30 @@ await tAsync('模型按 免费 → US/SG → 限定 分组打 tier', async () =>
   setTestAliases('');
 });
 
-await tAsync('服务专用 ox-alpha 不出现在目录且不能经直接 ID、短名或别名调用', async () => {
+// stealth/ox-alpha 已开放（官方 2026-08-24 放进 CLI/Desktop 目录并清空
+// FREEBUFF_SERVICE_ONLY_MODEL_IDS，d534205ad39d）。动态源返回时必须正常出目录、
+// 可解析；reasoning mandatory 钉死 high（同 luna 先例）。
+await tAsync('已开放的 ox-alpha 出现在目录、可经 ID 与短名调用、effort 钉死 high', async () => {
   setTestDynamicModels([
     {
-      id: 'stealth/ox-alpha', session: 'stealth/ox-alpha', agent: 'base2-ox-alpha',
-      root_agent: 'base2-ox-alpha', upstream: 'stealth/ox-alpha',
+      id: 'stealth/ox-alpha', session: 'stealth/ox-alpha', agent: 'base3-free-ox-alpha',
+      root_agent: 'base2-free-ox-alpha', upstream: 'stealth/ox-alpha',
     },
   ]);
   const body = await (await handleModels()).json();
-  if (body.data.some((model) => model.id === 'stealth/ox-alpha')) {
-    throw new Error('service-only ox-alpha 不得出现在 /v1/models');
+  if (!body.data.some((model) => model.id === 'stealth/ox-alpha')) {
+    throw new Error('开放的 ox-alpha 必须出现在 /v1/models');
   }
-  if (await resolveModelConfig('stealth/ox-alpha') !== null) {
-    throw new Error('ox-alpha 直接 ID 必须在请求解析入口被拒绝');
+  const mc = await resolveModelConfig('stealth/ox-alpha');
+  if (!mc) throw new Error('ox-alpha 直接 ID 必须可解析');
+  if (normalizeReasoningEffort('stealth/ox-alpha', 'max') !== 'high'
+    || normalizeReasoningEffort('stealth/ox-alpha', 'low') !== 'high') {
+    throw new Error('ox-alpha effort 必须钉死 high（reasoning.mandatory）');
   }
-  if (await resolveModelConfig(anthropicModelToOpenAI('ox-alpha')) !== null) {
-    throw new Error('Anthropic 短名不得绕过 ox-alpha 闸门');
+  const short = anthropicModelToOpenAI('ox-alpha');
+  if (!short || !(await resolveModelConfig(short))) {
+    throw new Error('Anthropic 短名 ox-alpha 必须可解析到该模型');
   }
-  setTestAliases('old-ox=stealth/ox-alpha');
-  if (await resolveModelConfig('old-ox') !== null) {
-    throw new Error('别名不得绕过 ox-alpha 闸门');
-  }
-  setTestAliases('');
   setTestDynamicModels(null);
 });
 

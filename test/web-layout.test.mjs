@@ -178,10 +178,13 @@ assert.match(css, /\.account-priority-toggle\s*\{[^}]*white-space:\s*nowrap/s,
   '账号优先级按钮必须保持紧凑单行');
 assert.match(css, /\.account-egress-refresh\s*\{[^}]*white-space:\s*nowrap/s,
   '刷新出站按钮必须保持紧凑单行');
-assert.match(app, /const HIDDEN_MODEL_IDS = new Set\(\[[\s\S]*?'stealth\/ox-alpha'[\s\S]*?'openai\/gpt-5\.6-luna-es'[\s\S]*?'crof\/kimi-k3-eco'[\s\S]*?\]\)/,
-  '面板必须过滤 service-only ox-alpha 与 god-only luna-es / K3 Eco，避免旧缓存或 Key 白名单重新显示');
-assert.match(app, /function isHiddenModelId\(modelId\)[\s\S]*?value === 'ox-alpha'[\s\S]*?value\.endsWith\('\/ox-alpha'\)/,
-  '面板必须统一过滤完整 ID、供应商变体和短名 ox-alpha');
+// stealth/ox-alpha 已开放（官方 2026-08-24 进 CLI 目录），隐藏列表只剩两条 god-only。
+assert.doesNotMatch(app, /'stealth\/ox-alpha'/,
+  '面板不得再把已开放的 stealth/ox-alpha 写进隐藏列表');
+assert.match(app, /const HIDDEN_MODEL_IDS = new Set\(\[[\s\S]*?'openai\/gpt-5\.6-luna-es'[\s\S]*?'crof\/kimi-k3-eco'[\s\S]*?\]\)/,
+  '面板仍必须过滤 god-only luna-es / K3 Eco，避免旧缓存或 Key 白名单重新显示');
+assert.doesNotMatch(app, /value === 'ox-alpha'|value\.endsWith\('\/ox-alpha'\)|value === "ox-alpha"|value\.endsWith\("\/ox-alpha"\)/,
+  'ox-alpha 短名/变体不再属于隐藏判定（它已可调用）');
 assert.match(app, /function isHiddenModelId\(modelId\)[\s\S]*?value\.startsWith\('crof\/kimi-k3-eco'\)/,
   'god-only K3 Eco 的日期/变体后缀同样要挡住，与 worker.js 保持一致');
 assert.match(app, /for \(const id of chosen\) if \(!ids\.includes\(id\) && !isHiddenModelId\(id\)\) ids\.push\(id\)/,

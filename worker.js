@@ -486,10 +486,10 @@ const LUNA_QUOTA_MODELS = new Set([
 const PAUSED_QUOTA_MODELS = new Set([
   "minimax/minimax-m3",
 ]);
-// Freebuff 自家 Web/Cloud runner 专用模型。普通 token、CLI、Desktop 和第三方
-// 代理没有服务账号权限，动态源即使返回也必须 fail closed。
+// God-only / 服务专用模型。普通 token 一定调不通，动态源即使返回也必须 fail closed。
+// stealth/ox-alpha 曾在此列（当时官方 FREEBUFF_SERVICE_ONLY_MODEL_IDS 非空）；2026-08-24
+// 官方把它放进了 CLI/Desktop 目录并清空该名单（d534205ad39d），隐藏前提失效，已开放。
 const HIDDEN_MODEL_IDS = new Set([
-  "stealth/ox-alpha",
   // Official Web God-only Novita/Codex test route; it is not the public Luna model.
   "openai/gpt-5.6-luna-es",
   // 同在官方 FREEBUFF_WEB_GOD_ONLY_MODELS 里（0766319c）：god 账号专属的 Web/Cloud
@@ -499,8 +499,7 @@ const HIDDEN_MODEL_IDS = new Set([
 ]);
 function isHiddenModelId(modelId) {
   const value = String(modelId || "").trim().toLowerCase();
-  return HIDDEN_MODEL_IDS.has(value) || value === "ox-alpha"
-    || value === "anthropic/ox-alpha" || value.endsWith("/ox-alpha")
+  return HIDDEN_MODEL_IDS.has(value)
     || value.startsWith("openai/gpt-5.6-luna-es")
     // 官方模型判定都是 suffix/前缀容错的，免得带日期的 provider 快照绕过分类。
     || value.startsWith("crof/kimi-k3-eco");
@@ -745,6 +744,20 @@ function maxWaitingRoomSwitches(env) {
   const raw = String((env && env.FREEBUFF_MAX_WAITING_ROOM_SWITCHES) ?? "").trim();
   const n = Number(raw);
   return raw !== "" && Number.isInteger(n) && n >= 0 ? n : MAX_WAITING_ROOM_SWITCHES;
+}
+
+// 单请求重试链的时间总预算。实测 2026-08-25 20:38 北京时间：整池排队时重试链烧了
+// 74.7s 一无所获，而客户端（CC GUI）首字超时约 75s —— 差 1s 被 499 掐断，客户端
+// 既没拿到错误也没拿到 Retry-After。预算到顶就不再起新号的尝试，让循环后的兜底
+// 分支回干净的 503 waiting_room（带 Retry-After）—— 早失败早重试比吊到超时强。
+// 只约束「再起一个新号的尝试」：正在跑的尝试不拦，第一个号永远试。
+// 0 是合法值 = 只试第一个号。空串陷阱同 maxAccountSwitches。
+const RETRY_CHAIN_BUDGET_MS = 45 * 1000;
+
+function retryChainBudgetMs(env) {
+  const raw = String((env && env.FREEBUFF_RETRY_CHAIN_BUDGET_MS) ?? "").trim();
+  const n = Number(raw);
+  return raw !== "" && Number.isFinite(n) && n >= 0 ? n : RETRY_CHAIN_BUDGET_MS;
 }
 
 // 这个号刚刚被上游放进 waiting room 吗？只看新鲜观测：过期的旧状态不该继续压它。
@@ -3609,6 +3622,9 @@ const MODEL_EFFORTS = {
 // low/none/auto 这类值仍会原样发出去继续 400。必须无条件改写成 high。
 const MODEL_PINNED_EFFORT = {
   "openai/gpt-5.6-luna": "high",
+  // stealth/ox-alpha：官方目录 defaultEffort:'high'（provider 默认 max，实测 4x token/延迟
+  // 且会被 4k 截断），reasoning.mandatory —— 与 luna 同理钉死，不进 MODEL_EFFORTS 做 clamp。
+  "stealth/ox-alpha": "high",
 };
 
 function clampReasoningEffort(requested, allowed) {
@@ -3903,8 +3919,16 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode, requestSig
   const waitingBudget = Math.min(maxWaitingRoomSwitches(env), pool.length);
   let accountSwitches = 0;
   let waitingRoomSwitches = 0;
+  const chainBudgetMs = retryChainBudgetMs(env);
+  const chainStart = Date.now();
   for (let acctTry = 0; acctTry < switchBudget + waitingBudget + SAME_ACCOUNT_TRANSIENT_RETRIES; acctTry++) {
     throwIfRequestAborted(requestSignal);
+    // 时间总预算：只拦「再起一个新号的尝试」，正在跑的尝试不拦。第一个号
+    // （acctTry === 0）永远试 —— 预算管的是换号链的长度，不是把请求直接拒掉。
+    if (acctTry > 0 && Date.now() - chainStart >= chainBudgetMs) {
+      if (debug) console.log(`[retry-chain] budget ${chainBudgetMs}ms exhausted after ${acctTry} attempts`);
+      break;
+    }
     // 上游抖动过的号优先原地重试；拿不回来（被隔离/冷却/占用）才正常选号。
     let acct = pinnedToken ? retakeToken(env, pinnedToken, mc.session) : null;
     pinnedToken = null;
@@ -4167,8 +4191,16 @@ async function executeChatPooled(env, chatParams, mc, isStream, mode, requestSig
   const waitingBudget = Math.min(maxWaitingRoomSwitches(env), pool.length);
   let accountSwitches = 0;
   let waitingRoomSwitches = 0;
+  const chainBudgetMs = retryChainBudgetMs(env);
+  const chainStart = Date.now();
   for (let acctTry = 0; acctTry < switchBudget + waitingBudget + SAME_ACCOUNT_TRANSIENT_RETRIES; acctTry++) {
     throwIfRequestAborted(requestSignal);
+    // 时间总预算：只拦「再起一个新号的尝试」，正在跑的尝试不拦。第一个号
+    // （acctTry === 0）永远试 —— 预算管的是换号链的长度，不是把请求直接拒掉。
+    if (acctTry > 0 && Date.now() - chainStart >= chainBudgetMs) {
+      if (debug) console.log(`[retry-chain] budget ${chainBudgetMs}ms exhausted after ${acctTry} attempts`);
+      break;
+    }
     // 上游抖动过的号优先原地重试；拿不回来（被隔离/冷却/占用）才正常选号。
     let acct = pinnedToken ? retakeToken(env, pinnedToken, mc.session) : null;
     pinnedToken = null;
