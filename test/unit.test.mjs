@@ -897,8 +897,9 @@ await tAsync('模型按 免费 → US/SG → 限定 分组打 tier', async () =>
 
 // stealth/ox-alpha 已开放（官方 2026-08-24 放进 CLI/Desktop 目录并清空
 // FREEBUFF_SERVICE_ONLY_MODEL_IDS，d534205ad39d）。动态源返回时必须正常出目录、
-// 可解析；reasoning mandatory 钉死 high（同 luna 先例）。
-await tAsync('已开放的 ox-alpha 出现在目录、可经 ID 与短名调用、effort 钉死 high', async () => {
+// 可解析；effort 走官方 ladder ['low','high','max'] 的 clamp-down——点名 max
+// 原样透传（官方 Web UI 自己就发 max），不在 ladder 上的值下取到 high。
+await tAsync('已开放的 ox-alpha 出现在目录、可经 ID 与短名调用、effort 按官方 ladder clamp', async () => {
   setTestDynamicModels([
     {
       id: 'stealth/ox-alpha', session: 'stealth/ox-alpha', agent: 'base3-free-ox-alpha',
@@ -911,9 +912,16 @@ await tAsync('已开放的 ox-alpha 出现在目录、可经 ID 与短名调用�
   }
   const mc = await resolveModelConfig('stealth/ox-alpha');
   if (!mc) throw new Error('ox-alpha 直接 ID 必须可解析');
-  if (normalizeReasoningEffort('stealth/ox-alpha', 'max') !== 'high'
-    || normalizeReasoningEffort('stealth/ox-alpha', 'low') !== 'high') {
-    throw new Error('ox-alpha effort 必须钉死 high（reasoning.mandatory）');
+  if (normalizeReasoningEffort('stealth/ox-alpha', 'max') !== 'max') {
+    throw new Error('ox-alpha 点名 max 必须原样透传（官方 ladder 含 max）');
+  }
+  if (normalizeReasoningEffort('stealth/ox-alpha', 'low') !== 'low') {
+    throw new Error('ox-alpha 点名 low 必须原样透传（官方 ladder 含 low）');
+  }
+  if (normalizeReasoningEffort('stealth/ox-alpha', 'medium') !== 'low'
+    || normalizeReasoningEffort('stealth/ox-alpha', 'xhigh') !== 'high'
+    || normalizeReasoningEffort('stealth/ox-alpha', 'ultra') !== 'max') {
+    throw new Error('ox-alpha 不在 ladder 上的档位必须下取（medium→low，xhigh→high，ultra→max）');
   }
   const short = anthropicModelToOpenAI('ox-alpha');
   if (!short || !(await resolveModelConfig(short))) {

@@ -3607,6 +3607,11 @@ const MODEL_EFFORTS = {
   "deepseek/deepseek-v4-flash": ["low", "high", "max"],
   "deepseek/deepseek-v4-pro": ["low", "high", "max"],
   "meta/muse-spark-1.2-contributor": ["minimal", "low", "medium", "high", "xhigh"],
+  // 官方 OX_ALPHA_REASONING_EFFORTS = ['low','high','max']（d534205），
+  // defaultEffort:'high' 只是未点名时的默认，不是唯一可发值。客户端点名 max
+  // 原样透传（官方 Web UI 自己就发 max）；low/medium 这类不在 ladder 上的值
+  // 由 clampReasoningEffort 下取到 high。
+  "stealth/ox-alpha": ["low", "high", "max"],
 };
 
 // 服务端钉死思考强度的模型：这里的值不是「上限」而是「唯一可发的值」。
@@ -3622,9 +3627,9 @@ const MODEL_EFFORTS = {
 // low/none/auto 这类值仍会原样发出去继续 400。必须无条件改写成 high。
 const MODEL_PINNED_EFFORT = {
   "openai/gpt-5.6-luna": "high",
-  // stealth/ox-alpha：官方目录 defaultEffort:'high'（provider 默认 max，实测 4x token/延迟
-  // 且会被 4k 截断），reasoning.mandatory —— 与 luna 同理钉死，不进 MODEL_EFFORTS 做 clamp。
-  "stealth/ox-alpha": "high",
+  // stealth/ox-alpha 曾在此钉死 high——那是把 defaultEffort 误当唯一可发值的过度矫正：
+  // 官方 efforts 表明确给 ['low','high','max']，且注入条件是「调用方未点名才注入」
+  // （freebuff-models.ts:74-78），点名 max 不存在 luna 那种双字段冲突。已移入 MODEL_EFFORTS。
 };
 
 function clampReasoningEffort(requested, allowed) {
