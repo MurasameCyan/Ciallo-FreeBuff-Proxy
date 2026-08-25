@@ -57,6 +57,7 @@ jobs:
       - run: node --test test/model-switch-parallel.test.mjs
       - run: node --test test/stream-convergence.test.mjs
       - run: node --test test/account-switch-budget.test.mjs
+      - run: node --test test/waiting-room-routing.test.mjs
       - run: node test/web-layout.test.mjs
 
   build:

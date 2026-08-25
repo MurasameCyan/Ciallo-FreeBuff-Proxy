@@ -719,6 +719,45 @@ function accountSwitchJitterMs(env) {
   const span = ACCOUNT_SWITCH_JITTER_MAX_MS - ACCOUNT_SWITCH_JITTER_MIN_MS;
   return ACCOUNT_SWITCH_JITTER_MIN_MS + Math.floor(Math.random() * (span + 1));
 }
+// 上游 waiting room：createSession 拿到 queued 后轮询 8x1.5s 仍未 active 就抛
+// WaitingRoomError。排队不是这个号的错，所以刻意不写冷却、不摘号（见两处循环里的
+// `!(e instanceof WaitingRoomError)`）。但 acctHealth 里的 waiting_room_required 也
+// 没有失效时间，只能等下一次真实请求撞上才被覆盖 —— 低流量时段（实测 2026-08-25
+// 03:17 北京时间）那份旧观测会一直挂着，配合换号预算 2，轮询前两位撞上就必然 503。
+//
+// 处置分两层，都不摘号：
+//   ① 新鲜的排队观测在 pickToken 里降权到候选末尾（本窗口内），过期即视同未知；
+//   ② 因排队而换号时给一份独立预算，不占 MAX_ACCOUNT_SWITCHES。
+// ponytail: 固定窗口 + 固定额度，不是自适应退避。上游长队时仍会 503，只是不再
+// 因为一份几小时前的旧状态而失败；不够用就调这两个环境变量。
+const WAITING_ROOM_DEPRIORITIZE_MS = 60 * 1000;
+const MAX_WAITING_ROOM_SWITCHES = 2;
+
+function waitingRoomDeprioritizeMs(env) {
+  // 空串陷阱同 maxAccountSwitches：`FREEBUFF_WAITING_ROOM_DEPRIORITIZE_MS=` 传进来是
+  // 空串，Number("") 是 0 —— 那会静默关掉降权。0 是合法的显式关闭，空串不是。
+  const raw = String((env && env.FREEBUFF_WAITING_ROOM_DEPRIORITIZE_MS) ?? "").trim();
+  const n = Number(raw);
+  return raw !== "" && Number.isFinite(n) && n >= 0 ? n : WAITING_ROOM_DEPRIORITIZE_MS;
+}
+
+function maxWaitingRoomSwitches(env) {
+  const raw = String((env && env.FREEBUFF_MAX_WAITING_ROOM_SWITCHES) ?? "").trim();
+  const n = Number(raw);
+  return raw !== "" && Number.isInteger(n) && n >= 0 ? n : MAX_WAITING_ROOM_SWITCHES;
+}
+
+// 这个号刚刚被上游放进 waiting room 吗？只看新鲜观测：过期的旧状态不该继续压它。
+function recentlyWaitingRoom(token, env, now = Date.now()) {
+  const windowMs = waitingRoomDeprioritizeMs(env);
+  if (!(windowMs > 0)) return false;
+  const info = acctHealth.get(token);
+  if (!info) return false;
+  if (info.state !== "waiting_room_queued" && info.state !== "waiting_room_required") return false;
+  const checkedAt = Number(info.checkedAt);
+  if (!Number.isFinite(checkedAt)) return false;
+  return now - checkedAt < windowMs;
+}
 const TERMINAL_ACCOUNT_STATES = new Set(["banned", "token_invalid", "manual_disabled"]);
 let accountStateSet = null;
 let accountStateClear = null;
@@ -1841,6 +1880,7 @@ function pickToken(env, sessionModel, attempted = new Set(), client = null) {
   // ③ 最后把新鲜的正剩余额度按降序提到前面；未知仍在已知 0 之前。
   // ①在②前面：抢占别人的会话既毁掉对方的上下文又白扣一份额度，比共用一条会话更糟。
   const candidates = [];
+  const nowTs = Date.now();
   for (let k = 0; k < finalPool.length; k++) {
     const acct = finalPool[accountIdx % finalPool.length];
     accountIdx = (accountIdx + 1) % finalPool.length;
@@ -1852,12 +1892,17 @@ function pickToken(env, sessionModel, attempted = new Set(), client = null) {
         order: candidates.length,
         conflict: hasConflictingSession(t, sessionModel) ? 1 : 0,
         foreign: isLiveSession(cached) && !sessionOwnedByClient(client, t, sessionModel, cached) ? 1 : 0,
+        waiting: recentlyWaitingRoom(t, env, nowTs) ? 1 : 0,
         remaining: remainingQuota(t, sessionModel),
       });
     }
   }
   candidates.sort((a, b) => {
     if (a.conflict !== b.conflict) return a.conflict - b.conflict;
+    // 新鲜的 waiting room 观测降权：这个号大概率还在队列里，建会话要白等 12s 才失败。
+    // 排在 conflict 之后 —— 抢占别人的会话是实际损害，比一次概率性失败更该避免。
+    // 过期观测由 recentlyWaitingRoom 判为 false，自动回到正常轮询顺序。
+    if (a.waiting !== b.waiting) return a.waiting - b.waiting;
     if (a.foreign !== b.foreign) return a.foreign - b.foreign;
     const rank = (item) => item.remaining == null ? 1 : item.remaining > 0 ? 0 : 2;
     const rankDiff = rank(a) - rank(b);
@@ -3855,8 +3900,10 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode, requestSig
   let pinnedToken = null; // 上游抖动后待重试的同一个号
   let sameAccountRetries = 0;
   const switchBudget = Math.min(maxAccountSwitches(env), pool.length);
+  const waitingBudget = Math.min(maxWaitingRoomSwitches(env), pool.length);
   let accountSwitches = 0;
-  for (let acctTry = 0; acctTry < switchBudget + SAME_ACCOUNT_TRANSIENT_RETRIES; acctTry++) {
+  let waitingRoomSwitches = 0;
+  for (let acctTry = 0; acctTry < switchBudget + waitingBudget + SAME_ACCOUNT_TRANSIENT_RETRIES; acctTry++) {
     throwIfRequestAborted(requestSignal);
     // 上游抖动过的号优先原地重试；拿不回来（被隔离/冷却/占用）才正常选号。
     let acct = pinnedToken ? retakeToken(env, pinnedToken, mc.session) : null;
@@ -3864,10 +3911,14 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode, requestSig
     if (!acct) {
       // 换号计数只在这里：pinnedToken 命中走的是同号原地重试，复用已有会话，不烧
       // admission，也就不该占换号预算、不需要抖动。
-      if (accountSwitches >= switchBudget) break;
+      // 上一个号是被 waiting room 挡住的：那不是这个号的失败，也没扣到 admission，
+      // 走独立的小预算，不占 MAX_ACCOUNT_SWITCHES（否则整池被队列挡住就直接 503）。
+      const waitingSwitch = lastWaitingRetryAfter != null && waitingRoomSwitches < waitingBudget;
+      if (!waitingSwitch && accountSwitches >= switchBudget) break;
       // 第一个号不是「换号」，不等；之后每次换号前打散时间特征。
-      if (accountSwitches > 0) await sleep(accountSwitchJitterMs(env));
-      accountSwitches += 1;
+      if (accountSwitches + waitingRoomSwitches > 0) await sleep(accountSwitchJitterMs(env));
+      if (waitingSwitch) waitingRoomSwitches += 1;
+      else accountSwitches += 1;
       acct = await pickTokenWithSessionWait(
         env, mc.session, attempted, requestSignal,
         attempted.size === 0 ? sessionLeaseWaitMs(env) : 0,
@@ -4113,8 +4164,10 @@ async function executeChatPooled(env, chatParams, mc, isStream, mode, requestSig
   let pinnedToken = null; // 上游抖动后待重试的同一个号
   let sameAccountRetries = 0;
   const switchBudget = Math.min(maxAccountSwitches(env), pool.length);
+  const waitingBudget = Math.min(maxWaitingRoomSwitches(env), pool.length);
   let accountSwitches = 0;
-  for (let acctTry = 0; acctTry < switchBudget + SAME_ACCOUNT_TRANSIENT_RETRIES; acctTry++) {
+  let waitingRoomSwitches = 0;
+  for (let acctTry = 0; acctTry < switchBudget + waitingBudget + SAME_ACCOUNT_TRANSIENT_RETRIES; acctTry++) {
     throwIfRequestAborted(requestSignal);
     // 上游抖动过的号优先原地重试；拿不回来（被隔离/冷却/占用）才正常选号。
     let acct = pinnedToken ? retakeToken(env, pinnedToken, mc.session) : null;
@@ -4122,10 +4175,14 @@ async function executeChatPooled(env, chatParams, mc, isStream, mode, requestSig
     if (!acct) {
       // 换号计数只在这里：pinnedToken 命中走的是同号原地重试，复用已有会话，不烧
       // admission，也就不该占换号预算、不需要抖动。
-      if (accountSwitches >= switchBudget) break;
+      // 上一个号是被 waiting room 挡住的：那不是这个号的失败，也没扣到 admission，
+      // 走独立的小预算，不占 MAX_ACCOUNT_SWITCHES（否则整池被队列挡住就直接 503）。
+      const waitingSwitch = lastWaitingRetryAfter != null && waitingRoomSwitches < waitingBudget;
+      if (!waitingSwitch && accountSwitches >= switchBudget) break;
       // 第一个号不是「换号」，不等；之后每次换号前打散时间特征。
-      if (accountSwitches > 0) await sleep(accountSwitchJitterMs(env));
-      accountSwitches += 1;
+      if (accountSwitches + waitingRoomSwitches > 0) await sleep(accountSwitchJitterMs(env));
+      if (waitingSwitch) waitingRoomSwitches += 1;
+      else accountSwitches += 1;
       acct = await pickTokenWithSessionWait(
         env, mc.session, attempted, requestSignal,
         attempted.size === 0 ? sessionLeaseWaitMs(env) : 0,
