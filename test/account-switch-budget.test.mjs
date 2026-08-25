@@ -29,7 +29,7 @@ const workerWrapper = workerSource.replace('export default {', 'const __workerDe
 const DS4P = 'deepseek/deepseek-v4-pro';
 const LUNA = 'openai/gpt-5.6-luna';
 
-function createWorkerVm({ now, fetchImpl, consoleImpl = console } = {}) {
+function createWorkerVm({ now, fetchImpl, consoleImpl = console, random = null } = {}) {
   let clock = now ?? Date.UTC(2030, 0, 1);
   class FakeDate extends Date {
     constructor(...args) { super(...(args.length ? args : [clock])); }
@@ -44,7 +44,11 @@ function createWorkerVm({ now, fetchImpl, consoleImpl = console } = {}) {
   };
   const sandbox = {
     console: consoleImpl, TextEncoder, TextDecoder, Set, Map, Date: FakeDate,
-    Math, Number, String, JSON, Uint8Array, Object, URL, setTimeout, clearTimeout,
+    // random 可注入：up() 每次出站都调 jitterMs()（100-400ms 随机），一条链上好几次，
+    // 墙钟差值天然带 ±600ms 噪声。要断言「这段等待来自换号抖动」就得把无关的随机
+    // 源钉死，否则阈值只能靠猜（CI 上实测抖出过 4226ms vs 3626ms）。
+    Math: random ? Object.assign(Object.create(Math), { random }) : Math,
+    Number, String, JSON, Uint8Array, Object, URL, setTimeout, clearTimeout,
     AbortController, ReadableStream, TransformStream, Response, Request, Headers,
     fetch: fakeFetch,
     AbortSignal: { timeout: () => ({}) },
@@ -247,7 +251,10 @@ test('空的 FREEBUFF_MAX_ACCOUNT_SWITCHES 不会静默变成 0（Number("") 陷
 test('换号之间有间隔：第一个号不等，之后每次换号前等一段', async () => {
   const start = Date.UTC(2030, 0, 1);
   const upstream = createAlwaysFailingUpstream({ start });
-  const workerVm = createWorkerVm({ now: start, fetchImpl: upstream.fetch });
+  // 两侧用同一个固定 random：up() 里的出站抖动（jitterMs 100-400ms）在两次运行中
+  // 完全一致，差值里就只剩换号抖动本身。
+  const fixedRandom = () => 0.5;
+  const workerVm = createWorkerVm({ now: start, fetchImpl: upstream.fetch, random: fixedRandom });
   // 抖动钉成固定 1200ms，断言才不靠墙钟猜。真实运行是 800-2500ms 随机。
   const env = envFor(POOL8, { FREEBUFF_ACCOUNT_SWITCH_JITTER_MS: '1200' });
 
@@ -268,7 +275,7 @@ test('换号之间有间隔：第一个号不等，之后每次换号前等一�
   // 对照组：抖动设 0，同样的链路间隔必须明显更短。这才真正锁住「那段等待
   // 来自换号抖动」，而不是来自别处本来就有的延迟。
   const bare = createAlwaysFailingUpstream({ start });
-  const bareVm = createWorkerVm({ now: start, fetchImpl: bare.fetch });
+  const bareVm = createWorkerVm({ now: start, fetchImpl: bare.fetch, random: fixedRandom });
   const bareResp = await bareVm.api.executeChat(
     envFor(POOL8, { FREEBUFF_ACCOUNT_SWITCH_JITTER_MS: '0' }),
     chatParams(DS4P), modelCfg(DS4P, 'base2-free-deepseek'), false, 'chat',
