@@ -624,6 +624,8 @@ select:disabled { opacity: .5; cursor: not-allowed; }
 }
 .subcard-head h3 { font-size: 13px; font-weight: 650; }
 .subcard-head .hint { margin-top: 3px; }
+.model-head-actions { display: flex; align-items: center; gap: 8px; }
+#modelRefresh { width: 28px; height: 28px; padding: 0; }
 .model-catalog .models {
   flex: 1 1 0; min-height: 0; max-height: none;
   overflow-y: auto; justify-items: start; align-content: start; grid-auto-rows: max-content;

@@ -33,7 +33,7 @@ for (const id of [
   'acctCount', 'acctBody', 'addForm', 'addBtn', 'authToken', 'email', 'name',
   'quotaHead', 'maskEmail',
   'oauthStart', 'loginUrl', 'oauthStatus', 'key-mask', 'models', 'models-empty',
-  'modelCount',
+  'modelCount', 'modelRefresh',
   'aliasCount', 'aliasBody', 'newAlias', 'newAliasTarget', 'aliasAdd', 'aliasMsg',
   'proxyCard', 'proxyStatus', 'proxyUrl', 'proxyVersion', 'proxyNodeCount', 'proxyHealthyCount',
   'proxyCurrentNode', 'proxyLastRefresh', 'proxyError', 'proxyReject', 'proxyMessage',
@@ -373,6 +373,26 @@ assert.match(html, /id="h-model-workspace">模型与 Key<\/h2>/,
   '模型卡标题必须是“模型与 Key”（同卡两页：模型与映射 | Key 管理）');
 assert.match(html, /<h3 id="h-models">模型列表<\/h3>/,
   '右侧子卡标题必须是“模型列表”（原“可用模型”）');
+assert.match(html,
+  /id="modelRefresh"[^>]*title="获取最新模型列表"[^>]*aria-label="获取最新模型列表"/,
+  '模型列表必须提供带可访问名称的独立刷新按钮');
+assert.match(html, /id="modelRefresh"[\s\S]*?refresh/s,
+  '模型列表刷新按钮必须使用刷新图标');
+assert.match(app,
+  /modelRefresh[\s\S]*?rawApi\('\/v1\/models\?refresh=1'/s,
+  '模型列表刷新按钮必须请求无 session 的强制模型目录接口');
+const modelRefreshStart = app.indexOf("$('modelRefresh')", app.indexOf('function wire()'));
+const modelRefreshFlow = app.slice(modelRefreshStart, app.indexOf("$('maskEmail')", modelRefreshStart));
+assert.ok(modelRefreshFlow.includes('S.models = models.data || []'),
+  '模型列表刷新成功后必须更新前端模型状态');
+assert.ok(modelRefreshFlow.includes('renderModels()') && modelRefreshFlow.includes('renderKeys()'),
+  '模型列表刷新成功后必须同步模型目录和 Key 模型选择');
+assert.ok(modelRefreshFlow.includes('models.refresh?.updated')
+  && modelRefreshFlow.includes('未能获取最新模型，已保留当前列表'),
+  '模型目录源全部失败时必须明确提示使用旧列表，不能误报刷新成功');
+assert.ok(!modelRefreshFlow.includes("refresh()") && !modelRefreshFlow.includes("api('/accounts')")
+  && !modelRefreshFlow.includes("api('/proxy')"),
+  '模型列表刷新不得触发账号探测或完整 refresh()');
 assert.match(html,
   /class="tbl key-table"[\s\S]*?<thead><tr><th>备注<\/th><th>Key<\/th><th>并发<\/th><th>会话<\/th><th>今日 \/ 累计<\/th><th>统计<\/th><th>可用模型<\/th><th class="action-col">操作<\/th><\/tr><\/thead>/s,
   '分享 Key 表格必须按 会话 → 今日 / 累计 → 统计 排列，再显示可用模型');

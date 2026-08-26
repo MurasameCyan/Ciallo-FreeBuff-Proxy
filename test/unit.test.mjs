@@ -8,13 +8,13 @@ const src = readFileSync(new URL('../worker.js', import.meta.url), 'utf-8');
 // 使内部函数在沙箱全局可见，供单测直接调用。
 const wrapper = src.replace('export default {', 'const __workerDefault__ = {') +
   '\n\nglobalThis.__workerDefault__ = __workerDefault__;\n' +
-  'globalThis.__unitTestApi__ = { normalizeChatThinking, anthropicThinkingToEffort, namedEffort, normalizeReasoningEffort, collectReasoningTexts, anthropicStopReason, anthropicModelToOpenAI, parseModelAliases, resolveModelAlias, resolveModelConfig, findModelConfig, setTestAliases: (raw) => { currentAliases = parseModelAliases(raw); }, setTestDynamicModels: (models) => { dynamicModelsCache = { fetchedAt: Date.now(), models, pool: { premium: new Set(), standard: null, glm: new Set() } }; }, cooldown, cooldownInfo, inCooldown, parseCooldown, nextPacificMidnight: typeof nextPacificMidnight === "function" ? nextPacificMidnight : null, pickToken, releaseToken: typeof releaseToken === "function" ? releaseToken : null, accountPoolExhaustion: typeof accountPoolExhaustion === "function" ? accountPoolExhaustion : null, waitingRoomResponse: typeof waitingRoomResponse === "function" ? waitingRoomResponse : null, pipeUpstreamToClient, pipeUpstreamToResponsesStream, anthropicStream, streamToNonStream, buildUpstreamPayload, anthropicFromChat, responsesToNonStream, markSessionInvalidated, wasRecentlyInvalidated, singleFlight, sessionRemainingMs, INVALIDATION_WINDOW_MS, SESSION_REUSE_SAFE_MS, SESSION_VERIFY_WINDOW_MS, executeChat, readCallUsage, accountLabel, summarizeAccountHealth, logCall, callLogSnapshot, readUsageFull, recordRequest, blankUsageTotals, recordAccountObservation, configureUsagePersistence, restoreUsageSnapshot, usageSnapshot, setTestEgressReject: (fn) => { onEgressReject = fn; }, egressRejectedResponse: typeof egressRejectedResponse === "function" ? egressRejectedResponse : null, MODEL_TIERS, handleModels };\n';
+  'globalThis.__unitTestApi__ = { normalizeChatThinking, anthropicThinkingToEffort, namedEffort, normalizeReasoningEffort, collectReasoningTexts, anthropicStopReason, anthropicModelToOpenAI, parseModelAliases, resolveModelAlias, resolveModelConfig, findModelConfig, setTestAliases: (raw) => { currentAliases = parseModelAliases(raw); }, setTestDynamicModels: (models) => { dynamicModelsCache = { fetchedAt: Date.now(), models, pool: { premium: new Set(), standard: null, glm: new Set() } }; if (typeof dynamicModelAvailability !== "undefined") dynamicModelAvailability = new Map(); }, setTestModelAvailability: (id, available) => { if (typeof dynamicModelAvailability !== "undefined") dynamicModelAvailability.set(id, { available, checkedAt: Date.now() }); }, cooldown, cooldownInfo, inCooldown, parseCooldown, nextPacificMidnight: typeof nextPacificMidnight === "function" ? nextPacificMidnight : null, pickToken, releaseToken: typeof releaseToken === "function" ? releaseToken : null, accountPoolExhaustion: typeof accountPoolExhaustion === "function" ? accountPoolExhaustion : null, waitingRoomResponse: typeof waitingRoomResponse === "function" ? waitingRoomResponse : null, pipeUpstreamToClient, pipeUpstreamToResponsesStream, anthropicStream, streamToNonStream, buildUpstreamPayload, anthropicFromChat, responsesToNonStream, markSessionInvalidated, wasRecentlyInvalidated, singleFlight, sessionRemainingMs, INVALIDATION_WINDOW_MS, SESSION_REUSE_SAFE_MS, SESSION_VERIFY_WINDOW_MS, executeChat, readCallUsage, accountLabel, summarizeAccountHealth, logCall, callLogSnapshot, readUsageFull, recordRequest, blankUsageTotals, recordAccountObservation, configureUsagePersistence, restoreUsageSnapshot, usageSnapshot, setTestEgressReject: (fn) => { onEgressReject = fn; }, egressRejectedResponse: typeof egressRejectedResponse === "function" ? egressRejectedResponse : null, MODEL_TIERS, handleModels };\n';
 
 // 可编程 fetch mock：测试里可替换 sandbox.fetch，返回可定制的 Response 形状
 // （worker 里用的是 { status, ok, headers, text() } 简化形状）。
 const fetchState = { calls: [], impl: null };
 const sandbox = {
-  console, TextEncoder, TextDecoder, Set, Map, Date, Math, Number, String, JSON, Uint8Array, Object,
+  console, TextEncoder, TextDecoder, Set, Map, Date, Math, Number, String, JSON, Uint8Array, Object, URL,
   setTimeout, clearTimeout, AbortController, ReadableStream, TransformStream,
   // Node 18+ 全局 Response/Request 注入沙箱（worker.js 的 jsonResponse 用 new Response）
   Response, Request, Headers,
@@ -30,7 +30,8 @@ sandbox.globalThis = sandbox;
 vm.createContext(sandbox);
 vm.runInContext(wrapper, sandbox);
 
-const { normalizeChatThinking, anthropicThinkingToEffort, namedEffort, normalizeReasoningEffort, collectReasoningTexts, anthropicStopReason, anthropicModelToOpenAI, parseModelAliases, resolveModelAlias, resolveModelConfig, findModelConfig, setTestAliases, setTestDynamicModels, cooldown, cooldownInfo, inCooldown, parseCooldown, nextPacificMidnight, pickToken, releaseToken, accountPoolExhaustion, waitingRoomResponse, pipeUpstreamToClient, pipeUpstreamToResponsesStream, anthropicStream, streamToNonStream, buildUpstreamPayload, anthropicFromChat, responsesToNonStream, markSessionInvalidated, wasRecentlyInvalidated, singleFlight, sessionRemainingMs, INVALIDATION_WINDOW_MS, SESSION_REUSE_SAFE_MS, SESSION_VERIFY_WINDOW_MS, executeChat, readCallUsage, accountLabel, summarizeAccountHealth, logCall, callLogSnapshot, readUsageFull, recordRequest, blankUsageTotals, recordAccountObservation, configureUsagePersistence, restoreUsageSnapshot, usageSnapshot, setTestEgressReject, egressRejectedResponse, MODEL_TIERS, handleModels } = sandbox.__unitTestApi__;
+const { normalizeChatThinking, anthropicThinkingToEffort, namedEffort, normalizeReasoningEffort, collectReasoningTexts, anthropicStopReason, anthropicModelToOpenAI, parseModelAliases, resolveModelAlias, resolveModelConfig, findModelConfig, setTestAliases, setTestDynamicModels, setTestModelAvailability, cooldown, cooldownInfo, inCooldown, parseCooldown, nextPacificMidnight, pickToken, releaseToken, accountPoolExhaustion, waitingRoomResponse, pipeUpstreamToClient, pipeUpstreamToResponsesStream, anthropicStream, streamToNonStream, buildUpstreamPayload, anthropicFromChat, responsesToNonStream, markSessionInvalidated, wasRecentlyInvalidated, singleFlight, sessionRemainingMs, INVALIDATION_WINDOW_MS, SESSION_REUSE_SAFE_MS, SESSION_VERIFY_WINDOW_MS, executeChat, readCallUsage, accountLabel, summarizeAccountHealth, logCall, callLogSnapshot, readUsageFull, recordRequest, blankUsageTotals, recordAccountObservation, configureUsagePersistence, restoreUsageSnapshot, usageSnapshot, setTestEgressReject, egressRejectedResponse, MODEL_TIERS, handleModels } = sandbox.__unitTestApi__;
+const workerDefault = sandbox.__workerDefault__;
 
 let pass = 0, fail = 0;
 function t(name, fn) {
@@ -893,6 +894,256 @@ await tAsync('模型按 免费 → US/SG → 限定 分组打 tier', async () =>
     throw new Error('别名不得绕过 M3 暂停闸门');
   }
   setTestAliases('');
+});
+
+const modelRefreshSources = {
+  agents: `
+export const FREEBUFF_ROOT_AGENT_ID_BY_MODEL: Record<string, string> = {
+  [FREEBUFF_MIMO_V25_MODEL_ID]: 'base2-free-mimo',
+  [FREEBUFF_OX_ALPHA_MODEL_ID]: 'base2-free-ox-alpha',
+}
+export const FREEBUFF_WEB_BASE3_AGENT_ID_BY_MODEL: Record<string, string> = {
+  [FREEBUFF_OX_ALPHA_MODEL_ID]: 'base3-free-ox-alpha',
+}
+`,
+  models: `
+export const FREEBUFF_MIMO_V25_MODEL_ID = 'mimo/mimo-v2.5'
+export const FREEBUFF_OX_ALPHA_MODEL_ID = 'stealth/ox-alpha'
+export const FREEBUFF_PREMIUM_MODEL_IDS = [] as const
+export const FREEBUFF_WEB_PREMIUM_MODEL_IDS = [...FREEBUFF_PREMIUM_MODEL_IDS] as const
+export const FREEBUFF_GLM_V52_MODEL_IDS = [] as const
+`,
+  stable: `
+export const FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID = 'deepseek/deepseek-v4-flash'
+export const FREEBUFF_DEEPSEEK_V4_PRO_MODEL_ID = 'deepseek/deepseek-v4-pro'
+export const FREEBUFF_MINIMAX_M3_MODEL_ID = 'minimax/minimax-m3'
+`,
+};
+
+function modelRefreshResponse(status, body) {
+  const text = typeof body === 'string' ? body : JSON.stringify(body);
+  return Promise.resolve({
+    status,
+    ok: status >= 200 && status < 300,
+    headers: {},
+    text: async () => text,
+    json: async () => JSON.parse(text),
+  });
+}
+
+function installModelRefreshFetch(endpointResponse) {
+  fetchState.calls = [];
+  fetchState.impl = (url) => {
+    const value = String(url);
+    if (value.includes('free-agents.ts')) return modelRefreshResponse(200, modelRefreshSources.agents);
+    if (value.includes('freebuff-models.ts')) return modelRefreshResponse(200, modelRefreshSources.models);
+    if (value.includes('freebuff-model-ids.ts')) return modelRefreshResponse(200, modelRefreshSources.stable);
+    if (value.includes('/models/stealth/ox-alpha/endpoints')) return endpointResponse();
+    return modelRefreshResponse(404, { error: { message: 'not found' } });
+  };
+}
+
+async function requestModelRefresh(apiKey = 'owner-key', env = { FREEBUFF_API_KEY: 'owner-key' }) {
+  return workerDefault.fetch(new Request('http://worker.test/v1/models?refresh=1', {
+    headers: { Authorization: `Bearer ${apiKey}` },
+  }), env);
+}
+
+async function requestModels(apiKey = 'owner-key', env = { FREEBUFF_API_KEY: 'owner-key' }) {
+  return workerDefault.fetch(new Request('http://worker.test/v1/models', {
+    headers: { Authorization: `Bearer ${apiKey}` },
+  }), env);
+}
+
+await tAsync('Master Key 强制刷新绕过新鲜缓存，Ox 无端点时动态撤下且不创建 session', async () => {
+  setTestDynamicModels([
+    { id: 'legacy/stale-model', session: 'legacy/stale-model', agent: 'legacy-agent' },
+    { id: 'stealth/ox-alpha', session: 'stealth/ox-alpha', agent: 'base2-free-ox-alpha' },
+  ]);
+  installModelRefreshFetch(() => modelRefreshResponse(200, {
+    data: { id: 'stealth/ox-alpha', endpoints: [] },
+  }));
+
+  const response = await requestModelRefresh();
+  const body = await response.json();
+  const urls = fetchState.calls.map((call) => call.url);
+  if (!urls.some((url) => url.includes('free-agents.ts'))) {
+    throw new Error('refresh=1 没有绕过 6 小时缓存: ' + JSON.stringify(urls));
+  }
+  if (!urls.some((url) => url.includes('/models/stealth/ox-alpha/endpoints'))) {
+    throw new Error('没有定点检查 ox-alpha endpoints: ' + JSON.stringify(urls));
+  }
+  if (urls.some((url) => url.includes('codebuff.com') || url.includes('/api/v1/freebuff/session'))) {
+    throw new Error('模型刷新不得请求 Freebuff session: ' + JSON.stringify(urls));
+  }
+  if (body.data.some((model) => model.id === 'stealth/ox-alpha')) {
+    throw new Error('无 endpoints 的 ox-alpha 仍在模型目录: ' + JSON.stringify(body.data));
+  }
+  if (body.data.some((model) => model.id === 'legacy/stale-model')) {
+    throw new Error('强刷后仍保留旧缓存模型: ' + JSON.stringify(body.data));
+  }
+  if (await resolveModelConfig('stealth/ox-alpha') !== null) {
+    throw new Error('已动态撤下的 ox-alpha 仍可进入请求解析');
+  }
+});
+
+await tAsync('进程冷启动直接调用 Ox 时也先检查 endpoints，不漏放首笔请求', async () => {
+  setTestDynamicModels(null);
+  installModelRefreshFetch(() => modelRefreshResponse(200, {
+    data: { id: 'stealth/ox-alpha', endpoints: [] },
+  }));
+
+  if (await resolveModelConfig('stealth/ox-alpha') !== null) {
+    throw new Error('冷启动刷新已确认无 endpoints，首笔 Ox 仍被解析为可调用');
+  }
+});
+
+await tAsync('模型刷新单飞且原子发布，并发目录与调用不会看到未检查的 Ox', async () => {
+  setTestDynamicModels(null);
+  let markEndpointStarted;
+  let releaseEndpoint;
+  const endpointStarted = new Promise((resolve) => { markEndpointStarted = resolve; });
+  installModelRefreshFetch(() => {
+    markEndpointStarted();
+    return new Promise((resolve) => {
+      releaseEndpoint = () => modelRefreshResponse(200, {
+        data: { id: 'stealth/ox-alpha', endpoints: [] },
+      }).then(resolve);
+    });
+  });
+
+  const forcedRefresh = requestModelRefresh().then((response) => response.json());
+  await endpointStarted;
+
+  let regularSettled = false;
+  let resolveSettled = false;
+  const regularRequest = requestModels().then(async (response) => {
+    const body = await response.json();
+    regularSettled = true;
+    return body;
+  });
+  const modelResolution = resolveModelConfig('stealth/ox-alpha').then((model) => {
+    resolveSettled = true;
+    return model;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const leakedBeforeProbe = regularSettled || resolveSettled;
+
+  releaseEndpoint();
+  const [forcedBody, regularBody, resolvedModel] = await Promise.all([
+    forcedRefresh, regularRequest, modelResolution,
+  ]);
+  const sourceFetches = fetchState.calls.filter((call) =>
+    call.url.includes('free-agents.ts') || call.url.includes('freebuff-models.ts')
+      || call.url.includes('freebuff-model-ids.ts'));
+  const endpointFetches = fetchState.calls.filter((call) =>
+    call.url.includes('/models/stealth/ox-alpha/endpoints'));
+
+  setTestDynamicModels(null);
+  fetchState.impl = null;
+  fetchState.calls = [];
+
+  if (leakedBeforeProbe) throw new Error('endpoint 检查完成前并发请求看到了半成品模型缓存');
+  if (sourceFetches.length !== 3 || endpointFetches.length !== 1) {
+    throw new Error(`并发刷新没有复用同一轮请求: source=${sourceFetches.length}, endpoint=${endpointFetches.length}`);
+  }
+  for (const body of [forcedBody, regularBody]) {
+    if (body.data.some((model) => model.id === 'stealth/ox-alpha')) {
+      throw new Error('并发目录请求仍返回无 endpoints 的 Ox');
+    }
+  }
+  if (resolvedModel !== null) throw new Error('并发调用仍解析到无 endpoints 的 Ox');
+});
+
+await tAsync('官方源码失败改走 Release 兜底时仍检查 Ox endpoints', async () => {
+  setTestDynamicModels(null);
+  fetchState.calls = [];
+  fetchState.impl = (url) => {
+    const value = String(url);
+    if (value.includes('free-agents.ts') || value.includes('freebuff-models.ts')
+      || value.includes('freebuff-model-ids.ts')) {
+      return modelRefreshResponse(503, { error: { message: 'source unavailable' } });
+    }
+    if (value.includes('freebuff-models.json')) {
+      return modelRefreshResponse(200, {
+        models: [{ id: 'stealth/ox-alpha', session: 'stealth/ox-alpha', agent: 'base2-free-ox-alpha' }],
+        pools: { premium: [], glm: [] },
+      });
+    }
+    if (value.includes('/models/stealth/ox-alpha/endpoints')) {
+      return modelRefreshResponse(200, { data: { id: 'stealth/ox-alpha', endpoints: [] } });
+    }
+    return modelRefreshResponse(404, { error: { message: 'not found' } });
+  };
+
+  const body = await (await requestModelRefresh()).json();
+  if (!fetchState.calls.some((call) => call.url.includes('freebuff-models.json'))) {
+    throw new Error('官方源码失败后没有进入 Release 兜底');
+  }
+  if (!fetchState.calls.some((call) => call.url.includes('/models/stealth/ox-alpha/endpoints'))) {
+    throw new Error('Release 兜底提前返回，跳过了 Ox endpoints 检查');
+  }
+  if (body.data.some((model) => model.id === 'stealth/ox-alpha')) {
+    throw new Error('Release 兜底中的无端点 Ox 仍出现在目录');
+  }
+});
+
+await tAsync('手动刷新全源失败时保留旧目录并明确标记未更新', async () => {
+  setTestDynamicModels([
+    { id: 'legacy/stale-model', session: 'legacy/stale-model', agent: 'legacy-agent' },
+  ]);
+  fetchState.calls = [];
+  fetchState.impl = () => modelRefreshResponse(503, { error: { message: 'source unavailable' } });
+
+  const body = await (await requestModelRefresh()).json();
+
+  setTestDynamicModels(null);
+  fetchState.impl = null;
+  fetchState.calls = [];
+
+  if (body.refresh?.updated !== false || body.refresh?.source !== 'cache') {
+    throw new Error('全源失败没有返回 stale refresh 状态: ' + JSON.stringify(body.refresh));
+  }
+  if (!body.data.some((model) => model.id === 'legacy/stale-model')) {
+    throw new Error('全源失败不应丢弃上次模型目录');
+  }
+});
+
+await tAsync('Ox 可用性检查失败时保留上次可用状态', async () => {
+  setTestDynamicModels([
+    { id: 'stealth/ox-alpha', session: 'stealth/ox-alpha', agent: 'base2-free-ox-alpha' },
+  ]);
+  setTestModelAvailability('stealth/ox-alpha', true);
+  installModelRefreshFetch(() => modelRefreshResponse(503, { error: { message: 'temporary' } }));
+
+  const body = await (await requestModelRefresh()).json();
+  if (!fetchState.calls.some((call) => call.url.includes('/models/stealth/ox-alpha/endpoints'))) {
+    throw new Error('强刷没有执行 ox-alpha 可用性检查');
+  }
+  if (!body.data.some((model) => model.id === 'stealth/ox-alpha')) {
+    throw new Error('OpenRouter 瞬时失败误删了上次可用的 ox-alpha');
+  }
+});
+
+await tAsync('Ox endpoints 恢复后重新进入模型目录', async () => {
+  setTestDynamicModels([
+    { id: 'stealth/ox-alpha', session: 'stealth/ox-alpha', agent: 'base2-free-ox-alpha' },
+  ]);
+  setTestModelAvailability('stealth/ox-alpha', false);
+  installModelRefreshFetch(() => modelRefreshResponse(200, {
+    data: { id: 'stealth/ox-alpha', endpoints: [{ name: 'restored' }] },
+  }));
+
+  const body = await (await requestModelRefresh()).json();
+  if (!fetchState.calls.some((call) => call.url.includes('/models/stealth/ox-alpha/endpoints'))) {
+    throw new Error('强刷没有执行 ox-alpha 恢复检查');
+  }
+  if (!body.data.some((model) => model.id === 'stealth/ox-alpha')) {
+    throw new Error('已有 endpoints 的 ox-alpha 没有恢复到目录');
+  }
+  setTestDynamicModels(null);
+  fetchState.impl = null;
+  fetchState.calls = [];
 });
 
 // stealth/ox-alpha 已开放（官方 2026-08-24 放进 CLI/Desktop 目录并清空

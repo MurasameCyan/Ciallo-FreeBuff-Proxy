@@ -58,6 +58,8 @@ const DYNAMIC_MODELS_STABLE_IDS_SOURCES = [
 const DYNAMIC_MODELS_RELEASE_SOURCES = [
   "https://github.com/pingmike2/freebuff2api-wokers/releases/latest/download/freebuff-models.json",
 ];
+const MODEL_ENDPOINTS_API = "https://openrouter.ai/api/v1/models";
+const ENDPOINT_CHECK_MODEL_IDS = new Set(["stealth/ox-alpha"]);
 // 刷新间隔：与 Quorinex 对齐，6 小时。失败时回退到硬编码 MODELS。
 const DYNAMIC_MODELS_REFRESH_MS = 6 * 60 * 60 * 1000;
 const DYNAMIC_MODELS_FETCH_TIMEOUT_MS = 10000;
@@ -68,6 +70,10 @@ let dynamicModelsCache = {
   models: null, // 动态模型表（含分类）
   pool: null, // { premium: Set, standard: Set, glm: Set }
 };
+let dynamicModelsRefreshFlight = null;
+// 公开 provider 端点状态。只有明确拿到 endpoints: [] 才标记不可用；网络错误沿用
+// 上次结果，避免一次 OpenRouter 抖动把仍可用的模型从目录误删。
+let dynamicModelAvailability = new Map(); // modelId -> { available, checkedAt }
 
 // 解析 freebuff-models.ts 的模型 ID 常量
 // 形如:
@@ -259,11 +265,43 @@ async function fetchSourceList(urls) {
   return null;
 }
 
-async function refreshDynamicModelsIfStale() {
-  const now = Date.now();
-  if (dynamicModelsCache.models && now - dynamicModelsCache.fetchedAt < DYNAMIC_MODELS_REFRESH_MS) {
-    return dynamicModelsCache;
+async function refreshEndpointAvailability(models, previous = dynamicModelAvailability) {
+  const next = new Map(previous);
+  const ids = new Set((Array.isArray(models) ? models : []).map((model) => model?.id));
+  for (const modelId of ENDPOINT_CHECK_MODEL_IDS) {
+    if (!ids.has(modelId)) continue;
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), DYNAMIC_MODELS_FETCH_TIMEOUT_MS);
+      let resp;
+      try {
+        resp = await fetch(`${MODEL_ENDPOINTS_API}/${modelId}/endpoints`, {
+          signal: ctrl.signal,
+          headers: { Accept: "application/json" },
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+      if (!resp.ok) continue;
+      const body = await resp.json();
+      if (!Array.isArray(body?.data?.endpoints)) continue;
+      next.set(modelId, {
+        available: body.data.endpoints.length > 0,
+        checkedAt: Date.now(),
+      });
+    } catch {}
   }
+  return next;
+}
+
+function modelIsAvailable(modelId) {
+  return dynamicModelAvailability.get(String(modelId || ""))?.available !== false;
+}
+
+async function performDynamicModelsRefresh() {
+  let nextCache = dynamicModelsCache;
+  let refreshed = false;
+  let source = "cache";
   // 并行拉 3 个源（每源主 raw + 备 jsDelivr）
   const [agentsSrc, modelsSrc, stableIdsSrc] = await Promise.all([
     fetchSourceList(DYNAMIC_MODELS_SOURCES),
@@ -274,13 +312,11 @@ async function refreshDynamicModelsIfStale() {
     // 官方源拉取失败：尝试 Releases JSON 兜底
     const release = await tryReleaseFallback();
     if (release) {
-      dynamicModelsCache = release;
-      return dynamicModelsCache;
+      nextCache = release;
+      refreshed = true;
+      source = "release";
     }
-    // Releases 也失败：保留旧缓存（若有），否则维持现状
-    return dynamicModelsCache;
-  }
-  try {
+  } else try {
     // 合并常量表：models.ts 优先（完整），stableIds.ts 补充 deepseek/m3
     const modelIdConstants = { ...parseModelIdConstants(stableIdsSrc || ""), ...parseModelIdConstants(modelsSrc) };
     const agentMappings = parseAgentMappings(agentsSrc, modelIdConstants);
@@ -288,32 +324,58 @@ async function refreshDynamicModelsIfStale() {
       // 解析失败：尝试 Releases 兜底
       const release = await tryReleaseFallback();
       if (release) {
-        dynamicModelsCache = release;
-        return dynamicModelsCache;
+        nextCache = release;
+        refreshed = true;
+        source = "release";
       }
-      return dynamicModelsCache;
+    } else {
+      const pools = parseModelPools(modelsSrc, modelIdConstants);
+      const pool = {
+        premium: new Set(pools.premium),
+        standard: null,
+        glm: new Set(pools.glm),
+      };
+      nextCache = {
+        fetchedAt: Date.now(),
+        models: annotateDynamicModelPools(buildDynamicModelTable(agentMappings), pool),
+        pool,
+      };
+      refreshed = true;
+      source = "official";
     }
-    const pools = parseModelPools(modelsSrc, modelIdConstants);
-    const pool = {
-      premium: new Set(pools.premium),
-      standard: null,
-      glm: new Set(pools.glm),
-    };
-    dynamicModelsCache = {
-      fetchedAt: Date.now(),
-      models: annotateDynamicModelPools(buildDynamicModelTable(agentMappings), pool),
-      pool,
-    };
   } catch {
     // 解析崩溃：尝试 Releases 兜底
     const release = await tryReleaseFallback();
     if (release) {
-      dynamicModelsCache = release;
-      return dynamicModelsCache;
+      nextCache = release;
+      refreshed = true;
+      source = "release";
     }
     // 保留旧缓存
   }
-  return dynamicModelsCache;
+
+  // 先完成 endpoint 检查，再在同一 tick 发布两份状态。并发请求不会看到
+  // “新目录 + 旧/未知 availability” 的半成品。
+  const nextAvailability = await refreshEndpointAvailability(nextCache.models, dynamicModelAvailability);
+  dynamicModelAvailability = nextAvailability;
+  dynamicModelsCache = nextCache;
+  return { cache: dynamicModelsCache, refreshed, source };
+}
+
+async function refreshDynamicModelsIfStale(force = false) {
+  // 强刷进行中时，普通目录请求也等待同一轮；必须早于 fresh-cache 判断。
+  if (dynamicModelsRefreshFlight) return dynamicModelsRefreshFlight;
+  const now = Date.now();
+  if (!force && dynamicModelsCache.models && now - dynamicModelsCache.fetchedAt < DYNAMIC_MODELS_REFRESH_MS) {
+    return { cache: dynamicModelsCache, refreshed: false, source: "cache" };
+  }
+  const flight = performDynamicModelsRefresh();
+  dynamicModelsRefreshFlight = flight;
+  try {
+    return await flight;
+  } finally {
+    if (dynamicModelsRefreshFlight === flight) dynamicModelsRefreshFlight = null;
+  }
 }
 
 // Releases JSON 兜底：直接拉预生成的 models.json，零解析成本
@@ -601,7 +663,8 @@ export default {
     cleanCache();
 
     if (request.method === "GET" && (url.pathname === "/v1/models" || url.pathname === "/models")) {
-      return await handleModels(client);
+      const forceRefresh = client.owner === true && url.searchParams.get("refresh") === "1";
+      return await handleModels(client, { forceRefresh });
     }
     if (request.method === "POST" && (url.pathname === "/v1/chat/completions" || url.pathname === "/chat/completions")) {
       return handleChat(request, env, client);
@@ -3776,7 +3839,7 @@ function resolveModelAlias(modelId) {
 // 查找模型配置：自定义别名 → 硬编码 MODELS → 动态表（合并表）
 function findModelConfig(modelId) {
   const target = resolveModelAlias(modelId) || modelId;
-  if (PAUSED_QUOTA_MODELS.has(target) || isHiddenModelId(target)) return null;
+  if (PAUSED_QUOTA_MODELS.has(target) || isHiddenModelId(target) || !modelIsAvailable(target)) return null;
   const hit = MODELS.find((m) => m.id === target);
   if (hit) return hit;
   const dyn = dynamicModelsCache.models;
@@ -3790,15 +3853,20 @@ function findModelConfig(modelId) {
 // 查找模型配置前确保动态注册表已加载。
 // 不能依赖 /v1/models 先被调用：Cloudflare 不保证两个请求落在同一 isolate。
 async function resolveModelConfig(modelId) {
+  if (dynamicModelsRefreshFlight) {
+    try { await dynamicModelsRefreshFlight; } catch {}
+  }
   const target = resolveModelAlias(modelId) || modelId;
-  if (PAUSED_QUOTA_MODELS.has(target) || isHiddenModelId(target)) return null;
+  if (PAUSED_QUOTA_MODELS.has(target) || isHiddenModelId(target) || !modelIsAvailable(target)) return null;
   let hit = findModelConfig(target);
   if (hit) return hit;
   try {
-    const dyn = await refreshDynamicModelsIfStale();
+    const { cache: dyn } = await refreshDynamicModelsIfStale();
     if (dyn && dyn.models) {
+      // Endpoint 可用性检查可能刚在刷新阶段更新；统一再过一次本地闸门，
+      // 避免冷启动首笔请求绕过已确认的不可用状态。
       hit = dyn.models.find((m) => m.id === target) || null;
-      if (hit) return hit;
+      if (hit && modelIsAvailable(target)) return hit;
     }
   } catch {}
   return findModelConfig(target);
@@ -5376,10 +5444,12 @@ function cleanCache() {
 // 该接口会占用账号 session，而 Freebuff 一个号同一时间只能一个客户端在线，
 // 查询会干扰/顶掉正在进行的 chat 会话（428 waiting_room_required）。
 // 自定义别名不在此展示（面板单独管理），避免污染客户端模型列表。
-async function handleModels(client = null) {
+async function handleModels(client = null, { forceRefresh = false } = {}) {
   let modelList = MODELS;
+  let refreshResult = null;
   try {
-    const dyn = await refreshDynamicModelsIfStale();
+    refreshResult = await refreshDynamicModelsIfStale(forceRefresh);
+    const dyn = refreshResult.cache;
     if (dyn && dyn.models && dyn.models.length) {
       modelList = mergeModelTables(MODELS, dyn.models);
     }
@@ -5391,7 +5461,7 @@ async function handleModels(client = null) {
   }
   // 官方暂停模型可能残留在动态源/旧 Key 白名单中；它不能继续出现在正常
   // 模型目录，否则客户端会先选中再收到上游 409。
-  modelList = modelList.filter((m) => !PAUSED_QUOTA_MODELS.has(m.id) && !isHiddenModelId(m.id));
+  modelList = modelList.filter((m) => !PAUSED_QUOTA_MODELS.has(m.id) && !isHiddenModelId(m.id) && modelIsAvailable(m.id));
   const data = modelList
     .map((m) => {
       // 实测（2026-08-15）：免费账号只有 Flash / MiMo 2.5 两个模型能建会话
@@ -5413,7 +5483,16 @@ async function handleModels(client = null) {
     })
     .sort((a, b) => a._sort - b._sort)
     .map(({ _sort, ...m }) => m);
-  return jsonResponse({ object: "list", data }, 200, { "X-Freebuff2api-Version": VERSION });
+  return jsonResponse({
+    object: "list",
+    data,
+    ...(forceRefresh ? {
+      refresh: {
+        updated: refreshResult?.refreshed === true,
+        source: refreshResult?.source || "cache",
+      },
+    } : {}),
+  }, 200, { "X-Freebuff2api-Version": VERSION });
 }
 
 // 请求带的 key。Bearer 优先，其次 x-api-key。

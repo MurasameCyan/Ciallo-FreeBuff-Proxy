@@ -189,7 +189,18 @@
             <div>
               <h3 id="h-models">模型列表</h3>
             </div>
-            <span class="count" id="modelCount"></span>
+            <div class="model-head-actions">
+              <span class="count" id="modelCount"></span>
+              <button type="button" class="btn tiny icon" id="modelRefresh"
+                      title="获取最新模型列表" aria-label="获取最新模型列表">
+                <svg class="refresh" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor"
+                     stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <polyline points="23 4 23 10 17 10"/>
+                  <polyline points="1 20 1 14 7 14"/>
+                  <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+                </svg>
+              </button>
+            </div>
           </div>
           <ul class="models" id="models"></ul>
           <p class="empty" id="models-empty" hidden>加载中…</p>

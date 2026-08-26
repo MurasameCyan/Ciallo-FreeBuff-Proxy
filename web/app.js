@@ -1557,6 +1557,32 @@ function wire() {
     }
   });
 
+  // 只重拉公开模型目录与 provider endpoint，不探账号、不创建 Freebuff session。
+  $('modelRefresh')?.addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    if (btn.disabled) return;
+    btn.disabled = true;
+    btn.classList.add('spin');
+    try {
+      const models = await rawApi('/v1/models?refresh=1', {
+        headers: { 'Authorization': 'Bearer ' + S.apiKey },
+      });
+      S.models = models.data || [];
+      renderModels();
+      renderKeys();
+      if (models.refresh?.updated === false) {
+        toast(`未能获取最新模型，已保留当前列表（共 ${S.models.length} 个）`, 'err');
+      } else {
+        toast(`模型列表已更新，共 ${S.models.length} 个`, 'ok');
+      }
+    } catch (err) {
+      toast(`获取模型列表失败:${err.message}`, 'err');
+    } finally {
+      btn.disabled = false;
+      btn.classList.remove('spin');
+    }
+  });
+
   // 账号列表头的眼睛：只切展示，不重新拉数据（静态按钮，只在这里挂一次监听）
   $('maskEmail')?.addEventListener('click', () => {
     S.maskEmail = !S.maskEmail;
