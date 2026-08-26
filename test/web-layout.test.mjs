@@ -811,6 +811,15 @@ assert.ok(!app.includes('c.node') && !app.includes('r.node'),
   '详情里的“节点”必须改为调度的账号名，不应保留 node 字段');
 assert.ok(app.includes("tag('nm'"), '调用日志主行必须有 .nm 承载账号名');
 
+// 时间下方的 User 行：分享 Key 显示备注名，主 Key 固定写 Master Key（2026-08-26）
+assert.match(app, /user\.textContent = `User: \$\{r\.key === S\.ownerName \? 'Master Key' : r\.key\}`/,
+  'User 行必须把主 Key 显示成 Master Key，并把分享 Key 显示成其备注名');
+assert.ok(app.includes('calllog-user'), 'User 行必须用 .calllog-user 承载');
+assert.match(app, /li\.append\(main, user, sub\)/,
+  '调用日志明细顺序必须是时间主行 → User 行 → Token 行');
+assert.ok(!/sub\.textContent \+= ` · Key /.test(app),
+  '行尾的「· Key xxx」必须并入 User 行，不得重复出现');
+
 // 聚合与格式化（与 zen core.js 同口径）
 for (const fn of ['function fmtClock', 'function fmtDelay', 'function fmtTokens',
   'function fmtCount', 'function callLog', 'function renderCallLog', 'function num']) {
@@ -1023,8 +1032,8 @@ assert.doesNotMatch(app, /在跑 \$\{st\.inFlight\}<\/span>/,
   '运行状态的可见文本不得再包含“在跑”');
 assert.match(css, /\.key-inflight\s*\{[^}]*color:\s*var\(--mint\)/s,
   '运行中的数量必须使用绿色样式');
-assert.match(app, /if \(r\.key && r\.key !== S\.ownerName\)/,
-  '调用日志只在共享 key 上标 Key 名：主 Key 自己用时那行是噪音，历史空值也不显示');
+assert.match(app, /if \(r\.key\)/,
+  '调用日志必须为分享 Key 和 Master Key 都显示 User 行，历史空值不显示');
 assert.ok(app.includes("api('/keys')"), '面板必须读取分享 Key 列表与归账');
 
 // ── Key 面板控件精简：纯图标操作、圆点状态、模型按钮组 ──────────

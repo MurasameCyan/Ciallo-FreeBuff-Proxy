@@ -1296,16 +1296,23 @@ function renderCallLog() {
 
     const sub = document.createElement('p');
     sub.className = 'sub';
+    // 时间下方独立一行 User:哪把 key 发的。分享 Key 显示备注名,主 Key 固定写
+    // Master Key;空值(加多 key 之前的历史行/内部调用)不显示这一行。
+    // 原行尾的「· Key xxx」并进这里,不再重复出现。
+    let user = null;
+    if (r.key) {
+      user = document.createElement('p');
+      user.className = 'sub calllog-user';
+      user.textContent = `User: ${r.key === S.ownerName ? 'Master Key' : r.key}`;
+    }
     // Token 总数下来和分项同行：它就是入+出的和，拆两行对不起来。
     // 推理 token 单列：它不计入 total（上游算在 completion 里），但「这次想了
     // 多少」是判断强度有没有生效最直接的一个数
     sub.textContent = `Token ${fmtTokens(r.total)} · 入 ${fmtTokens(r.in)}`
       + ` · 出 ${fmtTokens(r.out)} · 推理 ${fmtTokens(r.reasoning)}`;
-    // 哪把 key 发的。只在多 key 场景有意义：主 Key 自己用时这行是噪音，
-    // 空值（加多 key 之前的历史行）也不显示。
-    if (r.key && r.key !== S.ownerName) sub.textContent += ` · Key ${r.key}`;
 
-    li.append(main, sub);
+    if (user) li.append(main, user, sub);
+    else li.append(main, sub);
     return li;
   }));
   ul.scrollTop = top;

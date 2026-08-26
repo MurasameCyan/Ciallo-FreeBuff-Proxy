@@ -1094,6 +1094,10 @@ details[open] > .calllog-summary { margin-bottom: 14px; }
   font-family: var(--mono); font-size: 11px; color: var(--fg-2);
   font-variant-numeric: tabular-nums;
 }
+/* User 行紧跟主行、在 Token 行上方；左对齐与时刻对齐，扫一眼就知道是谁发的 */
+.calllog-row .calllog-user {
+  margin: 4px 0 0; text-align: left;
+}
 
 /* ── 概况（移植自 zen） ───────────────────────────────────
    通栏卡内 2×2 四格。刻意用 .usage-* 私有类，不复用账号池概况的 .stats/.stat
