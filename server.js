@@ -540,7 +540,7 @@ async function probeAccount(token, {
     else if (typedState === 'model_locked') { state = 'model_locked'; label = 'session 被锁定'; }
     else if (typedState === 'rate_limited' || typedState === 'spend_limited') { state = typedState; label = typedState === 'spend_limited' ? '账号消费额度受限' : '模型额度受限'; quota = fmtQuota(); }
     else if (typedState === 'ip_capped') { state = 'ip_capped'; label = 'IP 并发上限'; }
-    else if (typedState === 'waiting_room_queued' || typedState === 'waiting_room_required') { state = 'waiting_room'; label = '等待室排队'; }
+    else if (typedState === 'waiting_room_queued' || typedState === 'waiting_room_required') { state = 'waiting_room'; label = '等待室排队'; quota = fmtQuota(); }
     else { state = 'ok'; label = '存活'; quota = fmtQuota(); }
   } else { state = 'unknown'; label = `HTTP ${r.status}`; }
   const result = {
@@ -860,6 +860,10 @@ function scheduleAccountEgress(account, { force = false } = {}) {
       try {
         await configureAccountEgress(current, { force: runForce, persist: false });
       } catch (error) {
+        // 终态号（ACCOUNT_EGRESS_TERMINAL）没有重试意义：账号已被封禁/停用，
+        // 出站配置永远不可能成功。直接终止任务，否则 force 轮询会把它无限拉起
+        // （实测 15 分钟刷几十条「账号已进入终态」，纯浪费）。
+        if (error?.code === 'ACCOUNT_EGRESS_TERMINAL' || error?.code === 'ACCOUNT_CHANGED') return null;
         console.error(`[server] 账号 ${account.key} 出站配置失败: ${String(error?.message || error).slice(0, 180)}`);
       }
     } while (!record.cancelled && record.pendingForce);

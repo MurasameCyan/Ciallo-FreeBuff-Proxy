@@ -512,6 +512,34 @@ test('旧探测响应不能用已暂停 M3 作为高级节点证据', () => {
   }), null, 'M3 即使残留 Premium 行也不得让自动选点误判为高级节点');
 });
 
+// 实测 2026-08-26：上游拥堵波次里探针拿到 waiting_room，若判成验证失败，
+// 节点被逐个拉黑、lane 无法就绪、全部请求本地拒成 egress_unavailable。
+// waiting_room 恰恰证明出口路径已被上游应用层接受——必须算验证通过。
+test('排队/额度类探测结果证明出口路径可用，不得判成验证失败', () => {
+  assert.deepEqual(proxyModule.classifyAccountProbeAuthorization({
+    state: 'waiting_room',
+    accessTier: 'full',
+    quota: [
+      { model: 'openai/gpt-5.6-luna', used: 1, limit: 2, pool: 'luna' },
+    ],
+  }), { tier: 'advanced', model: 'openai/gpt-5.6-luna' },
+  'waiting_room 探针 + full tier 必须照常授权为高级节点');
+  assert.deepEqual(proxyModule.classifyAccountProbeAuthorization({
+    state: 'rate_limited',
+    accessTier: null,
+    quota: [{ model: 'deepseek/deepseek-v4-flash', used: 5, limit: 5, pool: 'premium' }],
+  }), { tier: 'advanced', model: 'deepseek/deepseek-v4-flash' },
+  '额度耗尽的 429 同样走通了链路，旧响应无 accessTier 时按 pool 判定');
+  assert.equal(proxyModule.classifyAccountProbeAuthorization({
+    state: 'blocked',
+    quota: [{ model: 'mimo/mimo-v2.5', used: 0, limit: 6 }],
+  }), null, '403 blocked 是链路被拒，不能算验证通过');
+  assert.equal(proxyModule.classifyAccountProbeAuthorization({
+    state: 'ip_capped',
+    quota: [{ model: 'mimo/mimo-v2.5', used: 0, limit: 6 }],
+  }), null, 'ip_capped 是出口 IP 级问题，不能算验证通过');
+});
+
 test('账号自动出站优先级可持久化并切换', async () => {
   assert.equal(proxyModule.resolveProxySettings({}).accountSelectionPriority, 'advanced');
   assert.equal(proxyModule.resolveProxySettings({ saved: { accountSelectionPriority: 'unused' } }).accountSelectionPriority, 'unused');

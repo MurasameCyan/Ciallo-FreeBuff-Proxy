@@ -730,7 +730,10 @@ function accountSwitchJitterMs(env) {
 // ponytail: 固定窗口 + 固定额度，不是自适应退避。上游长队时仍会 503，只是不再
 // 因为一份几小时前的旧状态而失败；不够用就调这两个环境变量。
 const WAITING_ROOM_DEPRIORITIZE_MS = 60 * 1000;
-const MAX_WAITING_ROOM_SWITCHES = 2;
+// 实测 2026-08-26：排队是模型后端级的（同一秒 luna 200 而 ox 503），但波次里并非
+// 全池同挡——多试几个空闲号常能捡到没被排队的。2 → 4；仍受重试链 45s 总预算约束，
+// 不会吊到客户端超时。
+const MAX_WAITING_ROOM_SWITCHES = 4;
 
 function waitingRoomDeprioritizeMs(env) {
   // 空串陷阱同 maxAccountSwitches：`FREEBUFF_WAITING_ROOM_DEPRIORITIZE_MS=` 传进来是
@@ -2021,10 +2024,16 @@ function waitingRoomResponse(retryAfterMs = 30 * 1000, modelHint = "") {
   }, 503, { "Retry-After": String(seconds) });
 }
 
+// 两种 state 必须分开说（2026-08-26 用户反馈）：egress_unavailable 是本地判定
+// （lane 未就绪，请求根本没发出去），说「被上游拒绝」会把锅甩给上游；只有
+// egress_rejected 才是上游真拒了出口 IP。
 function egressRejectedResponse(state) {
+  const unavailable = state === "egress_unavailable";
   return jsonResponse({
     error: {
-      message: "当前出口被上游拒绝，请等待代理节点恢复后重试",
+      message: unavailable
+        ? "出站代理通道尚未就绪，网关正在自动重建，请稍后重试"
+        : "当前出口节点被上游（Freebuff）拒绝，网关正在自动更换节点，请稍后重试",
       type: "egress_unavailable",
       state: state || "egress_rejected",
     },

@@ -117,7 +117,8 @@ function createQueueingUpstream({ start, queuedTokens = new Set(), log }) {
   };
 }
 
-const POOL = Array.from({ length: 6 }, (_, i) => `waiting-room-token-${String(i).padStart(18, 'w')}`);
+// 8 个号：默认排队预算 2+4=6 时，「预算封顶」与「不许试完整池」两个不变量才有区分度。
+const POOL = Array.from({ length: 8 }, (_, i) => `waiting-room-token-${String(i).padStart(18, 'w')}`);
 
 test('排队号不占换号预算：前 3 个号排队，第 4 个号仍能成功', async () => {
   const start = Date.UTC(2030, 0, 1);
@@ -153,9 +154,10 @@ test('排队预算也有上限：整池排队时不会退化成全池轮询', as
   const body = JSON.parse(await response.text());
   assert.equal(body.error.type, 'waiting_room');
   // 关键：不能因为「排队不计预算」就把上周堵住的全池轮询放大器又放开。
+  // 默认排队预算 4（2026-08-26 从 2 上调）：最多碰 2 换号 + 4 排队 = 6 个号。
   const posts = log.filter((e) => e.path === '/api/v1/freebuff/session' && e.method === 'POST');
-  assert.ok(posts.length <= 4,
-    `排队换号有独立上限，最多碰 2+2 个号，实际 POST /session ${posts.length} 次`);
+  assert.ok(posts.length <= 6,
+    `排队换号有独立上限，最多碰 2+4 个号，实际 POST /session ${posts.length} 次`);
   assert.ok(posts.length < POOL.length, '不许试完整个 6 号池子');
 });
 
@@ -202,7 +204,9 @@ test('两个环境变量都不会被空串静默关掉（Number("") 陷阱）', 
   const workerVm = createWorkerVm({ now: Date.UTC(2030, 0, 1) });
   const { api } = workerVm;
   // docker-compose 里写 `FREEBUFF_MAX_WAITING_ROOM_SWITCHES=` 传进来是空串。
-  assert.equal(api.maxWaitingRoomSwitches({ FREEBUFF_MAX_WAITING_ROOM_SWITCHES: '' }), 2);
+  // 默认 4（2026-08-26：排队是模型后端级波次，多试几个空闲号常能捡到没被排队的）。
+  assert.equal(api.maxWaitingRoomSwitches({ FREEBUFF_MAX_WAITING_ROOM_SWITCHES: '' }), 4);
+  assert.equal(api.maxWaitingRoomSwitches({}), 4);
   assert.equal(api.waitingRoomDeprioritizeMs({ FREEBUFF_WAITING_ROOM_DEPRIORITIZE_MS: '' }), 60 * 1000);
   // 显式 0 是合法的关闭意图，必须被尊重。
   assert.equal(api.maxWaitingRoomSwitches({ FREEBUFF_MAX_WAITING_ROOM_SWITCHES: '0' }), 0);

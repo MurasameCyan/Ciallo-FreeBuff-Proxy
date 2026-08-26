@@ -144,8 +144,14 @@ const PAUSED_ACCOUNT_AUTH_MODELS = new Set([
   'minimax/minimax-m3',
 ]);
 
+// 这些探测结果同样证明「出口路径可用」：上游在应用层认出了这个 IP + 凭据并给出了
+// 账号/模型级的状态（排队、额度），而不是拒绝这条链路。拥堵波次里若把 waiting_room
+// 探针判成验证失败，节点会被逐个拉黑、lane 永远无法就绪，全部请求都被本地拒成
+// egress_unavailable（2026-08-26 实测）。地区/IP 级状态不在其中——那才是真·出口问题。
+const PATH_PROVEN_PROBE_STATES = new Set(['ok', 'waiting_room', 'rate_limited', 'spend_limited']);
+
 export function classifyAccountProbeAuthorization(probe) {
-  if (!probe || typeof probe !== 'object' || probe.state !== 'ok') return null;
+  if (!probe || typeof probe !== 'object' || !PATH_PROVEN_PROBE_STATES.has(probe.state)) return null;
   const accessTier = String(probe.accessTier || '').trim().toLowerCase();
   const quota = Array.isArray(probe.quota) ? probe.quota : null;
   const rowFor = (model) => quota?.find((entry) => entry?.model === model) || null;
