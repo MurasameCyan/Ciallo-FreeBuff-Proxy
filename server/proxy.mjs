@@ -85,6 +85,7 @@ const MAX_HEALTH_INTERVAL = 86400;
 // 自动更新订阅比测活重（要重新拉取机场配置），最小粒度限制为 1 小时。
 const MIN_UPDATE_INTERVAL = 3600;
 const MAX_UPDATE_INTERVAL = 86400;
+const STARTUP_REFRESH_RETRY_DELAY_MS = 1000;
 
 // 自动选点优先的地区。免费额度能用哪些模型由出口 IP 的 accessTier 决定，
 // 美国/新加坡出口拿到 full 的概率明显更高，选错地区比慢几十毫秒代价大得多。
@@ -417,6 +418,7 @@ export function createProxyService({
   now = () => Date.now(),
   setIntervalFn = setInterval,
   clearIntervalFn = clearInterval,
+  sleepFn = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   onAutoRefresh = null,
 } = {}) {
   if (!manager) throw new Error('proxy service 缺少 manager');
@@ -1169,6 +1171,7 @@ export function createProxyService({
       if (hadLastGood) {
         state = 'ready';
       } else {
+        stopTimers();
         await closeDispatcher();
         state = 'error';
       }
@@ -1224,7 +1227,13 @@ export function createProxyService({
         }
         if (!cfg.subscriptionUrl) return disableCore();
         if (!(await startCore())) return snapshot();
-        return refreshCore({ ensureStarted: false });
+        let result = await refreshCore({ ensureStarted: false });
+        if (!result?.ok) {
+          serviceLogger('warn', '[proxy] 启动刷新失败，1 秒后重试一次');
+          await sleepFn(STARTUP_REFRESH_RETRY_DELAY_MS);
+          result = await refreshCore({ ensureStarted: false });
+        }
+        return result;
       });
     },
     setSubscription(value) { return serial(() => setSubscriptionCore(value)); },

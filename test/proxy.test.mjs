@@ -77,6 +77,73 @@ test('初始化时环境变量订阅不能被调用方传入地址覆盖', async
   assert.equal(service.isEnvLocked(), true);
 });
 
+test('启动首次刷新失败后只重试刷新，不重启 mihomo', async () => {
+  let providerPuts = 0;
+  const sleeps = [];
+  const { service, calls } = fakeService({
+    settings: { subscriptionUrl: 'https://sub.example.com/list', autoHealthCheck: false },
+    controller: {
+      async request(path, method = 'GET') {
+        if (method === 'PUT' && path.includes('/providers/proxies/')) {
+          providerPuts++;
+          if (providerPuts === 1) throw new Error('startup provider timeout');
+          return {};
+        }
+        if (path === '/proxies/freebuff-pool') return { all: ['US-A'], now: 'US-A' };
+        if (path === '/proxies/freebuff-auto') return { now: 'US-A', all: ['US-A'] };
+        if (path.startsWith('/group/freebuff-pool/delay')) return { 'US-A': 30 };
+        return {};
+      },
+    },
+    service: {
+      buildFetch: async () => ({ fetch: async () => new Response('ok'), close: async () => {} }),
+      sleepFn: async (ms) => { sleeps.push(ms); },
+    },
+  });
+
+  const status = await service.initialize();
+
+  assert.equal(status.state, 'ready');
+  assert.equal(providerPuts, 2, '启动刷新失败后应再尝试一次 provider 刷新');
+  assert.equal(calls.filter(([kind]) => kind === 'start').length, 1,
+    '刷新重试不得重启已正常运行的 mihomo');
+  assert.deepEqual(sleeps, [1000]);
+  assert.equal(typeof service.getFetch(), 'function');
+});
+
+test('启动刷新连续失败时只尝试两次并保持直连', async () => {
+  let providerPuts = 0;
+  const sleeps = [];
+  const timers = [];
+  const { service, calls } = fakeService({
+    settings: { subscriptionUrl: 'https://sub.example.com/list' },
+    controller: {
+      async request(path, method = 'GET') {
+        if (method === 'PUT' && path.includes('/providers/proxies/')) {
+          providerPuts++;
+          throw new Error('provider remains unavailable');
+        }
+        return {};
+      },
+    },
+    service: {
+      buildFetch: async () => ({ fetch: async () => new Response('ok'), close: async () => {} }),
+      sleepFn: async (ms) => { sleeps.push(ms); },
+      setIntervalFn: (fn, ms) => { const timer = { fn, ms }; timers.push(timer); return timer; },
+      clearIntervalFn: (timer) => { const index = timers.indexOf(timer); if (index >= 0) timers.splice(index, 1); },
+    },
+  });
+
+  const status = await service.initialize();
+
+  assert.equal(status.state, 'error');
+  assert.equal(providerPuts, 2, '启动刷新必须有限重试，不能无限循环');
+  assert.equal(calls.filter(([kind]) => kind === 'start').length, 1);
+  assert.deepEqual(sleeps, [1000]);
+  assert.equal(service.getFetch(), null);
+  assert.equal(timers.length, 0, '连续失败后不得遗留自动测活或更新 timer');
+});
+
 test('空订阅会停用内核并回落直连', async () => {
   const { service, calls } = fakeService({ settings: { subscriptionUrl: 'https://old.example/sub' } });
   await service.setSubscription('https://old.example/sub');
