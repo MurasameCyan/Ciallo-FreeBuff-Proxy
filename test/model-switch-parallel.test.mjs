@@ -23,8 +23,9 @@ const workerSource = readFileSync(new URL('../worker.js', import.meta.url), 'utf
 const workerWrapper = workerSource.replace('export default {', 'const __workerDefault__ = {')
   + '\n\nglobalThis.__workerDefault__ = __workerDefault__;\n'
   + 'globalThis.__accountSafetyTestApi__ = { pickToken, pickTokenWithSessionWait, '
-  + 'releaseToken, invalidateSessionCache, createSession, executeChat, scopedCooldownInfo, '
-  + 'accountPoolExhaustion, sessCache, clientModelLock };\n';
+  + 'releaseToken, acquireToken, tokenBusy, invalidateSessionCache, createSession, executeChat, '
+  + 'scopedCooldownInfo, accountPoolExhaustion, sessCache, clientModelLock, clientStat, '
+  + 'clientSessionIdentity };\n';
 
 // 这组测的是「同一 Key 在会话期内换模型」，需要两个互不相同且都未被官方 paused
 // 的模型。D4P 已撤下（paused 闸门会在换模型逻辑之前就返回），改用 DS4F。
@@ -409,4 +410,211 @@ test('会话缓存没了就解锁：不把 Key 锁在一条已经不存在的会
   assert.equal(luna.status, 200, '解锁后照常按上游契约删旧会话重建 luna');
   await luna.text();
   assert.equal(upstream.state.get(tokenA)?.model, LUNA);
+});
+
+// ---- 多人同时用：有空闲号就不许排到 120s ---------------------------------------
+// 上游一个号只能有一个会话，所以并发只能靠账号数扩展。原实现里「不等待、直接换个
+// 空闲号」这条路被 preserveBudget 挡着，只有**有每日 session 预算**的分享 Key 走得到；
+// Master Key 和不限额分享 Key（多人同时用最常见的两种）反而会等满
+// ACTIVE_SESSION_LEASE_WAIT_MS(120s)，期间还占着自己 Key 的并发槽位 —— 而池里的号全空闲。
+//
+// 等待本身要保留：它省的是一份 admission（每天只有 4~7 份），而且占用多半是上一笔
+// 请求正在收尾。所以是「先等 SESSION_REUSE_GRACE_MS，等不到再看池里有没有空闲号」：
+// 分界线是**池里还有没有空闲号**，不是「这把 Key 有没有预算」。
+const GRACE_MS = 500;   // worker.js 的 SESSION_REUSE_GRACE_MS
+
+// 会话对象够用就好：pickTokenWithSessionWait 只看 instanceId/expiresAt/remainingMs。
+function liveSessionAt(start, model, instanceId = 'inst-live') {
+  return {
+    instanceId, model,
+    expiresAt: new Date(start + 3600 * 1000).toISOString(),
+    remainingMs: 3600 * 1000,
+  };
+}
+
+// 让这把 Key「认领」这条会话，否则 sessionOwnedByClient 会判成别人的会话，
+// 走不到等待那条路（那是另一个用例的行为）。
+function claimSession(api, client, token, model, session, start) {
+  if (!client) return;
+  api.clientStat(client).seenSessions
+    .set(api.clientSessionIdentity(token, model, session), start + 3600 * 1000);
+}
+
+for (const [label, client] of [
+  ['Master Key', MASTER],
+  ['不限每日额度的分享 Key', sharedKey('idle-unlimited')],
+  ['有每日额度的分享 Key', { ...sharedKey('idle-budget'), dailyLimit: 5 }],
+  ['无 Key 上下文（内部调用）', null],
+]) {
+  test(`${label}：自己的会话被长时间占用且池里有空闲号时，让出 grace 就换号，不等满 120s`, async () => {
+    const start = Date.UTC(2030, 0, 1);
+    const tokens = ['idle-pick-token-aaaaaaaaaaaaaa', 'idle-pick-token-bbbbbbbbbbbbbb'];
+    const workerVm = createWorkerVm({ now: start });
+    const env = envFor(tokens);
+    const api = workerVm.api;
+
+    const session = liveSessionAt(start, DS4F);
+    api.sessCache.set(`${tokens[0]}:${DS4F}`, session);
+    claimSession(api, client, tokens[0], DS4F, session, start);
+    assert.ok(api.acquireToken(tokens[0]), '模拟第一个请求正在跑，占住 A 号租约');
+
+    // A 号整程不释放，模拟一笔长流式请求。waitMs 给足 60s：真排队的话这个 await
+    // 会挂到 race 的计时器先到。计时器留足 grace 的余量，别把 CI 抖动当成回归。
+    const began = Date.now();
+    const picked = await Promise.race([
+      api.pickTokenWithSessionWait(env, DS4F, new Set(), null, 60_000, client),
+      new Promise((resolve) => setTimeout(() => resolve('QUEUED'), GRACE_MS + 2_500)),
+    ]);
+    const waited = Date.now() - began;
+
+    assert.notEqual(picked, 'QUEUED',
+      `${label} 排队了：A 号一直在忙但 B 号空闲，不该等满租约上限`);
+    assert.equal(picked?.token, tokens[1], '应该拿到空闲的 B 号');
+    assert.ok(waited >= GRACE_MS - 50,
+      `不该跳过 grace 直接换号（实测只等了 ${waited}ms）：短暂占用等一下就能复用，省一份 admission`);
+    assert.ok(api.tokenBusy(tokens[1]), '拿到的号必须已上租约，否则会被并发请求重复选中');
+    assert.ok(api.tokenBusy(tokens[0]), 'A 号的租约不受影响');
+  });
+}
+
+// 换号的硬约束：空闲不等于可用。挂着别的 Key 同模型活跃会话的号一律不碰 ——
+// createSession 缓存命中不查归属，换过去就直接复用那个 instanceId，两边上下文串在一起。
+// pickToken 只把这种号排到候选末尾（foreign 排序键），没有排除它，所以这条得自己兜。
+test('唯一空闲号挂着别的 Key 的同模型会话：宁可继续等，也不换过去串上下文', async () => {
+  const start = Date.UTC(2030, 0, 1);
+  const tokens = ['foreign-only-token-aaaaaaaaaa', 'foreign-only-token-bbbbbbbbbb'];
+  const workerVm = createWorkerVm({ now: start });
+  const env = envFor(tokens);
+  const api = workerVm.api;
+
+  const mine = liveSessionAt(start, DS4F, 'inst-mine');
+  api.sessCache.set(`${tokens[0]}:${DS4F}`, mine);
+  claimSession(api, MASTER, tokens[0], DS4F, mine, start);
+  assert.ok(api.acquireToken(tokens[0]), 'A 号：自己的会话正在跑');
+
+  // B 号空闲，但那条 DS4F 会话是别的 Key 开的（不给 MASTER 认领）。
+  api.sessCache.set(`${tokens[1]}:${DS4F}`, liveSessionAt(start, DS4F, 'inst-someone-else'));
+
+  const pending = api.pickTokenWithSessionWait(env, DS4F, new Set(), null, 60_000, MASTER);
+  const outcome = await Promise.race([
+    pending,
+    new Promise((resolve) => setTimeout(() => resolve({ stillWaiting: true }), GRACE_MS + 300)),
+  ]);
+
+  assert.deepEqual(outcome, { stillWaiting: true },
+    '换到了 B 号：那条会话是别人的，复用它会把两把 Key 的上下文串起来');
+  assert.ok(!api.tokenBusy(tokens[1]), 'B 号的租约必须还回去，不能被这次挑选占着');
+
+  // 收尾：放掉租约让那条 await 结束，顺便钉住释放后仍然复用自己的会话。
+  api.releaseToken(tokens[0]);
+  assert.equal((await pending)?.token, tokens[0], '释放后应复用自己那条会话');
+});
+
+test('空闲号里既有别人的会话又有干净号：跳过别人的会话，落到干净号上', async () => {
+  const start = Date.UTC(2030, 0, 1);
+  const tokens = [
+    'foreign-skip-token-aaaaaaaaaaaa',
+    'foreign-skip-token-bbbbbbbbbbbb',
+    'foreign-skip-token-cccccccccccc',
+  ];
+  const workerVm = createWorkerVm({ now: start });
+  const env = envFor(tokens);
+  const api = workerVm.api;
+
+  const mine = liveSessionAt(start, DS4F, 'inst-mine');
+  api.sessCache.set(`${tokens[0]}:${DS4F}`, mine);
+  claimSession(api, MASTER, tokens[0], DS4F, mine, start);
+  assert.ok(api.acquireToken(tokens[0]), 'A 号：自己的会话正在跑');
+
+  // B：别的 Key 的 DS4F 会话（conflict=0 / foreign=1）。
+  // C：只有一条 luna 会话，对 DS4F 算 conflict=1 —— pickToken 会把 B 排在 C 前面，
+  //    所以这个用例真正走的是「排除 B 之后重问」那条路，而不是碰巧先挑到 C。
+  api.sessCache.set(`${tokens[1]}:${DS4F}`, liveSessionAt(start, DS4F, 'inst-someone-else'));
+  api.sessCache.set(`${tokens[2]}:${LUNA}`, liveSessionAt(start, LUNA, 'inst-other-model'));
+
+  const picked = await api.pickTokenWithSessionWait(env, DS4F, new Set(), null, 60_000, MASTER);
+
+  assert.equal(picked?.token, tokens[2], '应该落到 C 号：B 号挂着别人的同模型会话');
+  assert.ok(!api.tokenBusy(tokens[1]), 'B 号试选后的租约必须还回去');
+  assert.ok(api.tokenBusy(tokens[2]), 'C 号必须已上租约');
+});
+
+test('占用在 grace 窗口内结束：复用原账号，不白烧一份 admission 去换号', async () => {
+  const start = Date.UTC(2030, 0, 1);
+  const tokens = ['grace-reuse-token-aaaaaaaaaaaa', 'grace-reuse-token-bbbbbbbbbbbb'];
+  const workerVm = createWorkerVm({ now: start });
+  const env = envFor(tokens);
+  const api = workerVm.api;
+
+  const session = liveSessionAt(start, DS4F);
+  api.sessCache.set(`${tokens[0]}:${DS4F}`, session);
+  claimSession(api, MASTER, tokens[0], DS4F, session, start);
+  assert.ok(api.acquireToken(tokens[0]), '第一个请求正在跑');
+
+  // 上一笔请求正在收尾：grace 没走完就释放了。这时必须复用 A，B 号一根汗毛都不能动 ——
+  // 这是 grace 存在的唯一理由，去掉它就会在每次短暂重叠时多建一条会话。
+  setTimeout(() => api.releaseToken(tokens[0]), Math.floor(GRACE_MS / 4));
+  const picked = await api.pickTokenWithSessionWait(env, DS4F, new Set(), null, 60_000, MASTER);
+
+  assert.equal(picked?.token, tokens[0], '短暂占用应等到释放并复用原账号');
+  assert.ok(!api.tokenBusy(tokens[1]), 'B 号不该被碰，否则就是白烧一份 admission');
+});
+
+test('全池都在忙时仍然等待：不能为了不排队就退化成直接报池耗尽', async () => {
+  const start = Date.UTC(2030, 0, 1);
+  const tokens = ['idle-none-token-aaaaaaaaaaaaaa', 'idle-none-token-bbbbbbbbbbbbbb'];
+  const workerVm = createWorkerVm({ now: start });
+  const env = envFor(tokens);
+  const api = workerVm.api;
+
+  const session = liveSessionAt(start, DS4F);
+  api.sessCache.set(`${tokens[0]}:${DS4F}`, session);
+  claimSession(api, MASTER, tokens[0], DS4F, session, start);
+  for (const token of tokens) assert.ok(api.acquireToken(token), '占满全池');
+
+  // 等待期间 A 号释放 → 应该醒过来把 A 号捡回去，而不是立刻回 null。
+  // 计时器必须超过 grace，否则「还在等」测的只是 grace 窗口本身，换号那条路根本没跑到。
+  const pending = api.pickTokenWithSessionWait(env, DS4F, new Set(), null, 60_000, MASTER);
+  const raced = await Promise.race([
+    pending.then((acct) => ({ acct })),
+    new Promise((resolve) => setTimeout(() => resolve({ stillWaiting: true }), GRACE_MS + 300)),
+  ]);
+  assert.ok(raced.stillWaiting, '没有空闲号时必须等待，不能立刻失败');
+
+  api.releaseToken(tokens[0]);
+  const acct = await pending;
+  assert.equal(acct?.token, tokens[0], '租约一释放就该醒过来复用自己那条会话');
+});
+
+test('每日预算已用尽的分享 Key：仍然等自己的会话，不换号去撞每日上限', async () => {
+  const start = Date.UTC(2030, 0, 1);
+  const tokens = ['idle-spent-token-aaaaaaaaaaaaaa', 'idle-spent-token-bbbbbbbbbbbbbb'];
+  const workerVm = createWorkerVm({ now: start });
+  const env = envFor(tokens);
+  const api = workerVm.api;
+  const client = { ...sharedKey('spent'), dailyLimit: 1 };
+
+  const session = liveSessionAt(start, DS4F);
+  api.sessCache.set(`${tokens[0]}:${DS4F}`, session);
+  claimSession(api, client, tokens[0], DS4F, session, start);
+  api.clientStat(client).daySessions.add('already-spent');   // dailyLimit=1 且已用 1
+  assert.ok(api.acquireToken(tokens[0]));
+
+  // 这类 Key 等的是「自己会话不再可复用」（activeWaitMs = sessionRemainingMs = 1h），
+  // 不是传进去的 waitMs，所以只 race 一下看它有没有换号。计时器必须超过 grace：
+  // 停在 grace 里面的话，B 号没被占用只是因为换号那条路还没跑到。
+  const pending = api.pickTokenWithSessionWait(env, DS4F, new Set(), null, 60_000, client);
+  const raced = await Promise.race([
+    pending.then((acct) => ({ acct })),
+    new Promise((resolve) => setTimeout(() => resolve({ stillWaiting: true }), GRACE_MS + 300)),
+  ]);
+
+  assert.ok(raced.stillWaiting,
+    '预算用尽还换号，createSession 会直接撞 ClientSessionLimitError —— 这种情况等待才是对的');
+  assert.ok(!api.tokenBusy(tokens[1]), 'B 号不该被占用');
+
+  // 收尾：那条 await 挂着一个 1 小时的定时器，不放掉会把测试进程吊到超时。
+  // 顺便钉住释放后的行为：复用自己那条会话，而不是换号。
+  api.releaseToken(tokens[0]);
+  assert.equal((await pending)?.token, tokens[0], '租约释放后应复用自己那条会话');
 });

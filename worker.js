@@ -975,6 +975,13 @@ const accountLeaseWaiters = new Set(); // 任意账号租约变化时广播，�
 // ponytail: 这个上限只是租约泄漏的兜底，不是调度策略。客户端断开会立即结束等待；
 // 想彻底禁止回退就把 FREEBUFF_SESSION_WAIT_MS 设成一个足够大的值。
 const ACTIVE_SESSION_LEASE_WAIT_MS = 120 * 1000;
+// 可复用 session 正被占用时，先让出这么久等它释放，之后才考虑换空闲号。
+// 上游一个账号同时只允许一条会话，所以「多人并发」只能靠多个账号：全都排在同一条
+// 会话上会把整个代理串行化成一次一个请求。但绝大多数占用只是上一笔请求正在收尾，
+// 等一下就能复用、省掉一份 admission，所以两者的分界线是「等一小会儿」而不是二选一。
+// ponytail: 固定窗口，不按请求类型自适应 —— 长流式请求会等满这个窗口再换号。
+// 真要区分就得把「预计剩余时长」透传进来，不值得为此加一条通道。
+const SESSION_REUSE_GRACE_MS = 500;
 // 上游抖动（session/run 5xx、超时）不是账号自身的问题，换号只会白扣一份新账号的
 // 创建额度，所以先重试同一个号；用尽后才换号，保留跨账号故障转移。
 const SAME_ACCOUNT_TRANSIENT_RETRIES = 1;
@@ -2043,9 +2050,44 @@ function callLogSnapshot() {
   };
 }
 
-// 第一次选号若已有同模型 active session，等待它的单并发租约释放而不是立刻换号。
-// 有每日 session 预算的分享 Key 会等到该 session 不再可复用，避免长请求超过普通
-// 等待上限后换号建新 session；不限量 Key 仍保留超时回退，真正失败后的重试也照常换号。
+// 这把 Key 今天还能不能再建一条 session。传 null（Master Key / 不限额 Key /
+// 内部调用）一律视为有预算：它们没有每日 session 上限。
+function clientSessionBudgetAvailable(client, now = Date.now()) {
+  const limit = Number(client?.dailyLimit) || 0;
+  if (limit <= 0) return true;
+  const st = clientStat(client, now);
+  return st.daySessions.size + st.pendingSessions.size < limit;
+}
+
+// 自己那条会话被长时间占用时，换到哪个空闲号。排序照用 pickToken（会话冲突 →
+// 排队观测 → 他人会话 → 剩余额度），但多一条硬约束：挂着别的 Key 同模型活跃会话的
+// 号一律不要。pickToken 只把这种号排到候选末尾，池里全是它时照样返回一个，而
+// createSession 的缓存命中会直接复用那个 instanceId（不查归属）—— 两把 Key 的上下文
+// 就串了。原来那段 accounts.find(!isLiveSession(session)) 正是靠排除挡住这一点。
+// 逐个排除后重问，让 pickToken 自己往下挑，比 find「第一个没有该模型会话的号」更准；
+// 全被排除就返回 null，回去等自己那条会话释放。
+function pickFreshTokenForSwitch(env, sessionModel, attempted, client) {
+  let skip = attempted;
+  for (let i = 0; i <= parseAccounts(env).length; i++) {
+    const acct = pickToken(env, sessionModel, skip, client);
+    if (!acct) return null;
+    const session = sessCache.get(acct.token + ":" + sessionModel);
+    if (!isLiveSession(session) || sessionOwnedByClient(client, acct.token, sessionModel, session)) {
+      return acct;
+    }
+    // 租约是 pickToken 上的，不用就得还；顺带把这个号从下一轮候选里摘掉。
+    // 只复制一次，别改调用方传进来的 attempted（外层还要用它做换号预算）。
+    releaseToken(acct.token);
+    skip = skip === attempted ? new Set(attempted) : skip;
+    skip.add(acct.token);
+  }
+  return null;
+}
+
+// 第一次选号若已有同模型 active session，先等 SESSION_REUSE_GRACE_MS 让它的单并发
+// 租约释放而不是立刻换号；等不到且池里有空闲号就换号，别把并发请求串行化在一条会话上。
+// 有每日 session 预算的分享 Key 会等到该 session 不再可复用（预算耗尽时换号必撞
+// ClientSessionLimitError）；不限量 Key 仍保留超时回退，真正失败后的重试也照常换号。
 async function pickTokenWithSessionWait(
   env,
   sessionModel,
@@ -2078,22 +2120,26 @@ async function pickTokenWithSessionWait(
         continue;
       }
 
-      // 活跃 session 都被占用时，先利用没有该模型 session 的空闲账号。
-      // 这让 concurrency>1 真正扩展到账号池，而不是让所有请求一起占着 Key
-      // 槽位等待同一个账号；只有没有预算或没有空闲账号时才等待旧 session。
-      if (preserveBudget) {
-        const st = clientStat(client);
-        const budgetAvailable = st.daySessions.size + st.pendingSessions.size < client.dailyLimit;
-        if (budgetAvailable) {
-          const fresh = accounts.find((acct) => {
-            if (accountIsBlocked(acct.token) || inScopedCooldown(acct.token, sessionModel)) return false;
-            if (tokenBusy(acct.token)) return false;
-            if (!accountRouteSelectable(acct.token)) return false;
-            const session = sessCache.get(acct.token + ":" + sessionModel);
-            return !isLiveSession(session);
-          });
-          if (fresh && acquireToken(fresh.token)) return fresh;
-        }
+      // 能复用的 session 全被占着。先让出一个短窗口等它释放：占用多半是上一笔请求
+      // 正在收尾，等到了就能复用、省掉一份 admission。窗口内被释放会立刻醒来，
+      // 客户端断开会直接抛出 —— 所以这一步必须在换号之前，不能先同步挑号。
+      const busy = active.map(({ acct }) => acct.token);
+      await waitForAnyTokenRelease(busy, Math.min(SESSION_REUSE_GRACE_MS, waitMs), signal);
+      if (busy.some((token) => !tokenBusy(token))) continue;
+
+      // 等过一轮还占着，就别再干等了：原本要干等最多 ACTIVE_SESSION_LEASE_WAIT_MS
+      // （120s），期间还占着自己 Key 的并发槽位，而池里可能十几个号全空闲。多人同时用
+      // （Master Key / 不限额分享 Key）撞的正是这条路。
+      //
+      // 交给 pickToken 挑而不是自己 find：它会按会话冲突 → 排队观测 → 他人会话 →
+      // 剩余额度排序，自己 find 只能捡到「第一个没有该模型会话的号」。
+      // 返回 null 表示真的没有空闲号，那才落到下面继续等原账号。
+      //
+      // 有每日 session 预算的 Key 例外：预算用完时只能复用自己那条会话，换号会直接
+      // 撞 ClientSessionLimitError，所以这种情况等满才是对的。
+      if (clientSessionBudgetAvailable(preserveBudget ? client : null)) {
+        const fresh = pickFreshTokenForSwitch(env, sessionModel, attempted, client);
+        if (fresh) return fresh;
       }
 
       const activeWaitMs = preserveBudget
