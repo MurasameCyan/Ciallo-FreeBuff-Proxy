@@ -522,7 +522,9 @@ test('未配置订阅时托管账号禁止携 Bearer 回落宿主直连', async 
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: `Bearer ${masterKey}` },
     body: JSON.stringify({
-      model: 'deepseek/deepseek-v4-pro',
+      // 必须用未被官方 paused 的模型：paused 闸门在出站哨兵之前就 400，
+      // 那样测到的是模型闸门，不是「托管账号无独立出口时不许借宿主出口」。
+      model: 'deepseek/deepseek-v4-flash',
       messages: [{ role: 'user', content: 'ping' }],
       stream: false,
     }),

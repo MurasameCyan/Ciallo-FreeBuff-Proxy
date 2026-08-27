@@ -26,8 +26,9 @@ const workerWrapper = workerSource.replace('export default {', 'const __workerDe
   + 'releaseToken, invalidateSessionCache, createSession, executeChat, scopedCooldownInfo, '
   + 'accountPoolExhaustion, sessCache, clientModelLock };\n';
 
-const DS4P = 'deepseek/deepseek-v4-pro';
-const LUNA = 'openai/gpt-5.6-luna';
+// 换号预算与模型无关，但主体必须是未被官方 paused 的模型：paused 闸门在换号逻辑
+// 之前就返回，一个号都不会试。D4P 已撤下，改用同为 deepseek 系的 Flash。
+const MODEL = 'deepseek/deepseek-v4-flash';
 
 function createWorkerVm({ now, fetchImpl, consoleImpl = console, random = null } = {}) {
   let clock = now ?? Date.UTC(2030, 0, 1);
@@ -204,7 +205,7 @@ test('单请求内换号有上限：8 个号的池子最多只建 2 个会话', 
   const env = envFor(POOL8);
 
   const response = await workerVm.api.executeChat(
-    env, chatParams(DS4P), modelCfg(DS4P, 'base2-free-deepseek'), false, 'chat',
+    env, chatParams(MODEL), modelCfg(MODEL, 'base2-free-deepseek'), false, 'chat',
   );
 
   assert.equal(response.status, 502, 'chat 一直 500，最终应该把失败回给客户端');
@@ -223,7 +224,7 @@ test('换号预算可配，且不会超过池子大小', async () => {
   const env = envFor([POOL8[0]], { FREEBUFF_MAX_ACCOUNT_SWITCHES: '2' });
 
   const response = await workerVm.api.executeChat(
-    env, chatParams(DS4P), modelCfg(DS4P, 'base2-free-deepseek'), false, 'chat',
+    env, chatParams(MODEL), modelCfg(MODEL, 'base2-free-deepseek'), false, 'chat',
   );
 
   // 池子只有 1 个号，它失败后被冷却 => 整池不可用，poolExhaustionResponse 走 503。
@@ -241,7 +242,7 @@ test('空的 FREEBUFF_MAX_ACCOUNT_SWITCHES 不会静默变成 0（Number("") 陷
   const env = envFor(POOL8, { FREEBUFF_MAX_ACCOUNT_SWITCHES: '' });
 
   const response = await workerVm.api.executeChat(
-    env, chatParams(DS4P), modelCfg(DS4P, 'base2-free-deepseek'), false, 'chat',
+    env, chatParams(MODEL), modelCfg(MODEL, 'base2-free-deepseek'), false, 'chat',
   );
 
   assert.equal(response.status, 502);
@@ -259,7 +260,7 @@ test('换号之间有间隔：第一个号不等，之后每次换号前等一�
   const env = envFor(POOL8, { FREEBUFF_ACCOUNT_SWITCH_JITTER_MS: '1200' });
 
   const response = await workerVm.api.executeChat(
-    env, chatParams(DS4P), modelCfg(DS4P, 'base2-free-deepseek'), false, 'chat',
+    env, chatParams(MODEL), modelCfg(MODEL, 'base2-free-deepseek'), false, 'chat',
   );
 
   assert.equal(response.status, 502);
@@ -278,7 +279,7 @@ test('换号之间有间隔：第一个号不等，之后每次换号前等一�
   const bareVm = createWorkerVm({ now: start, fetchImpl: bare.fetch, random: fixedRandom });
   const bareResp = await bareVm.api.executeChat(
     envFor(POOL8, { FREEBUFF_ACCOUNT_SWITCH_JITTER_MS: '0' }),
-    chatParams(DS4P), modelCfg(DS4P, 'base2-free-deepseek'), false, 'chat',
+    chatParams(MODEL), modelCfg(MODEL, 'base2-free-deepseek'), false, 'chat',
   );
   assert.equal(bareResp.status, 502);
   assert.equal(bare.created, 2);

@@ -178,21 +178,17 @@ assert.match(css, /\.account-priority-toggle\s*\{[^}]*white-space:\s*nowrap/s,
   '账号优先级按钮必须保持紧凑单行');
 assert.match(css, /\.account-egress-refresh\s*\{[^}]*white-space:\s*nowrap/s,
   '刷新出站按钮必须保持紧凑单行');
-// stealth/ox-alpha 已开放（官方 2026-08-24 进 CLI 目录），隐藏列表只剩两条 god-only。
-assert.doesNotMatch(app, /'stealth\/ox-alpha'/,
-  '面板不得再把已开放的 stealth/ox-alpha 写进隐藏列表');
+assert.match(app,
+  /const PAUSED_MODEL_IDS = new Set\(\[[\s\S]*?'minimax\/minimax-m3'[\s\S]*?'deepseek\/deepseek-v4-pro'[\s\S]*?'stealth\/ox-alpha'[\s\S]*?\]\)/,
+  '暂停模型集合必须包含 M3、D4P 与 Ox Alpha');
 assert.match(app, /const HIDDEN_MODEL_IDS = new Set\(\[[\s\S]*?'openai\/gpt-5\.6-luna-es'[\s\S]*?'crof\/kimi-k3-eco'[\s\S]*?\]\)/,
   '面板仍必须过滤 god-only luna-es / K3 Eco，避免旧缓存或 Key 白名单重新显示');
-assert.doesNotMatch(app, /value === 'ox-alpha'|value\.endsWith\('\/ox-alpha'\)|value === "ox-alpha"|value\.endsWith\("\/ox-alpha"\)/,
-  'ox-alpha 短名/变体不再属于隐藏判定（它已可调用）');
 assert.match(app, /function isHiddenModelId\(modelId\)[\s\S]*?value\.startsWith\('crof\/kimi-k3-eco'\)/,
   'god-only K3 Eco 的日期/变体后缀同样要挡住，与 worker.js 保持一致');
 assert.match(app, /for \(const id of chosen\) if \(!ids\.includes\(id\) && !isHiddenModelId\(id\)\) ids\.push\(id\)/,
-  '旧 Key 白名单里的短名 ox-alpha 不得被重新加入模型按钮');
-assert.match(app, /function quotaRows\(probe\)[\s\S]*?!isHiddenModelId\(q\?\.model\)/,
-  '账号可用模型列表必须在生成行之前排除 ox-alpha，不能留下空项目');
-assert.match(app, /const rows = rankBreakdown\(S\.usage\?\.byModel, 0\)\.filter\(\(row\) => !isHiddenModelId\(row\.key\)\)/,
-  '概况模型统计不得从历史数据重新显示 ox-alpha');
+  '旧 Key 白名单里目录已撤下的模型仍必须保留为历史按钮');
+assert.match(app, /function quotaRows\(probe\)[\s\S]*?!isPausedModelId\(q\?\.model\)[\s\S]*?!isHiddenModelId\(q\?\.model\)/,
+  '账号可用模型列表必须在生成行之前排除暂停模型与 god-only 模型');
 assert.ok(app.includes('function poolResetAt') && app.includes('function renderQuotaHead'),
   '重置时间必须提到列标题（池级统一，逐行重复无信息量）');
 assert.ok(app.includes('`可用模型 (重置 ${formatResetAt(reset)})`'),
@@ -201,10 +197,10 @@ assert.ok(app.includes('renderQuotaHead()'), 'renderAccounts 必须刷新额度�
 assert.ok(!app.includes('quota-reset'), '重置时间已上移列标题，行内不应再有 quota-reset');
 assert.ok(!app.includes('tokenShort'),
   '账号面板不得展示或依赖 token 短哈希');
-assert.match(app, /function accountQuotaSummary\(probe\)[\s\S]*?deepseek_pro[\s\S]*?luna[\s\S]*?premium/s,
-  '账号额度必须按上游 pool 聚合为 D4P / Luna / Premium 三个独立池');
+assert.match(app, /function accountQuotaSummary\(probe\)[\s\S]*?glm_v53_flash[\s\S]*?premium/s,
+  '账号额度必须把 GLM 5.3 Flash 独立池与 Premium 分开聚合');
 assert.match(app, /`\( \$\{parts\.join\(' '\)\} \)`/,
-  '账号名后必须紧凑呈现 ( D1 L0 P2 ) 形式的剩余可开会话数');
+  '账号名后必须紧凑呈现 ( G2 P3 ) 形式的剩余可开会话数');
 assert.doesNotMatch(app, /parts\.push\([^)]*\/\$\{row\.limit\}/,
   '徽标只显示剩余，上限只出现在 title 里');
 assert.doesNotMatch(app, /function accountUsage\(/,
@@ -422,25 +418,23 @@ assert.match(css, /\.model-catalog \.models\s*\{[^}]*row-gap:\s*3px/s,
   '模型列表纵向间距必须固定为紧凑的 3px，不能被通用 gap 或 flex 剩余高度放大');
 assert.match(css, /\.model-catalog \.models li\s*\{[^}]*width:\s*fit-content/s,
   '模型列表条目不应横向拉伸并留下空白');
-assert.match(html,
-  /<p class="model-availability-note">deepseek-v4-pro：北京时间 08:00–18:00 不可用 <span>\(UTC 00:00–10:00\)<\/span><\/p>/,
-  '模型列表底部必须写明 DS4P 的官方不可用时段');
-assert.match(css, /\.model-availability-note\s*\{[^}]*border-top:/s,
-  '模型时段说明必须用顶部分隔线与模型列表分开');
-const availabilityNote = html.match(/<p class="model-availability-note">[\s\S]*?<\/p>/)?.[0] || '';
-assert.ok(!/luna|kimi-k3/i.test(availabilityNote),
-  'Luna 与 K3 官方均为 always，不得捏造同类时段限制');
+assert.ok(!html.includes('model-availability-note'),
+  'D4P 已暂停，模型列表不得再显示过期的时段说明');
+assert.ok(!html.includes('08:00–18:00') && !html.includes('UTC 00:00–10:00'),
+  '已失效的 D4P 可用时段文案必须删除');
 assert.match(app, /MODEL_TIER_LABELS = \{ free: '免费', us_sg: '高级', limited: '限定' \}/,
   '模型列表的通用分组 tag 文案必须是 免费 / 高级 / 限定');
 for (const [id, label] of [
-  ['openai/gpt-5.6-luna', 'Luna'],
-  ['deepseek/deepseek-v4-pro', 'DS4P'],
+  ['openai/gpt-5.6-luna', '高级'],
+  ['deepseek/deepseek-v4-pro', '停用'],
+  ['stealth/ox-alpha', '停用'],
   ['deepseek/deepseek-v4-flash', '免费'],
   ['minimax/minimax-m3', '停用'],
   ['crof/kimi-k3-eco', '高级'],
   ['meta/muse-spark-1.2-contributor', '高级'],
   ['mimo/mimo-v2.5', '免费'],
   ['z-ai/glm-5.2', '限定'],
+  ['z-ai/glm-5.3-flash', 'GLM'],
   ['anthropic/claude-fable-5', '限定'],
 ]) {
   assert.ok(app.includes(`'${id}': { label: '${label}'`), `${id} 必须显示标签 ${label}`);
@@ -458,9 +452,15 @@ assert.match(app, /function renderModels\(\)[\s\S]*?li\.textContent = name/s,
 assert.match(app, /fillKeyModelButtons[\s\S]*?title="\$\{esc\(id\)\}">\$\{esc\(name\)\}/s,
   'Key 模型按钮必须只显示模型名，完整 id 留在 title');
 assert.match(app, /PAUSED_MODEL_IDS[\s\S]*?fillKeyModelButtons[\s\S]*?disabled aria-disabled="true"/s,
-  'Key 模型列表必须展示 M3 已暂停，但不得允许新 Key 选择它');
+  'Key 模型列表必须展示暂停模型，但不得允许新 Key 选择它们');
+assert.match(app, /function fillKeyModelButtons[\s\S]*?const paused = isPausedModelId\(id\)/s,
+  'Key 模型按钮必须用统一暂停判定，日期快照变体也要禁用');
+assert.match(app, /keyEditingPausedModels = Array\.isArray\(k\.models\)[\s\S]*?isPausedModelId\(model\)/s,
+  '编辑旧 Key 时日期快照变体必须进入暂停白名单保留路径');
 assert.match(app, /function selectedKeyModels\(\)[\s\S]*?\.filter\(Boolean\)/s,
-  '编辑旧 Key 时必须保留已暂停 M3 白名单，不能静默丢失');
+  '编辑旧 Key 时必须保留已暂停模型白名单，不能静默丢失');
+assert.match(css, /\.pill\.tier-glm_v53_flash\s*\{[^}]*color:/s,
+  'GLM 5.3 Flash 独立 tag 必须有专用样式');
 
 const helperSource = `const S = { models: [], health: {} };\nconst esc = (value) => String(value);\n${app.match(/const MODEL_TIER_LABELS = \{[^\n]+/)[0]}\n`
   + `${app.slice(app.indexOf('const MODEL_DISPLAY ='), app.indexOf('function modelsCellHtml'))}\n`
@@ -471,29 +471,27 @@ helperVm.globalThis = helperVm;
 vm.runInNewContext(helperSource, helperVm);
 assert.deepEqual(
   JSON.parse(JSON.stringify(helperVm.__modelUi.accountQuotaSummary({ quota: [
-    { model: 'deepseek/deepseek-v4-pro', used: 1, limit: 1, pool: 'deepseek_pro' },
-    { model: 'openai/gpt-5.6-luna', used: 1, limit: 1, pool: 'luna' },
+    { model: 'z-ai/glm-5.3-flash', used: 0, limit: 2, pool: 'glm_v53_flash' },
+    { model: 'openai/gpt-5.6-luna', used: 2, limit: 5, pool: 'premium' },
     { model: 'deepseek/deepseek-v4-flash', used: 3, limit: 5, pool: 'premium' },
     { model: 'meta/muse-spark-1.2-contributor', used: 3, limit: 5, pool: 'premium' },
   ] }))),
-  { text: '( D0 L0 P2 )', title: '额度 D 剩 0 / 已用 1 / 上限 1 · L 剩 0 / 已用 1 / 上限 1 · P 剩 2 / 已用 3 / 上限 5' },
-  'D/L/P 摘要必须按 pool 去重，Premium 多模型行只显示一个 P',
+  { text: '( G2 P2 )', title: '额度 G 剩 2 / 已用 0 / 上限 2 · P 剩 2 / 已用 3 / 上限 5' },
+  'G/P 摘要必须按 pool 去重，GLM 独立池与 Premium 并列且 Premium 多模型行只显示一个 P',
 );
 assert.deepEqual(
   JSON.parse(JSON.stringify(helperVm.__modelUi.accountQuotaSummary({ quota: [
-    { model: 'deepseek/deepseek-v4-pro', used: 0, limit: 1, pool: 'deepseek_pro' },
-    { model: 'openai/gpt-5.6-luna', used: 0, limit: 1, pool: 'luna' },
+    { model: 'openai/gpt-5.6-luna', used: 1, limit: 4, pool: 'luna' },
     { model: 'deepseek/deepseek-v4-flash', used: 1, limit: 4, pool: 'premium' },
   ] }))),
-  { text: '( D1 L1 P3 )', title: '额度 D 剩 1 / 已用 0 / 上限 1 · L 剩 1 / 已用 0 / 上限 1 · P 剩 3 / 已用 1 / 上限 4' },
-  'P 值必须读取上游 Premium 池 limit，不能写死为 5',
+  { text: '( P3 )', title: '额度 P 剩 3 / 已用 1 / 上限 4' },
+  '旧 luna pool 必须兼容归并到 Premium，不能继续显示独立 L 或重复计数',
 );
-// 2026-08-23 线上实测：DS4P 的 deepseek_pro 独立池已被上游删除，V4 Pro 与 Flash
-// 同在 premium 池，所以「同池多行」的保守取值用这两行才是现实形状。
+// Premium 同池多行必须保守合并，Luna 没有独立池。
 assert.deepEqual(
   JSON.parse(JSON.stringify(helperVm.__modelUi.accountQuotaSummary({ quota: [
     { model: 'deepseek/deepseek-v4-flash', used: null, limit: 7, pool: 'premium' },
-    { model: 'deepseek/deepseek-v4-pro', used: 2, limit: 5, pool: 'premium' },
+    { model: 'openai/gpt-5.6-luna', used: 2, limit: 5, pool: 'premium' },
   ] }))),
   { text: '( P3 )', title: '额度 P 剩 3 / 已用 2 / 上限 5' },
   'Premium 行异常不一致时必须保守取最小 limit，并优先显示已知 used',
@@ -501,26 +499,25 @@ assert.deepEqual(
 assert.deepEqual(
   JSON.parse(JSON.stringify(helperVm.__modelUi.accountQuotaSummary({ quota: [
     { model: 'deepseek/deepseek-v4-flash', used: 0, limit: 0, pool: 'premium' },
-    { model: 'deepseek/deepseek-v4-pro', used: 2, limit: 5, pool: 'premium' },
+    { model: 'openai/gpt-5.6-luna', used: 2, limit: 5, pool: 'premium' },
   ] }))),
   { text: '( P0 )', title: '额度 P 剩 0 / 已用 2 / 上限 0' },
   'Premium 同池出现 0 与正数冲突时，UI 必须与 worker 一样保守，不能丢掉 0 后显示 P5',
 );
-// 2026-08-23 线上实测形状：luna 池打满（3/3），premium 池按半次计费出现小数。
-// 剩余必须原样给小数，四舍五入会把「还能开」说成「不能开」或反过来。
+// GLM 5.3 独立池打满，Premium 池按半次计费出现小数。
 assert.deepEqual(
   JSON.parse(JSON.stringify(helperVm.__modelUi.accountQuotaSummary({ quota: [
-    { model: 'openai/gpt-5.6-luna', used: 3, limit: 3, pool: 'luna' },
+    { model: 'z-ai/glm-5.3-flash', used: 2, limit: 2, pool: 'glm_v53_flash' },
     { model: 'deepseek/deepseek-v4-flash', used: 2.5, limit: 5, pool: 'premium' },
   ] }))),
-  { text: '( L0 P2.5 )', title: '额度 L 剩 0 / 已用 3 / 上限 3 · P 剩 2.5 / 已用 2.5 / 上限 5' },
+  { text: '( G0 P2.5 )', title: '额度 G 剩 0 / 已用 2 / 上限 2 · P 剩 2.5 / 已用 2.5 / 上限 5' },
   '打满的池必须显示剩余 0，小数用量不得被取整',
 );
 // 2026-08-23 线上实测：premium limit 5 / used 3.7 直接相减是 1.2999999999999998，
 // 徽标必须按 0.1 粒度归整，否则账号行会甩出一串浮点渣。
 assert.deepEqual(
   JSON.parse(JSON.stringify(helperVm.__modelUi.accountQuotaSummary({ quota: [
-    { model: 'deepseek/deepseek-v4-pro', used: 3.7, limit: 5, pool: 'premium' },
+    { model: 'openai/gpt-5.6-luna', used: 3.7, limit: 5, pool: 'premium' },
   ] }))),
   { text: '( P1.3 )', title: '额度 P 剩 1.3 / 已用 3.7 / 上限 5' },
   '小数剩余必须归整到 0.1，不能出现 1.2999999999999998',
@@ -563,25 +560,27 @@ assert.deepEqual(
 assert.equal(
   helperVm.__modelUi.accountQuotaSummary({ quota: [
     { model: 'minimax/minimax-m3', used: 0, limit: 99, pool: 'premium' },
+    { model: 'deepseek/deepseek-v4-pro', used: 0, limit: 99, pool: 'premium' },
+    { model: 'stealth/ox-alpha', used: 0, limit: 99, pool: 'premium' },
   ] }),
   null,
-  '暂停 M3 的残留额度行不得生成 P 摘要',
+  '暂停模型的残留额度行不得生成 P 摘要',
 );
-helperVm.__modelState.models = [{ id: 'deepseek/deepseek-v4-pro', pool: 'premium' }];
+helperVm.__modelState.models = [{ id: 'z-ai/glm-5.3-flash', pool: 'glm_v53_flash' }];
 assert.deepEqual(
   JSON.parse(JSON.stringify(helperVm.__modelUi.accountQuotaSummary({ quota: [
-    { model: 'deepseek/deepseek-v4-pro', used: 2, limit: 5 },
+    { model: 'z-ai/glm-5.3-flash', used: 0, limit: 2 },
   ] }))),
-  { text: '( P3 )', title: '额度 P 剩 3 / 已用 2 / 上限 5' },
-  '账号行缺少 pool 时必须使用模型目录的实时 pool，而不是静态 DS4P 归属',
+  { text: '( G2 )', title: '额度 G 剩 2 / 已用 0 / 上限 2' },
+  '账号行缺少 pool 时必须使用模型目录的 GLM 5.3 独立池',
 );
 assert.match(
   helperVm.__modelUi.modelListHtml(
-    ['deepseek/deepseek-v4-pro'],
-    [{ id: 'deepseek/deepseek-v4-pro' }],
+    ['z-ai/glm-5.3-flash'],
+    [{ id: 'z-ai/glm-5.3-flash' }],
   ),
-  /tier-premium">高级<\/span>/,
-  '账号行缺少 pool 时必须回退模型目录的 Premium 标签',
+  /tier-glm_v53_flash">GLM<\/span>/,
+  '账号行缺少 pool 时必须回退模型目录的 GLM 标签',
 );
 helperVm.__modelState.models = [];
 assert.deepEqual(
@@ -589,20 +588,39 @@ assert.deepEqual(
   { id: 'minimax/minimax-m3', name: 'minimax-m3', tierKey: 'paused', tier: '停用' },
   'M3 在模型与 Key 展示中必须标为停用',
 );
+for (const id of ['deepseek/deepseek-v4-pro', 'stealth/ox-alpha']) {
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(helperVm.__modelUi.modelDisplay(id, { pool: 'premium' }))),
+    { id, name: id.slice(id.lastIndexOf('/') + 1), tierKey: 'paused', tier: '停用' },
+    `${id} 即使旧快照仍带 pool，也必须优先显示停用`,
+  );
+}
+assert.deepEqual(
+  JSON.parse(JSON.stringify(helperVm.__modelUi.modelDisplay('deepseek/deepseek-v4-pro-20260827'))),
+  {
+    id: 'deepseek/deepseek-v4-pro-20260827',
+    name: 'deepseek-v4-pro-20260827',
+    tierKey: 'paused',
+    tier: '停用',
+  },
+  'D4P 日期快照变体必须继承暂停状态',
+);
+assert.deepEqual(
+  JSON.parse(JSON.stringify(helperVm.__modelUi.modelDisplay(
+    'deepseek/deepseek-v4-pro-max', { pool: 'premium' },
+  ))),
+  {
+    id: 'deepseek/deepseek-v4-pro-max',
+    name: 'deepseek-v4-pro-max',
+    tierKey: 'premium',
+    tier: '高级',
+  },
+  '非日期后缀 deepseek-v4-pro-max 不得被暂停规则误伤',
+);
 assert.deepEqual(
   JSON.parse(JSON.stringify(helperVm.__modelUi.modelDisplay('deepseek/deepseek-v4-flash'))),
   { id: 'deepseek/deepseek-v4-flash', name: 'deepseek-v4-flash', tierKey: 'free', tier: '免费' },
   'DS4F 必须去掉 provider 前缀，只保留模型名 + 免费标签',
-);
-assert.deepEqual(
-  JSON.parse(JSON.stringify(helperVm.__modelUi.modelDisplay('deepseek/deepseek-v4-pro', { pool: 'premium' }))),
-  { id: 'deepseek/deepseek-v4-pro', name: 'deepseek-v4-pro', tierKey: 'premium', tier: '高级' },
-  'DS4P 计入共享 Premium 时必须显示高级',
-);
-assert.deepEqual(
-  JSON.parse(JSON.stringify(helperVm.__modelUi.modelDisplay('deepseek/deepseek-v4-pro', { pool: 'deepseek_pro' }))),
-  { id: 'deepseek/deepseek-v4-pro', name: 'deepseek-v4-pro', tierKey: 'deepseek_pro', tier: 'DS4P' },
-  'DS4P 有独立额度池时必须显示 DS4P',
 );
 assert.deepEqual(
   JSON.parse(JSON.stringify(helperVm.__modelUi.modelDisplay('anthropic/claude-fable-5', { pool: 'standard' }))),
@@ -616,8 +634,13 @@ assert.deepEqual(
 );
 assert.deepEqual(
   JSON.parse(JSON.stringify(helperVm.__modelUi.modelDisplay('openai/gpt-5.6-luna', { pool: 'luna' }))),
-  { id: 'openai/gpt-5.6-luna', name: 'gpt-5.6-luna', tierKey: 'luna', tier: 'Luna' },
-  'Luna 有独立额度池时必须显示 Luna',
+  { id: 'openai/gpt-5.6-luna', name: 'gpt-5.6-luna', tierKey: 'premium', tier: '高级' },
+  '旧 Luna 独立池数据必须兼容显示为 Premium 高级，不得再显示 Luna tag',
+);
+assert.deepEqual(
+  JSON.parse(JSON.stringify(helperVm.__modelUi.modelDisplay('z-ai/glm-5.3-flash', { pool: 'glm_v53_flash' }))),
+  { id: 'z-ai/glm-5.3-flash', name: 'glm-5.3-flash', tierKey: 'glm_v53_flash', tier: 'GLM' },
+  'GLM 5.3 Flash 有独立池时必须显示 GLM tag',
 );
 assert.deepEqual(
   JSON.parse(JSON.stringify(helperVm.__modelUi.modelDisplay('vendor/new-model', { pool: 'preview_pool' }))),
@@ -625,52 +648,52 @@ assert.deepEqual(
   '未知 pool 必须原样显示且使用通用配色，不能猜成高级池',
 );
 assert.deepEqual(
-  JSON.parse(JSON.stringify(helperVm.__modelUi.modelDisplay('deepseek/deepseek-v4-pro', { pool: 'preview_pool' }))),
-  { id: 'deepseek/deepseek-v4-pro', name: 'deepseek-v4-pro', tierKey: 'pool-other', tier: 'preview_pool' },
-  '未知 pool 必须原样显示，不能猜测 DS4P 的额度归属',
+  JSON.parse(JSON.stringify(helperVm.__modelUi.modelDisplay('z-ai/glm-5.3-flash', { pool: 'preview_pool' }))),
+  { id: 'z-ai/glm-5.3-flash', name: 'glm-5.3-flash', tierKey: 'glm_v53_flash', tier: 'GLM' },
+  'GLM 5.3 的固定独立额度 tag 不得被目录中的旧 pool 声明覆盖',
 );
 assert.match(app, /function modelsCellHtml[\s\S]*?modelListHtml\(\[q\.model\], \[q\]\)/s,
   '账号可用模型必须把实时额度行传给统一 Tag 解析器');
 assert.match(
   helperVm.__modelUi.modelListHtml(
-    ['deepseek/deepseek-v4-pro'],
-    [{ id: 'deepseek/deepseek-v4-pro', pool: 'premium' }],
+    ['z-ai/glm-5.3-flash'],
+    [{ id: 'z-ai/glm-5.3-flash', pool: 'glm_v53_flash' }],
   ),
-  /tier-premium">高级<\/span>/,
-  '账号额度行 pool=premium 时 DS4P 必须显示高级',
+  /tier-glm_v53_flash">GLM<\/span>/,
+  '账号额度行 pool=glm_v53_flash 时必须显示 GLM',
 );
-helperVm.__modelState.models = [{ id: 'deepseek/deepseek-v4-pro', pool: 'deepseek_pro' }];
+helperVm.__modelState.models = [{ id: 'z-ai/glm-5.3-flash', pool: 'premium' }];
 assert.match(
   helperVm.__modelUi.modelListHtml(
-    ['deepseek/deepseek-v4-pro'],
-    [{ model: 'deepseek/deepseek-v4-pro', pool: 'premium', limit: 5 }],
+    ['z-ai/glm-5.3-flash'],
+    [{ model: 'z-ai/glm-5.3-flash', pool: 'glm_v53_flash', limit: 2 }],
   ),
-  /tier-premium">高级<\/span>/,
-  '账号额度行必须优先于模型目录 pool，不能把该账号的 Premium DS4P 错标为独立池',
+  /tier-glm_v53_flash">GLM<\/span>/,
+  '账号额度行必须优先于模型目录 pool，不能把 GLM 独立池错标为 Premium',
 );
 helperVm.__modelState.models = [
-  { id: 'deepseek/deepseek-v4-pro', pool: 'premium', tier: 'us_sg' },
+  { id: 'z-ai/glm-5.3-flash', pool: 'premium', tier: 'us_sg' },
   { id: 'openai/gpt-5.6-luna', pool: 'premium', tier: 'us_sg' },
 ];
 helperVm.__modelState.health = {
   account: { quota: [
-    { model: 'deepseek/deepseek-v4-pro', pool: 'premium', limit: 5 },
+    { model: 'z-ai/glm-5.3-flash', pool: 'glm_v53_flash', limit: 2 },
     { model: 'openai/gpt-5.6-luna', pool: 'luna', limit: 2 },
   ] },
 };
 assert.deepEqual(
   JSON.parse(JSON.stringify(helperVm.__modelUi.modelDisplay(
-    'deepseek/deepseek-v4-pro', helperVm.__modelState.models[0],
+    'z-ai/glm-5.3-flash', helperVm.__modelState.models[0],
   ))),
-  { id: 'deepseek/deepseek-v4-pro', name: 'deepseek-v4-pro', tierKey: 'premium', tier: '高级' },
-  '全局模型列表必须根据账号额度表把共享池 DS4P 显示为高级',
+  { id: 'z-ai/glm-5.3-flash', name: 'glm-5.3-flash', tierKey: 'glm_v53_flash', tier: 'GLM' },
+  '全局模型列表必须根据账号额度表识别 GLM 5.3 独立池',
 );
 assert.deepEqual(
   JSON.parse(JSON.stringify(helperVm.__modelUi.modelDisplay(
     'openai/gpt-5.6-luna', helperVm.__modelState.models[1],
   ))),
-  { id: 'openai/gpt-5.6-luna', name: 'gpt-5.6-luna', tierKey: 'luna', tier: 'Luna' },
-  '全局模型列表必须根据账号额度表识别 Luna 独立池',
+  { id: 'openai/gpt-5.6-luna', name: 'gpt-5.6-luna', tierKey: 'premium', tier: '高级' },
+  '全局模型列表必须把旧 Luna pool 兼容归入 Premium',
 );
 helperVm.__modelState.health = {};
 assert.ok(!helperVm.__modelUi.modelListHtml(['openai/gpt-5.6-luna-es']),
@@ -681,15 +704,15 @@ assert.equal(
     [{ id: 'openai/gpt-5.6-luna', pool: 'luna' }],
   ),
   '<span class="model-label" title="openai/gpt-5.6-luna">gpt-5.6-luna'
-  + ' <span class="pill tier tier-luna">Luna</span></span>',
-  'Luna 独立池必须显示模型名 + Luna tag',
+  + ' <span class="pill tier tier-premium">高级</span></span>',
+  '旧 Luna pool 必须显示模型名 + 高级 tag',
 );
 assert.match(helperVm.__modelUi.modelListHtml(
-  ['deepseek/deepseek-v4-pro'],
-  [{ id: 'deepseek/deepseek-v4-pro', pool: 'deepseek_pro' }],
+  ['z-ai/glm-5.3-flash'],
+  [{ id: 'z-ai/glm-5.3-flash', pool: 'glm_v53_flash' }],
 ),
-  /">deepseek-v4-pro <span class="pill tier tier-deepseek_pro">DS4P<\/span>/,
-  'DS4P 独立池必须显示去 provider 的模型名 + DS4P tag');
+  /">glm-5\.3-flash <span class="pill tier tier-glm_v53_flash">GLM<\/span>/,
+  'GLM 独立池必须显示去 provider 的模型名 + GLM tag');
 assert.match(helperVm.__modelUi.modelListHtml(['mimo/mimo-v2.5']),
   /">mimo-v2\.5 <span class="pill tier tier-free">免费<\/span>/,
   'MiMo 的免费标签必须使用 free 配色');

@@ -125,6 +125,33 @@ test('旧 M3-only Key 不得被空模型更新静默扩成不限模型', async (
   });
 });
 
+for (const [label, model] of [
+  ['M3 日期快照', 'minimax/minimax-m3-260827'],
+  ['D4P', 'deepseek/deepseek-v4-pro'],
+  ['D4P 日期快照', 'deepseek/deepseek-v4-pro-20260826'],
+  ['D4P 日期构建', 'deepseek/deepseek-v4-pro-20260826-preview'],
+  ['Ox', 'stealth/ox-alpha'],
+  ['Ox 日期快照', 'stealth/ox-alpha-260827:freebuff'],
+]) {
+  test(`旧 ${label}-only Key 不得被空模型更新静默扩成不限模型`, async () => {
+    await withStore(async (store) => {
+      const key = store.add({ name: `旧 ${label} Key`, models: [model] });
+      assert.throws(
+        () => store.update(key.key, { models: [] }),
+        (error) => error?.code === 'INVALID_KEY_CONFIG',
+      );
+      assert.deepEqual(store.list()[0].models, [model]);
+    });
+  });
+}
+
+test('暂停规则不把 D4P Max 当成 D4P', async () => {
+  await withStore(async (store) => {
+    const key = store.add({ name: 'D4P Max Key', models: ['deepseek/deepseek-v4-pro-max'] });
+    assert.deepEqual(store.update(key.key, { models: [] }).models, []);
+  });
+});
+
 test('手改过/旧版本写的文件也能用：缺字段补默认值，坏 JSON 当空池而不是打不开面板', async () => {
   await withStore(async (store) => {
     const list = store.list();

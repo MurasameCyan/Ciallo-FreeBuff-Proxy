@@ -24,7 +24,8 @@ const workerWrapper = workerSource.replace('export default {', 'const __workerDe
   + 'recentlyWaitingRoom, maxWaitingRoomSwitches, waitingRoomDeprioritizeMs, '
   + 'retryChainBudgetMs, recordAccountObservation, acctHealth };\n';
 
-const DS4P = 'deepseek/deepseek-v4-pro';
+// 主体必须是未被官方 paused 的模型：paused 闸门在排队/换号逻辑之前就返回。
+const MODEL = 'deepseek/deepseek-v4-flash';
 
 function createWorkerVm({ now, fetchImpl } = {}) {
   let clock = now ?? Date.UTC(2030, 0, 1);
@@ -130,7 +131,7 @@ test('排队号不占换号预算：前 3 个号排队，第 4 个号仍能成�
   const env = envFor(POOL, { FREEBUFF_ACCOUNT_SWITCH_JITTER_MS: '0' });
 
   const response = await workerVm.api.executeChat(
-    env, chatParams(DS4P), modelCfg(DS4P, 'base2-free-deepseek'), false, 'chat',
+    env, chatParams(MODEL), modelCfg(MODEL, 'base2-free-deepseek'), false, 'chat',
   );
 
   assert.equal(response.status, 200,
@@ -147,7 +148,7 @@ test('排队预算也有上限：整池排队时不会退化成全池轮询', as
   const env = envFor(POOL, { FREEBUFF_ACCOUNT_SWITCH_JITTER_MS: '0' });
 
   const response = await workerVm.api.executeChat(
-    env, chatParams(DS4P), modelCfg(DS4P, 'base2-free-deepseek'), false, 'chat',
+    env, chatParams(MODEL), modelCfg(MODEL, 'base2-free-deepseek'), false, 'chat',
   );
 
   assert.equal(response.status, 503, '整池排队最终仍应返回 waiting_room 503');
@@ -168,13 +169,13 @@ test('新鲜的排队观测把号降权到候选末尾，但不摘号', async ()
   const { api } = workerVm;
 
   // 把 POOL[0] 标成刚刚排队过（428 waiting_room_required）。
-  api.recordAccountObservation(POOL[0], 428, { status: 'waiting_room_required' }, { model: DS4P });
+  api.recordAccountObservation(POOL[0], 428, { status: 'waiting_room_required' }, { model: MODEL });
   assert.equal(api.recentlyWaitingRoom(POOL[0], env, start), true);
 
   // 连着选 6 次（每次选完释放），排队号不该出现在第一位。
   const picked = [];
   for (let i = 0; i < POOL.length; i++) {
-    const acct = api.pickToken(env, DS4P, new Set(picked), null);
+    const acct = api.pickToken(env, MODEL, new Set(picked), null);
     assert.ok(acct, '降权不等于摘号：池子容量不变，6 个号都还能被选到');
     picked.push(acct.token);
     api.releaseToken(acct.token);
@@ -189,7 +190,7 @@ test('过期的排队观测自动失效，不再压着这个号', async () => {
   const env = envFor(POOL);
   const { api } = workerVm;
 
-  api.recordAccountObservation(POOL[0], 428, { status: 'waiting_room_required' }, { model: DS4P });
+  api.recordAccountObservation(POOL[0], 428, { status: 'waiting_room_required' }, { model: MODEL });
   assert.equal(api.recentlyWaitingRoom(POOL[0], env, start), true);
 
   // 默认窗口 60s：超过就视同未知，回到正常轮询。这正是线上那份几小时前的
@@ -229,7 +230,7 @@ test('重试链时间预算到顶就停手，不再起新号的尝试', async ()
   const env = envFor(POOL, { FREEBUFF_ACCOUNT_SWITCH_JITTER_MS: '0', FREEBUFF_RETRY_CHAIN_BUDGET_MS: '0' });
 
   const response = await workerVm.api.executeChat(
-    env, chatParams(DS4P), modelCfg(DS4P, 'base2-free-deepseek'), false, 'chat',
+    env, chatParams(MODEL), modelCfg(MODEL, 'base2-free-deepseek'), false, 'chat',
   );
 
   assert.equal(response.status, 503, '预算耗尽后仍应回 waiting_room 503（兜底分支）');
@@ -247,7 +248,7 @@ test('预算 0 也不拦第一个号：单号可用时请求照常成功', async
   const env = envFor(POOL, { FREEBUFF_ACCOUNT_SWITCH_JITTER_MS: '0', FREEBUFF_RETRY_CHAIN_BUDGET_MS: '0' });
 
   const response = await workerVm.api.executeChat(
-    env, chatParams(DS4P), modelCfg(DS4P, 'base2-free-deepseek'), false, 'chat',
+    env, chatParams(MODEL), modelCfg(MODEL, 'base2-free-deepseek'), false, 'chat',
   );
   assert.equal(response.status, 200, '预算只拦换号链，不拦首个尝试');
   assert.equal(upstream.created, 1);

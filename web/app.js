@@ -294,30 +294,47 @@ function stateDot(s, detail = '') {
 }
 
 // 面板只显示模型名（去掉 provider/ 前缀）；完整 id 留在 title 和 API/白名单值里。
-// tag 表达访问/供给层：免费 / 高级 / DS4P / Luna / 限定 / 停用。
-// DS4P/Luna 由实时额度池决定：独立池显示模型专属 tag，共享 premium 显示高级。
+// tag 表达访问/供给层：免费 / 高级 / GLM / 限定 / 停用。
+// GLM 5.3 Flash 有独立额度池；Luna 只属于 Premium 共享池。
 // Fable 虽沿用 standard 兼容池，访问层仍是限定，不能被错标为免费。
 const MODEL_DISPLAY = {
-  'openai/gpt-5.6-luna': { label: 'Luna', tier: 'luna' },
-  'deepseek/deepseek-v4-pro': { label: 'DS4P', tier: 'deepseek_pro' },
+  'openai/gpt-5.6-luna': { label: '高级', tier: 'premium' },
+  'deepseek/deepseek-v4-pro': { label: '停用', tier: 'paused' },
+  'stealth/ox-alpha': { label: '停用', tier: 'paused' },
   'deepseek/deepseek-v4-flash': { label: '免费', tier: 'free' },
   'minimax/minimax-m3': { label: '停用', tier: 'paused' },
   'crof/kimi-k3-eco': { label: '高级', tier: 'us_sg' },
   'meta/muse-spark-1.2-contributor': { label: '高级', tier: 'us_sg' },
   'mimo/mimo-v2.5': { label: '免费', tier: 'free' },
   'z-ai/glm-5.2': { label: '限定', tier: 'limited' },
+  'z-ai/glm-5.3-flash': { label: 'GLM', tier: 'glm_v53_flash' },
   'anthropic/claude-fable-5': { label: '限定', tier: 'limited' },
 };
 
 // 官方已撤回但动态目录可能不再返回的模型，保留在管理面板用于说明历史配置，
 // 不代表它仍可调用；worker /v1/models 和请求入口都会将其排除。
-const PAUSED_MODEL_IDS = new Set(['minimax/minimax-m3']);
-// stealth/ox-alpha 已开放（官方 2026-08-24 放进 CLI 目录并清空 service-only 名单）。
+const PAUSED_MODEL_IDS = new Set([
+  'minimax/minimax-m3',
+  'deepseek/deepseek-v4-pro',
+  'stealth/ox-alpha',
+]);
 const HIDDEN_MODEL_IDS = new Set([
   'openai/gpt-5.6-luna-es',
   // 官方 FREEBUFF_WEB_GOD_ONLY_MODELS（0766319c）：god 账号专属，且不在 CLI 目录里。
   'crof/kimi-k3-eco',
 ]);
+
+function isPausedModelId(modelId) {
+  const value = String(modelId || '').trim().toLowerCase();
+  if (!value) return false;
+  if (PAUSED_MODEL_IDS.has(value)) return true;
+  if (value === 'minimax-m3' || value === 'deepseek-v4-pro' || value === 'ox-alpha') return true;
+  return [
+    'minimax/minimax-m3',
+    'deepseek/deepseek-v4-pro',
+    'stealth/ox-alpha',
+  ].some((base) => new RegExp(`^${base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}-\\d{6,8}(?:[-/:].*)?$`).test(value));
+}
 
 function isHiddenModelId(modelId) {
   const value = String(modelId || '').trim().toLowerCase();
@@ -334,24 +351,19 @@ function catalogModelIds() {
 }
 
 const MODEL_QUOTA_POOLS = {
-  'deepseek/deepseek-v4-pro': 'deepseek_pro',
-  'openai/gpt-5.6-luna': 'luna',
+  'openai/gpt-5.6-luna': 'premium',
   'deepseek/deepseek-v4-flash': 'premium',
   'crof/kimi-k3-eco': 'premium',
   'meta/muse-spark-1.2-contributor': 'premium',
+  'z-ai/glm-5.3-flash': 'glm_v53_flash',
 };
 
 const KNOWN_POOL_TAGS = {
   premium: { label: '高级', tierKey: 'premium' },
-  luna: { label: 'Luna', tierKey: 'luna' },
-  deepseek_pro: { label: 'DS4P', tierKey: 'deepseek_pro' },
+  glm_v53_flash: { label: 'GLM', tierKey: 'glm_v53_flash' },
   glm: { label: '限定', tierKey: 'glm' },
   standard: { label: '免费', tierKey: 'free' },
 };
-const POOL_TAG_MODEL_IDS = new Set([
-  'deepseek/deepseek-v4-pro',
-  'openai/gpt-5.6-luna',
-]);
 
 // 未收录的动态模型退回 /v1/models 的 tier 分组文案。
 // name 只保留 provider/ 后面的模型名，完整 id 仍放在 title 并继续作为 API/白名单值。
@@ -360,32 +372,28 @@ function modelName(id) {
   return value.slice(value.lastIndexOf('/') + 1);
 }
 
+// 访问层固定的 tag：不跟随 pool 声明。GLM 5.3 Flash 的独立额度池是它的访问层特征，
+// 目录行里残留的 pool=premium 不能把它降标成高级；Luna 的独立池已被上游删除，
+// 旧快照里回的 pool='luna' 一律按 Premium 显示。
+const FIXED_TAG_MODELS = {
+  'z-ai/glm-5.3-flash': { tierKey: 'glm_v53_flash', tier: 'GLM' },
+  'openai/gpt-5.6-luna': { tierKey: 'premium', tier: '高级' },
+};
+
 function modelDisplay(id, model = null) {
   const known = MODEL_DISPLAY[id] || {};
-  if (PAUSED_MODEL_IDS.has(id)) {
-    return { id, name: modelName(id), tierKey: 'paused', tier: '停用' };
-  }
-  const declaredPool = String(model?.pool || '').trim().slice(0, 64);
-  // 账号额度行（带 model 字段）的 pool 最具体，必须优先；模型目录行则允许
-  // 已加载的账号快照覆盖官方目录的通用 pool。
-  const rawPool = model?.model ? declaredPool : observedQuotaPool(id) || declaredPool;
   const name = modelName(id);
-  // 只有 DS4P/Luna 的 tag 跟随额度池。其他已知模型仍以访问层配置为准，
-  // 例如 Fable 的兼容 pool=standard 不能把“限定”覆盖成“免费”。
-  if (POOL_TAG_MODEL_IDS.has(id) && rawPool) {
-    const poolTag = KNOWN_POOL_TAGS[rawPool.toLowerCase()];
-    return {
-      id,
-      name,
-      tierKey: poolTag?.tierKey || 'pool-other',
-      tier: poolTag?.label || rawPool,
-    };
+  if (isPausedModelId(id)) {
+    return { id, name, tierKey: 'paused', tier: '停用' };
   }
+  const fixed = FIXED_TAG_MODELS[id];
+  if (fixed) return { id, name, ...fixed };
+  const rawPool = normalizeQuotaPool(model?.pool).slice(0, 64);
   const declaredTier = String(known.tier || model?.tier || '').trim();
   if (declaredTier && (known.label || MODEL_TIER_LABELS[declaredTier])) {
     return {
       id,
-      name: modelName(id),
+      name,
       tierKey: declaredTier,
       tier: known.label || MODEL_TIER_LABELS[declaredTier],
     };
@@ -403,32 +411,10 @@ function modelDisplay(id, model = null) {
   return { id, name, tierKey, tier: known.label || MODEL_TIER_LABELS[tierKey] || '' };
 }
 
-// 模型目录没有账号上下文；从已加载的账号额度快照汇总 DS4P/Luna 的真实池。
-// 任一账号有独立池就显示专属 tag，否则共享 Premium 显示高级。
-function observedQuotaPool(modelId) {
-  const id = String(modelId || '');
-  if (!POOL_TAG_MODEL_IDS.has(id)) return '';
-  const pools = new Set();
-  for (const probe of Object.values(S.health || {})) {
-    for (const row of Array.isArray(probe?.quota) ? probe.quota : []) {
-      if (row?.model !== id) continue;
-      const pool = String(row.pool || '').trim().toLowerCase();
-      if (pool) pools.add(pool);
-    }
-  }
-  const dedicated = id === 'deepseek/deepseek-v4-pro' ? 'deepseek_pro' : 'luna';
-  if (pools.has(dedicated)) return dedicated;
-  if (pools.has('premium')) return 'premium';
-  return '';
-}
-
 function modelListHtml(modelIds = [], models = null) {
   const byId = new Map((Array.isArray(S.models) ? S.models : [])
     .filter((model) => model?.id)
-    .map((model) => {
-      const observedPool = observedQuotaPool(model.id);
-      return [model.id, observedPool ? { ...model, pool: observedPool } : model];
-    }));
+    .map((model) => [model.id, model]));
   for (const model of Array.isArray(models) ? models : []) {
     const id = String(model?.id || model?.model || '').trim();
     if (!id) continue;
@@ -442,23 +428,28 @@ function modelListHtml(modelIds = [], models = null) {
   }).join(', ');
 }
 
+function normalizeQuotaPool(pool) {
+  const value = String(pool || '').trim().toLowerCase();
+  return value === 'luna' ? 'premium' : value;
+}
+
 function quotaPoolForRow(row) {
-  const explicit = String(row?.pool || '').trim().toLowerCase();
+  const explicit = normalizeQuotaPool(row?.pool);
   if (explicit) return explicit;
   const model = Array.isArray(S.models)
     ? S.models.find((entry) => entry?.id === row?.model)
     : null;
-  return String(model?.pool || '').trim().toLowerCase() || MODEL_QUOTA_POOLS[row?.model] || '';
+  return normalizeQuotaPool(model?.pool || MODEL_QUOTA_POOLS[row?.model]);
 }
 
-// 额度展示按上游 pool 聚合。D/L/P 给的是「还能开几次会话」：徽标只出剩余数，
+// 额度展示按上游 pool 聚合。G/P 给的是「还能开几次会话」：徽标只出剩余数，
 // 上限和已用放 title。只按 pool 汇总，避免一行账号被某个模型的计数冒充成整个账号额度。
 function quotaRows(probe) {
   if (!probe || !Array.isArray(probe.quota)) return [];
   return probe.quota.filter((q) => {
     const limit = Number(q?.limit);
     return Number.isFinite(limit) && limit >= 0
-      && !PAUSED_MODEL_IDS.has(String(q?.model || '')) && !isHiddenModelId(q?.model);
+      && !isPausedModelId(q?.model) && !isHiddenModelId(q?.model);
   });
 }
 
@@ -470,7 +461,7 @@ function accountQuotaSummary(probe) {
   const pools = new Map();
   for (const row of quotaRows(probe)) {
     const pool = quotaPoolForRow(row);
-    if (!['deepseek_pro', 'luna', 'premium', 'limited'].includes(pool)) continue;
+    if (!['glm_v53_flash', 'premium', 'limited'].includes(pool)) continue;
     const limit = Number(row.limit);
     const usedValue = row.used ?? row.recentCount;
     const used = Number.isFinite(Number(usedValue)) ? Number(usedValue) : null;
@@ -486,8 +477,7 @@ function accountQuotaSummary(probe) {
     }
   }
   const poolOrder = [
-    ['deepseek_pro', 'D'],
-    ['luna', 'L'],
+    ['glm_v53_flash', 'G'],
     ['premium', 'P'],
     // accessTier=limited 的号只有这一个池（上游 poolLabel "Daily"，只覆盖 flash/mimo）。
     // 不列出来的话这类账号整行没有任何剩余数字，看起来像探测失败。
@@ -888,7 +878,7 @@ function fillKeyModelButtons(selected = []) {
     ...ids.map((id) => {
       const model = (Array.isArray(S.models) ? S.models : []).find((entry) => entry?.id === id);
       const { name, tier } = modelDisplay(id, model);
-      const paused = PAUSED_MODEL_IDS.has(id);
+      const paused = isPausedModelId(id);
       return `<button type="button" class="key-model-option${paused ? ' is-paused' : ''}" data-key-model="${esc(id)}" aria-pressed="${chosen.includes(id)}"${paused ? ' disabled aria-disabled="true"' : ''} title="${esc(id)}">${esc(name)}${tier ? ` · ${esc(tier)}` : ''}</button>`;
     }),
   ].join('');
@@ -920,7 +910,7 @@ function resetKeyForm() {
 function fillKeyForm(k) {
   keyEditing = k.key;
   keyEditingPausedModels = Array.isArray(k.models)
-    ? k.models.filter((model) => PAUSED_MODEL_IDS.has(model))
+    ? k.models.filter((model) => isPausedModelId(model))
     : [];
   keyEditingHiddenModels = Array.isArray(k.models)
     ? k.models.filter((model) => isHiddenModelId(model))

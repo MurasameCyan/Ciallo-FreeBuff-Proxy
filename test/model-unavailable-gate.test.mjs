@@ -1,7 +1,7 @@
 // 官方 FREEBUFF_GATE_CODES 的 `model_unavailable`（410，endsTheSession: false）。
 //
 // 语义是「模型本身现在不可选」——已从 free mode 撤下，或只在某些时段开放
-// （session 联合体那一支还带 `availableHours`，V4 Pro 就有 00:00-10:00 UTC 的关闭窗口）。
+// （session 联合体那一支还带 `availableHours`，峰时关闭的模型就有这种时段窗口）。
 // 这是**全局**结果：换账号拿到的还是同一个答案。
 //
 // 官方注释写明 endsTheSession 为什么必须是 false：已发布客户端的编译期目录里还留着
@@ -22,7 +22,10 @@ const workerWrapper = workerSource.replace('export default {', 'const __workerDe
   + 'classifyRateLimit, buildDynamicModelTable, startRunChain, acctHealth, sessCache };\n';
 
 const LUNA = 'openai/gpt-5.6-luna';
-const DS4P = 'deepseek/deepseek-v4-pro';
+// 被测主体必须是**当前未被官方 paused 的**模型：paused 闸门在 gate 归类之前就短路
+// （回 account_pool_unavailable），拿 D4P 这种已撤下的当样本只会测到 paused 闸门。
+// model_unavailable 是上游对在售模型的实时回答，任何活模型都可能收到。
+const GATED = 'z-ai/glm-5.3-flash';
 
 function createWorkerVm({ now = Date.UTC(2030, 0, 1), fetchImpl } = {}) {
   let clock = now;
@@ -113,7 +116,7 @@ function chatParams(id) {
 const GATE_BODY = JSON.stringify({
   error: 'model_unavailable',
   statusCode: 410,
-  message: 'DeepSeek V4 Pro is not selectable right now.',
+  message: 'GLM 5.3 Flash is not selectable right now.',
 });
 
 test('chat 410 model_unavailable：立刻回客户端，不换号、不冷却、不重建会话', async () => {
@@ -126,13 +129,13 @@ test('chat 410 model_unavailable：立刻回客户端，不换号、不冷却、
   const workerVm = createWorkerVm({ now: start, fetchImpl: upstream.fetch });
 
   const response = await workerVm.api.executeChat(
-    envFor(tokens), chatParams(DS4P), modelCfg(DS4P, 'base2-free-deepseek'), true, 'chat',
+    envFor(tokens), chatParams(GATED), modelCfg(GATED, 'base2-free-deepseek'), true, 'chat',
   );
   const body = await response.json();
 
   assert.equal(response.status, 503);
   assert.equal(body.error.type, 'model_unavailable', '必须原样告知原因，不能伪装成 502/无可用账号');
-  assert.equal(body.error.requestedModel, DS4P);
+  assert.equal(body.error.requestedModel, GATED);
   const chatTokens = new Set(log.filter((e) => e.path === '/api/v1/chat/completions').map((e) => e.token));
   assert.equal(chatTokens.size, 1, '模型全局不可用，换号只是把同一个答案再要一遍');
   assert.deepEqual(log.filter((e) => e.method === 'DELETE'), [],
@@ -140,12 +143,12 @@ test('chat 410 model_unavailable：立刻回客户端，不换号、不冷却、
   assert.equal(upstream.created, 1, '不得重建会话白扣 admission（#1801 的循环）');
   for (const token of tokens) {
     assert.equal(workerVm.api.cooldownInfo(token), null, `${token} 不该被冷却`);
-    assert.equal(workerVm.api.scopedCooldownInfo(token, DS4P), null, `${token}:DS4P 不该被冷却`);
+    assert.equal(workerVm.api.scopedCooldownInfo(token, GATED), null, `${token}:GATED 不该被冷却`);
   }
 });
 
 test('POST /session 回 model_unavailable：带上 availableHours 告诉客户端什么时候能用', async () => {
-  const start = Date.UTC(2030, 0, 1, 3, 0, 0); // V4 Pro 的关闭窗口内
+  const start = Date.UTC(2030, 0, 1, 3, 0, 0); // 上游给出的关闭窗口内
   const tokens = ['gate-session-token-aaaaaaaaaaaaa', 'gate-session-token-bbbbbbbbbbbbb'];
   const log = [];
   const upstream = createFakeUpstream({
@@ -159,7 +162,7 @@ test('POST /session 回 model_unavailable：带上 availableHours 告诉客户�
   const workerVm = createWorkerVm({ now: start, fetchImpl: upstream.fetch });
 
   const response = await workerVm.api.executeChat(
-    envFor(tokens), chatParams(DS4P), modelCfg(DS4P, 'base2-free-deepseek'), true, 'chat',
+    envFor(tokens), chatParams(GATED), modelCfg(GATED, 'base2-free-deepseek'), true, 'chat',
   );
   const body = await response.json();
 
@@ -171,7 +174,7 @@ test('POST /session 回 model_unavailable：带上 availableHours 告诉客户�
   assert.equal(sessionPosts.length, 1, '第一个号就该终止，不能把整池 POST 一遍');
   for (const token of tokens) {
     assert.equal(workerVm.api.cooldownInfo(token), null);
-    assert.equal(workerVm.api.scopedCooldownInfo(token, DS4P), null);
+    assert.equal(workerVm.api.scopedCooldownInfo(token, GATED), null);
   }
 });
 
@@ -246,14 +249,14 @@ test('报了名字的 403 是模型/模式问题，不能算到出口节点头�
 test('luna 的 root agent 走 base3（上游已下线 base2-free-luna）', () => {
   const { api } = createWorkerVm({ fetchImpl: async () => upstreamResponse(200, {}) });
   const table = api.buildDynamicModelTable({
-    root: { [LUNA]: 'base2-free-luna', [DS4P]: 'base2-free-deepseek' },
-    base3: { [LUNA]: 'base3-free-luna', [DS4P]: 'base3-free-deepseek' },
+    root: { [LUNA]: 'base2-free-luna', [GATED]: 'base2-free-deepseek' },
+    base3: { [LUNA]: 'base3-free-luna', [GATED]: 'base3-free-deepseek' },
     reviewer: {},
   });
   const luna = table.find((m) => m.id === LUNA);
   assert.equal(luna.agent, 'base3-free-luna', '普通 chat 必须用 base3 root');
   assert.equal(luna.root_agent, 'base3-free-luna');
-  const ds4p = table.find((m) => m.id === DS4P);
+  const ds4p = table.find((m) => m.id === GATED);
   assert.equal(ds4p.agent, 'base2-free-deepseek', '只改被下线的那个，别的模型不动');
 });
 
@@ -275,7 +278,7 @@ test('base3 root 不 spawn context-pruner 子 run', async () => {
   assert.equal(base3.childRunId, null);
 
   log.length = 0;
-  await api.startRunChain('run-chain-token-base2-aaaa', 'base2-free-deepseek', DS4P);
+  await api.startRunChain('run-chain-token-base2-aaaa', 'base2-free-deepseek', GATED);
   assert.deepEqual(log, ['base2-free-deepseek', 'context-pruner'], 'base2 链路保持原样');
 });
 

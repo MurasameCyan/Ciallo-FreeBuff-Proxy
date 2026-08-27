@@ -26,7 +26,9 @@ const workerWrapper = workerSource.replace('export default {', 'const __workerDe
   + 'releaseToken, invalidateSessionCache, createSession, executeChat, scopedCooldownInfo, '
   + 'accountPoolExhaustion, sessCache, clientModelLock };\n';
 
-const DS4P = 'deepseek/deepseek-v4-pro';
+// 这组测的是「同一 Key 在会话期内换模型」，需要两个互不相同且都未被官方 paused
+// 的模型。D4P 已撤下（paused 闸门会在换模型逻辑之前就返回），改用 DS4F。
+const DS4F = 'deepseek/deepseek-v4-flash';
 const LUNA = 'openai/gpt-5.6-luna';
 
 function createWorkerVm({ now, fetchImpl, consoleImpl = console } = {}) {
@@ -144,7 +146,7 @@ test('同一账号换模型：只能删旧会话重建，会白烧一次 admissi
   const tokenA = 'switch-single-account-token-aaaaaa';
   const log = [];
   const upstream = createFakeUpstream({
-    start, log, sessions: { [tokenA]: { instanceId: 'inst-ds4p', model: DS4P } },
+    start, log, sessions: { [tokenA]: { instanceId: 'inst-ds4f', model: DS4F } },
   });
   const workerVm = createWorkerVm({ now: start, fetchImpl: upstream.fetch });
   const env = envFor([tokenA]);
@@ -156,11 +158,11 @@ test('同一账号换模型：只能删旧会话重建，会白烧一次 admissi
   assert.equal(response.status, 200, 'model_locked 前的 DELETE 生效后 luna 应该能开起来');
   assert.equal(upstream.state.get(tokenA)?.model, LUNA);
   assert.equal(log.filter((e) => e.method === 'DELETE').length, 1,
-    '换模型必须删掉上游 ds4p 会话 —— 这就是「并行不可能」的上游硬约束');
+    '换模型必须删掉上游 ds4f 会话 —— 这就是「并行不可能」的上游硬约束');
   assert.equal(upstream.created, 1, '重建 luna 会话消耗一次 admission');
 });
 
-test('ds4p 调用完立刻换 luna：应落到另一个空闲账号，两个会话并行', async () => {
+test('ds4f 调用完立刻换 luna：应落到另一个空闲账号，两个会话并行', async () => {
   const start = Date.UTC(2030, 0, 1);
   const tokenA = 'switch-parallel-token-aaaaaaaaaaaa';
   const tokenB = 'switch-parallel-token-bbbbbbbbbbbb';
@@ -169,14 +171,14 @@ test('ds4p 调用完立刻换 luna：应落到另一个空闲账号，两个会�
   const workerVm = createWorkerVm({ now: start, fetchImpl: upstream.fetch });
   const env = envFor([tokenA, tokenB]);
 
-  // 1) 先跑一次 ds4p（用户的第一步），会在某个号上留下 ds4p 会话。
-  const ds4p = await workerVm.api.executeChat(
-    env, chatParams(DS4P), modelCfg(DS4P, 'base2-free-deepseek'), true, 'chat',
+  // 1) 先跑一次 ds4f（用户的第一步），会在某个号上留下 ds4f 会话。
+  const ds4f = await workerVm.api.executeChat(
+    env, chatParams(DS4F), modelCfg(DS4F, 'base2-free-deepseek'), true, 'chat',
   );
-  assert.equal(ds4p.status, 200);
-  await ds4p.text();
-  const ds4pHost = [...upstream.state.entries()].find(([, s]) => s.model === DS4P)?.[0];
-  assert.ok(ds4pHost, 'ds4p 会话应该建立在某个账号上');
+  assert.equal(ds4f.status, 200);
+  await ds4f.text();
+  const ds4pHost = [...upstream.state.entries()].find(([, s]) => s.model === DS4F)?.[0];
+  assert.ok(ds4pHost, 'ds4f 会话应该建立在某个账号上');
   log.length = 0;
 
   // 2) 立刻要 luna（用户的第二步）。
@@ -187,8 +189,8 @@ test('ds4p 调用完立刻换 luna：应落到另一个空闲账号，两个会�
   assert.equal(luna.status, 200, '有空闲账号时换模型不该失败');
   await luna.text();
   assert.deepEqual(log.filter((e) => e.method === 'DELETE').map((e) => e.token), [],
-    '不得为了开 luna 删掉 ds4p 会话 —— 重建要再扣一份 premium admission');
-  assert.equal(upstream.state.get(ds4pHost)?.model, DS4P, 'ds4p 会话必须原封不动地活着');
+    '不得为了开 luna 删掉 ds4f 会话 —— 重建要再扣一份 premium admission');
+  assert.equal(upstream.state.get(ds4pHost)?.model, DS4F, 'ds4f 会话必须原封不动地活着');
   const lunaHost = [...upstream.state.entries()].find(([, s]) => s.model === LUNA)?.[0];
   assert.ok(lunaHost && lunaHost !== ds4pHost, 'luna 必须落在另一个账号上，形成两个并行会话');
 });
@@ -199,19 +201,19 @@ test('model_locked 在失效窗口内被跳过 DELETE 时，不得把全池冷�
   const upstream = createFakeUpstream({
     start, log,
     sessions: {
-      [tokens[0]]: { instanceId: 'inst-a-ds4p', model: DS4P },
-      [tokens[1]]: { instanceId: 'inst-b-ds4p', model: DS4P },
+      [tokens[0]]: { instanceId: 'inst-a-ds4f', model: DS4F },
+      [tokens[1]]: { instanceId: 'inst-b-ds4f', model: DS4F },
     },
   });
   const workerVm = createWorkerVm({ now: start, fetchImpl: upstream.fetch });
   const env = envFor(tokens);
-  // 真实触发条件：30s 内在同一个号上 luna → ds4p → luna 来回切。
+  // 真实触发条件：30s 内在同一个号上 luna → ds4f → luna 来回切。
   // deleteUpstreamSession 的失效窗口 key 用的是「要建的模型」而不是「被删的会话」，
   // 所以第二次要 luna 时 DELETE 会被当成重复调用直接跳过，POST 必然再 model_locked。
   for (const token of tokens) {
     await workerVm.api.createSession(token, LUNA).catch(() => {});
-    await workerVm.api.createSession(token, DS4P).catch(() => {});
-    workerVm.api.invalidateSessionCache(token); // 只清本地缓存，上游仍是 ds4p 会话
+    await workerVm.api.createSession(token, DS4F).catch(() => {});
+    workerVm.api.invalidateSessionCache(token); // 只清本地缓存，上游仍是 ds4f 会话
   }
   log.length = 0;
 
@@ -233,13 +235,13 @@ test('model_locked 挂在 HTTP 409 上时同样要 DELETE 再 POST，且不写�
   const log = [];
   const upstream = createFakeUpstream({
     start, log, lockStatus: 409,
-    sessions: { [tokenA]: { instanceId: 'inst-409-ds4p', model: DS4P } },
+    sessions: { [tokenA]: { instanceId: 'inst-409-ds4f', model: DS4F } },
   });
   const workerVm = createWorkerVm({ now: start, fetchImpl: upstream.fetch });
   const env = envFor([tokenA]);
-  // 让 A:DS4P 落进失效窗口，逼 GET 分支的 DELETE 走 force 之外的路径都失败。
-  workerVm.api.sessCache.set(`${tokenA}:${DS4P}`, {
-    instanceId: 'inst-409-ds4p', model: DS4P,
+  // 让 A:DS4F 落进失效窗口，逼 GET 分支的 DELETE 走 force 之外的路径都失败。
+  workerVm.api.sessCache.set(`${tokenA}:${DS4F}`, {
+    instanceId: 'inst-409-ds4f', model: DS4F,
     expiresAt: new Date(start + 3600 * 1000).toISOString(),
   });
 
@@ -268,7 +270,7 @@ test('分享 Key 会话期内换模型：回中文 409 key_model_locked，且完
   const keyA = sharedKey('lock-a');
 
   const first = await workerVm.api.executeChat(
-    env, chatParams(DS4P), modelCfg(DS4P, 'base2-free-deepseek'), true, 'chat', null, keyA,
+    env, chatParams(DS4F), modelCfg(DS4F, 'base2-free-deepseek'), true, 'chat', null, keyA,
   );
   assert.equal(first.status, 200);
   await first.text();
@@ -281,10 +283,10 @@ test('分享 Key 会话期内换模型：回中文 409 key_model_locked，且完
   assert.equal(second.status, 409);
   const body = JSON.parse(await second.text());
   assert.equal(body.error.type, 'key_model_locked');
-  assert.equal(body.error.currentModel, DS4P);
+  assert.equal(body.error.currentModel, DS4F);
   assert.equal(body.error.requestedModel, LUNA);
   assert.match(body.error.message, /只能用这一个模型/, '提示必须是中文');
-  assert.match(body.error.message, new RegExp(`· 锁定模型: ${DS4P}`), '要写明当前锁在哪个模型上');
+  assert.match(body.error.message, new RegExp(`· 锁定模型: ${DS4F}`), '要写明当前锁在哪个模型上');
   assert.match(body.error.message, new RegExp(`· 本次请求: ${LUNA}（已拒绝）`));
   assert.match(body.error.message, /· 解锁时间: 2030-01-01 09:00:00 \(UTC\+8\),还需 1 小时（3600s）/,
     '解锁时间点按 UTC\+8 写清楚，容器时区是 UTC，不能直接写本地时间');
@@ -293,7 +295,7 @@ test('分享 Key 会话期内换模型：回中文 409 key_model_locked，且完
   assert.equal(body.error.unlockAt, new Date(start + 3600 * 1000).toISOString());
   assert.equal(second.headers.get('Retry-After'), '3600');
   assert.deepEqual(log, [], '被 Key 挡住就不该发任何上游请求，更不该删会话重建');
-  assert.equal(upstream.state.get(tokenA)?.model, DS4P, 'ds4p 会话原封不动');
+  assert.equal(upstream.state.get(tokenA)?.model, DS4F, 'ds4f 会话原封不动');
 
   // 剩余时间是真倒计时（解锁时间点不动），顺便钉住「分 + 秒」这一档的说法。
   workerVm.setNow(start + 3600 * 1000 - 90 * 1000);
@@ -306,7 +308,7 @@ test('分享 Key 会话期内换模型：回中文 409 key_model_locked，且完
   assert.equal(late.error.retryAfterSec, 90);
 });
 
-test('keyA 锁在 ds4p 上，不影响 keyB 用另一个账号开 luna', async () => {
+test('keyA 锁在 ds4f 上，不影响 keyB 用另一个账号开 luna', async () => {
   const start = Date.UTC(2030, 0, 1);
   const tokens = ['keylock-pair-token-aaaaaaaaaaaa', 'keylock-pair-token-bbbbbbbbbbbb'];
   const log = [];
@@ -314,12 +316,12 @@ test('keyA 锁在 ds4p 上，不影响 keyB 用另一个账号开 luna', async (
   const workerVm = createWorkerVm({ now: start, fetchImpl: upstream.fetch });
   const env = envFor(tokens);
 
-  const ds4p = await workerVm.api.executeChat(
-    env, chatParams(DS4P), modelCfg(DS4P, 'base2-free-deepseek'), true, 'chat', null, sharedKey('pair-a'),
+  const ds4f = await workerVm.api.executeChat(
+    env, chatParams(DS4F), modelCfg(DS4F, 'base2-free-deepseek'), true, 'chat', null, sharedKey('pair-a'),
   );
-  assert.equal(ds4p.status, 200);
-  await ds4p.text();
-  const ds4pHost = [...upstream.state.entries()].find(([, s]) => s.model === DS4P)?.[0];
+  assert.equal(ds4f.status, 200);
+  await ds4f.text();
+  const ds4pHost = [...upstream.state.entries()].find(([, s]) => s.model === DS4F)?.[0];
   log.length = 0;
 
   const luna = await workerVm.api.executeChat(
@@ -330,7 +332,7 @@ test('keyA 锁在 ds4p 上，不影响 keyB 用另一个账号开 luna', async (
   await luna.text();
   assert.deepEqual(log.filter((e) => e.method === 'DELETE').map((e) => e.token), [],
     'keyB 该落到空闲号上，不该删 keyA 的会话');
-  assert.equal(upstream.state.get(ds4pHost)?.model, DS4P);
+  assert.equal(upstream.state.get(ds4pHost)?.model, DS4F);
   const lunaHost = [...upstream.state.entries()].find(([, s]) => s.model === LUNA)?.[0];
   assert.ok(lunaHost && lunaHost !== ds4pHost, '两把 Key 两个号，两个会话并行');
 });
@@ -342,11 +344,11 @@ test('Master Key 不受锁限制：同一个号上也能立刻换模型', async 
   const workerVm = createWorkerVm({ now: start, fetchImpl: upstream.fetch });
   const env = envFor([tokenA]);
 
-  const ds4p = await workerVm.api.executeChat(
-    env, chatParams(DS4P), modelCfg(DS4P, 'base2-free-deepseek'), true, 'chat', null, MASTER,
+  const ds4f = await workerVm.api.executeChat(
+    env, chatParams(DS4F), modelCfg(DS4F, 'base2-free-deepseek'), true, 'chat', null, MASTER,
   );
-  assert.equal(ds4p.status, 200);
-  await ds4p.text();
+  assert.equal(ds4f.status, 200);
+  await ds4f.text();
   assert.equal(workerVm.api.clientModelLock(MASTER), null, 'Master Key 不写锁');
 
   const luna = await workerVm.api.executeChat(
@@ -366,18 +368,18 @@ test('同模型第二把 Key：换个干净账号新建会话，不共用别人�
   const env = envFor(tokens);
 
   const a = await workerVm.api.executeChat(
-    env, chatParams(DS4P), modelCfg(DS4P, 'base2-free-deepseek'), true, 'chat', null, sharedKey('same-a'),
+    env, chatParams(DS4F), modelCfg(DS4F, 'base2-free-deepseek'), true, 'chat', null, sharedKey('same-a'),
   );
   assert.equal(a.status, 200);
   await a.text();
 
   const b = await workerVm.api.executeChat(
-    env, chatParams(DS4P), modelCfg(DS4P, 'base2-free-deepseek'), true, 'chat', null, sharedKey('same-b'),
+    env, chatParams(DS4F), modelCfg(DS4F, 'base2-free-deepseek'), true, 'chat', null, sharedKey('same-b'),
   );
   assert.equal(b.status, 200);
   await b.text();
 
-  const hosts = [...upstream.state.entries()].filter(([, s]) => s.model === DS4P);
+  const hosts = [...upstream.state.entries()].filter(([, s]) => s.model === DS4F);
   assert.equal(hosts.length, 2, '两把 Key 各自开会话，不落在同一个号上');
   assert.notEqual(hosts[0][1].instanceId, hosts[1][1].instanceId,
     '共用 instanceId 会串上下文 —— 宁可多花一份 admission');
@@ -391,12 +393,12 @@ test('会话缓存没了就解锁：不把 Key 锁在一条已经不存在的会
   const env = envFor([tokenA]);
   const keyA = sharedKey('release-a');
 
-  const ds4p = await workerVm.api.executeChat(
-    env, chatParams(DS4P), modelCfg(DS4P, 'base2-free-deepseek'), true, 'chat', null, keyA,
+  const ds4f = await workerVm.api.executeChat(
+    env, chatParams(DS4F), modelCfg(DS4F, 'base2-free-deepseek'), true, 'chat', null, keyA,
   );
-  assert.equal(ds4p.status, 200);
-  await ds4p.text();
-  assert.equal(workerVm.api.clientModelLock(keyA)?.model, DS4P);
+  assert.equal(ds4f.status, 200);
+  await ds4f.text();
+  assert.equal(workerVm.api.clientModelLock(keyA)?.model, DS4F);
 
   workerVm.api.invalidateSessionCache(tokenA);   // 会话被顶替/删掉/进程重启后的本地状态
   assert.equal(workerVm.api.clientModelLock(keyA), null, '缓存里那条会话没了就该放开');

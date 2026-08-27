@@ -521,16 +521,24 @@ test('typed 429 按上游状态选择正确作用域', () => {
   assert.equal(generic.reason, 'quota');
   assert.equal(generic.scope, workerVm.api.quotaScopeForModel(model));
 
-  const premium = 'deepseek/deepseek-v4-pro';
+  // 共享 Premium 的主体换成 luna：官方 FREEBUFF_PREMIUM_MODEL_IDS 现在只剩
+  // luna + GLM 5.3 Flash，deepseek_pro / luna 两个独立池名都已被上游删除。
+  const premium = 'openai/gpt-5.6-luna';
   const genericPremium = workerVm.api.classifyRateLimit('{}', 429, {}, premium);
   assert.equal(genericPremium.scope, `model:${premium}`, '无 typed status 时不得扩大到整个 Premium 池');
   const typedPremium = workerVm.api.classifyRateLimit(
     JSON.stringify({ status: 'rate_limited' }), 429, {}, premium,
   );
-  assert.equal(typedPremium.scope, 'pool:deepseek_pro', 'D4P typed quota 必须锁独立池');
-  assert.equal(workerVm.api.quotaScopeForModel('openai/gpt-5.6-luna'), 'pool:luna',
-    'Luna 必须使用独立池');
+  assert.equal(typedPremium.scope, 'pool:premium', 'luna typed quota 锁共享 Premium 池');
+  assert.equal(workerVm.api.quotaScopeForModel('openai/gpt-5.6-luna'), 'pool:premium',
+    'Luna 已并入共享 Premium 池（旧 pool:luna 只剩兼容池名）');
+  assert.equal(workerVm.api.quotaScopeForModel('deepseek/deepseek-v4-pro'),
+    'model:deepseek/deepseek-v4-pro',
+    'D4P 已暂停，静态兜底不得继续声称它占任何共享池');
   assert.equal(workerVm.api.quotaScopeForModel('z-ai/glm-5.2'), 'pool:glm', 'GLM 静态兜底必须保持独立池');
+  assert.equal(workerVm.api.quotaScopeForModel('z-ai/glm-5.3-flash', {
+    'z-ai/glm-5.3-flash': { recentCount: 0, limit: 2, pool: 'glm_v53_flash' },
+  }), 'pool:glm_v53_flash', 'GLM 5.3 Flash 必须使用官方独立池');
   assert.equal(workerVm.api.quotaScopeForModel('deepseek/deepseek-v4-flash'), 'pool:premium',
     'DS4F 当前属于共享 Premium 池');
   assert.equal(workerVm.api.quotaScopeForModel('meta/muse-spark-1.2-contributor'), 'pool:premium');
@@ -545,23 +553,137 @@ test('typed 429 按上游状态选择正确作用域', () => {
   assert.equal(workerVm.api.quotaScopeForModel('anthropic/claude-fable-5'), 'model:anthropic/claude-fable-5');
 });
 
+test('GLM 5.3 Flash 独立额度池不污染 Premium 共享池', async () => {
+  const workerVm = createWorkerVm();
+  const token = 'glm-v53-flash-quota-account-123456';
+  const glm53 = 'z-ai/glm-5.3-flash';
+  const premium = 'deepseek/deepseek-v4-flash';
+  const quota = {
+    [glm53]: { recentCount: 2, limit: 2, pool: 'glm_v53_flash' },
+    [premium]: { recentCount: 1, limit: 5, pool: 'premium' },
+  };
+  workerVm.api.recordAccountObservation(token, 200, { status: 'ok' }, { quota });
+
+  assert.equal(workerVm.api.modelPoolCategory(glm53, quota), 'glm_v53_flash');
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(workerVm.api.quotaEntryForModel(quota, glm53))),
+    quota[glm53],
+  );
+  await assert.rejects(
+    workerVm.api.freshQuotaProbe(token, glm53),
+    (error) => error?.name === 'QuotaExhaustedError'
+      && error.scope === 'pool:glm_v53_flash',
+  );
+  await assert.doesNotReject(workerVm.api.freshQuotaProbe(token, premium));
+});
+
+test('GLM 5.3 Flash 同时受独立 G2 与 Premium 共享额度约束', async () => {
+  const workerVm = createWorkerVm();
+  const token = 'glm-v53-dual-quota-account-123456';
+  const glm53 = 'z-ai/glm-5.3-flash';
+  const premium = 'deepseek/deepseek-v4-flash';
+
+  workerVm.api.recordAccountObservation(token, 200, { status: 'ok' }, {
+    quota: {
+      [glm53]: { recentCount: 1, limit: 2, pool: 'glm_v53_flash' },
+      [premium]: { recentCount: 5, limit: 5, pool: 'premium' },
+    },
+  });
+
+  await assert.rejects(
+    workerVm.api.freshQuotaProbe(token, glm53),
+    (error) => error?.name === 'QuotaExhaustedError'
+      && error.scope === 'pool:premium',
+    'GLM 独立额度未满时，Premium 已耗尽仍必须拒绝',
+  );
+});
+
+test('GLM 5.3 Flash typed 429 按实际耗尽池写入作用域', () => {
+  const workerVm = createWorkerVm();
+  const glm53 = 'z-ai/glm-5.3-flash';
+  const premium = 'deepseek/deepseek-v4-flash';
+  const decision = workerVm.api.classifyRateLimit(
+    JSON.stringify({ status: 'rate_limited' }),
+    429,
+    {},
+    glm53,
+    Date.UTC(2030, 0, 1),
+    {
+      [glm53]: { recentCount: 1, limit: 2, pool: 'glm_v53_flash' },
+      [premium]: { recentCount: 5, limit: 5, pool: 'premium' },
+    },
+  );
+  assert.equal(decision.scope, 'pool:premium',
+    'G2 尚有余额但 Premium 已耗尽时，429 必须传播到整个 Premium 池');
+});
+
+test('Premium 池冷却会阻塞 GLM 5.3 Flash，但 GLM 独立池不阻塞其他 Premium 模型', () => {
+  const workerVm = createWorkerVm();
+  const token = 'glm-v53-dual-cooldown-account-123456';
+  const glm53 = 'z-ai/glm-5.3-flash';
+  const premium = 'deepseek/deepseek-v4-flash';
+  const env = { FREEBUFF_TOKEN: token, FREEBUFF_ACCOUNT_STATE: {} };
+
+  workerVm.api.cooldown(token, 60 * 1000, {
+    reason: 'quota', retryAfterMs: 60 * 1000, model: premium,
+  });
+  assert.equal(workerVm.api.pickToken(env, glm53, new Set()), null,
+    'GLM 5.3 Flash 消耗 Premium，必须看到 Premium 池冷却');
+
+  const isolatedVm = createWorkerVm();
+  isolatedVm.api.cooldown(token, 60 * 1000, {
+    reason: 'quota', retryAfterMs: 60 * 1000, model: glm53,
+  });
+  const selected = isolatedVm.api.pickToken(env, premium, new Set());
+  assert.equal(selected?.token, token, 'GLM 独立 G2 耗尽不得阻塞其他 Premium 模型');
+  releaseIfSelected(isolatedVm, selected);
+});
+
+test('GLM 5.3 Flash 选号按独立与 Premium 中更少的剩余额度排序', () => {
+  const workerVm = createWorkerVm();
+  const tokenA = 'glm-v53-dual-sort-account-a-123456';
+  const tokenB = 'glm-v53-dual-sort-account-b-123456';
+  const glm53 = 'z-ai/glm-5.3-flash';
+  const premium = 'deepseek/deepseek-v4-flash';
+  const env = { FREEBUFF_TOKEN: `${tokenA},${tokenB}`, FREEBUFF_ACCOUNT_STATE: {} };
+
+  workerVm.api.recordAccountObservation(tokenA, 200, { status: 'ok' }, {
+    quota: {
+      [glm53]: { recentCount: 0, limit: 2, pool: 'glm_v53_flash' },
+      [premium]: { recentCount: 4.5, limit: 5, pool: 'premium' },
+    },
+  });
+  workerVm.api.recordAccountObservation(tokenB, 200, { status: 'ok' }, {
+    quota: {
+      [glm53]: { recentCount: 1, limit: 2, pool: 'glm_v53_flash' },
+      [premium]: { recentCount: 2, limit: 5, pool: 'premium' },
+    },
+  });
+
+  const selected = workerVm.api.pickToken(env, glm53, new Set());
+  assert.equal(selected?.token, tokenB,
+    '账号 A 虽有 G2，但只剩 P0.5；应选择 min(G1, P3)=1 的账号 B');
+  releaseIfSelected(workerVm, selected);
+});
+
 test('额度快照按上游 pool 选择，不再取任意 Premium 模型行', async () => {
   const workerVm = createWorkerVm();
   const token = 'pool-quota-snapshot-account-123456';
+  // 独立池的样本换成 GLM 5.3 Flash（官方 FREEBUFF_PER_MODEL_SESSION_CAPS 的
+  // glm_v53_flash）：deepseek_pro / luna 两个旧独立池名已被上游删除，d4p 本身也进了
+  // paused 列表。GLM 5.3 的 G 池耗尽不能牵连共享 Premium，反之亦然。
   workerVm.api.recordAccountObservation(token, 200, { status: 'ok' }, {
     quota: {
-      'deepseek/deepseek-v4-pro': { recentCount: 1, limit: 1, pool: 'deepseek_pro' },
-      'openai/gpt-5.6-luna': { recentCount: 0, limit: 1, pool: 'luna' },
+      'z-ai/glm-5.3-flash': { recentCount: 2, limit: 2, pool: 'glm_v53_flash' },
       'deepseek/deepseek-v4-flash': { recentCount: 5, limit: 5, pool: 'premium' },
       'mimo/mimo-v2.5': { recentCount: 6, limit: 6, pool: 'standard' },
     },
   });
 
   await assert.rejects(
-    workerVm.api.freshQuotaProbe(token, 'deepseek/deepseek-v4-pro'),
-    (error) => error?.name === 'QuotaExhaustedError' && error.scope === 'pool:deepseek_pro',
+    workerVm.api.freshQuotaProbe(token, 'z-ai/glm-5.3-flash'),
+    (error) => error?.name === 'QuotaExhaustedError' && error.scope === 'pool:glm_v53_flash',
   );
-  await assert.doesNotReject(workerVm.api.freshQuotaProbe(token, 'openai/gpt-5.6-luna'));
   await assert.rejects(
     workerVm.api.freshQuotaProbe(token, 'meta/muse-spark-1.2-contributor'),
     (error) => error?.name === 'QuotaExhaustedError' && error.scope === 'pool:premium',
@@ -569,11 +691,15 @@ test('额度快照按上游 pool 选择，不再取任意 Premium 模型行', as
   await assert.doesNotReject(workerVm.api.freshQuotaProbe(token, 'mimo/mimo-v2.5'));
 });
 
-test('账号实时 pool 覆盖 DS4P 旧静态归属并共享 Premium', async () => {
+// 账号实时快照优先于静态兜底表：这条以前用 DS4P（静态 deepseek_pro vs 线上 premium）
+// 验证，D4P 暂停后换成 GLM 5.3 Flash —— 它静态归属独立 cap 池 glm_v53_flash，
+// 但上游若在快照里把它标成 premium，就得按快照走共享池（耗尽范围随之扩大到整池）。
+test('账号实时 pool 覆盖静态归属并共享 Premium', async () => {
   const workerVm = createWorkerVm();
-  const token = 'dynamic-ds4p-premium-account-123456';
+  const token = 'dynamic-glm53-premium-account-123456';
+  const glm53 = 'z-ai/glm-5.3-flash';
   const quota = {
-    'deepseek/deepseek-v4-pro': { recentCount: 2.6, limit: 5, pool: 'premium' },
+    [glm53]: { recentCount: 2.6, limit: 5, pool: 'premium' },
     'deepseek/deepseek-v4-flash': { recentCount: 2.6, limit: 5, pool: 'premium' },
     'crof/kimi-k3-eco': { recentCount: 2.6, limit: 5, pool: 'premium' },
   };
@@ -581,23 +707,23 @@ test('账号实时 pool 覆盖 DS4P 旧静态归属并共享 Premium', async () 
 
   // god-only 模型即使被上游标成 premium，也不参与我们的池判定（见 HIDDEN_MODEL_IDS）。
   assert.equal(workerVm.api.modelPoolCategory('crof/kimi-k3-eco', quota), null);
-  assert.equal(workerVm.api.modelPoolCategory('deepseek/deepseek-v4-pro', quota), 'premium');
-  assert.equal(workerVm.api.quotaScopeForModel('deepseek/deepseek-v4-pro', quota), 'pool:premium');
-  assert.deepEqual(workerVm.api.quotaEntryForModel(quota, 'deepseek/deepseek-v4-pro'), {
+  assert.equal(workerVm.api.modelPoolCategory(glm53, quota), 'premium');
+  assert.equal(workerVm.api.quotaScopeForModel(glm53, quota), 'pool:premium');
+  assert.deepEqual(workerVm.api.quotaEntryForModel(quota, glm53), {
     recentCount: 2.6,
     limit: 5,
     pool: 'premium',
   });
-  await assert.doesNotReject(workerVm.api.freshQuotaProbe(token, 'deepseek/deepseek-v4-pro'));
+  await assert.doesNotReject(workerVm.api.freshQuotaProbe(token, glm53));
 
   const exhausted = {
     ...quota,
-    'deepseek/deepseek-v4-pro': { recentCount: 5, limit: 5, pool: 'premium' },
+    [glm53]: { recentCount: 5, limit: 5, pool: 'premium' },
     'deepseek/deepseek-v4-flash': { recentCount: 5, limit: 5, pool: 'premium' },
   };
   workerVm.api.recordAccountObservation(token, 200, { status: 'ok' }, { quota: exhausted });
   await assert.rejects(
-    workerVm.api.freshQuotaProbe(token, 'deepseek/deepseek-v4-pro'),
+    workerVm.api.freshQuotaProbe(token, glm53),
     (error) => error?.name === 'QuotaExhaustedError' && error.scope === 'pool:premium',
   );
 });
@@ -626,16 +752,17 @@ test('Premium 快照异常不一致时各模型使用同一保守池结论并忽
   const token = 'premium-inconsistent-snapshot-account-123456';
   workerVm.api.recordAccountObservation(token, 200, { status: 'ok' }, {
     quota: {
-      // 2026-08-23 线上形状：V4 Pro 与 Flash 同在 premium 池（deepseek_pro 已被删）。
+      // 2026-08-27 线上形状：DS4F 与 luna 同在 premium 池（deepseek_pro/luna 已被删，
+      // V4 Pro 本身也进了 paused 列表，不再参与池聚合）。
       'deepseek/deepseek-v4-flash': { recentCount: 2, limit: 7, pool: 'premium' },
-      'deepseek/deepseek-v4-pro': { recentCount: 5, limit: 5, pool: 'premium' },
+      'openai/gpt-5.6-luna': { recentCount: 5, limit: 5, pool: 'premium' },
       'minimax/minimax-m3': { recentCount: 0, limit: 99, pool: 'premium' },
     },
   });
 
   for (const model of [
     'deepseek/deepseek-v4-flash',
-    'deepseek/deepseek-v4-pro',
+    'openai/gpt-5.6-luna',
     'meta/muse-spark-1.2-contributor',
   ]) {
     await assert.rejects(
@@ -646,26 +773,27 @@ test('Premium 快照异常不一致时各模型使用同一保守池结论并忽
   }
 });
 
-// 反向锁：暂停 / god-only 的行不参与聚合，所以它们的计数不能把真实 Premium 池
-// 判成耗尽。这两行如果漏进 pooled 聚合，recentCount 会取到 99 而误报耗尽。
+// 反向锁：暂停（M3 / D4P）与 god-only 的行不参与聚合，所以它们的计数不能把真实
+// Premium 池判成耗尽。这三行如果漏进 pooled 聚合，recentCount 会取到 99 而误报耗尽。
 test('暂停与 god-only 额度行不得把真实 Premium 池算成耗尽', async () => {
   const workerVm = createWorkerVm();
   const token = 'premium-ghost-rows-account-1234567890';
   const quota = {
     'deepseek/deepseek-v4-flash': { recentCount: 1, limit: 4, pool: 'premium' },
-    'deepseek/deepseek-v4-pro': { recentCount: 3, limit: 6, pool: 'premium' },
+    'openai/gpt-5.6-luna': { recentCount: 3, limit: 6, pool: 'premium' },
     'minimax/minimax-m3': { recentCount: 99, limit: 6, pool: 'premium' },
+    'deepseek/deepseek-v4-pro': { recentCount: 99, limit: 6, pool: 'premium' },
     'crof/kimi-k3-eco': { recentCount: 99, limit: 6, pool: 'premium' },
   };
   workerVm.api.recordAccountObservation(token, 200, { status: 'ok' }, { quota });
 
   // 聚合结果是 vm 内新建的对象（原型属于 vm），比较前先做一次 JSON 归一。
   assert.deepEqual(
-    JSON.parse(JSON.stringify(workerVm.api.quotaEntryForModel(quota, 'deepseek/deepseek-v4-pro'))),
+    JSON.parse(JSON.stringify(workerVm.api.quotaEntryForModel(quota, 'openai/gpt-5.6-luna'))),
     { recentCount: 3, limit: 4, pool: 'premium' },
   );
   await assert.doesNotReject(workerVm.api.freshQuotaProbe(token, 'deepseek/deepseek-v4-flash'));
-  await assert.doesNotReject(workerVm.api.freshQuotaProbe(token, 'deepseek/deepseek-v4-pro'));
+  await assert.doesNotReject(workerVm.api.freshQuotaProbe(token, 'openai/gpt-5.6-luna'));
   // 目录侧同样 fail closed：god-only 模型解析不出配置，请求在扣 admission 前就被拒。
   assert.equal(workerVm.api.isHiddenModelId('crof/kimi-k3-eco'), true);
   assert.equal(workerVm.api.isHiddenModelId('crof/kimi-k3-eco-0820'), true,
@@ -675,60 +803,60 @@ test('暂停与 god-only 额度行不得把真实 Premium 池算成耗尽', asyn
 });
 
 // 429 额度冷却的写入与读取必须用同一个池口径。写入侧（cooldownScopeFor）以前不带
-// 账号实时额度快照，只能看静态兜底表；读取侧（scopedCooldownInfo）却带快照。DS4P 正好
-// 踩中：静态表说 deepseek_pro，2026-08-23 起线上说 premium —— 于是冷却写进
-// `pool:deepseek_pro`、查的是 `pool:premium`，一次真实的额度耗尽等于没冷却。
-test('429 额度冷却的写入池与读取池一致（DS4P 实时归属 premium）', () => {
+// 账号实时额度快照，只能看静态兜底表；读取侧（scopedCooldownInfo）却带快照。不对称时
+// 冷却写进一个池、查的是另一个池，一次真实的额度耗尽等于没冷却。
+// 主体用 GLM 5.3 Flash：它静态归属独立 cap 池，线上若报 premium 就正好压到这条不对称。
+test('429 额度冷却的写入池与读取池一致（实时归属覆盖静态池）', () => {
   const workerVm = createWorkerVm();
   const token = 'quota-scope-symmetry-account-1234567890';
-  const DS4P = 'deepseek/deepseek-v4-pro';
+  const GLM53 = 'z-ai/glm-5.3-flash';
   const DS4F = 'deepseek/deepseek-v4-flash';
   workerVm.api.recordAccountObservation(token, 200, { status: 'ok' }, {
     quota: {
-      [DS4P]: { recentCount: 5, limit: 5, pool: 'premium' },
+      [GLM53]: { recentCount: 5, limit: 5, pool: 'premium' },
       [DS4F]: { recentCount: 5, limit: 5, pool: 'premium' },
     },
   });
-  assert.equal(workerVm.api.quotaScopeForModel(DS4P, { [DS4P]: { pool: 'premium' } }), 'pool:premium');
+  assert.equal(workerVm.api.quotaScopeForModel(GLM53, { [GLM53]: { pool: 'premium' } }), 'pool:premium');
 
-  workerVm.api.cooldown(token, 60 * 1000, { reason: 'quota', retryAfterMs: 60 * 1000, model: DS4P });
+  workerVm.api.cooldown(token, 60 * 1000, { reason: 'quota', retryAfterMs: 60 * 1000, model: GLM53 });
 
-  const lock = workerVm.api.scopedCooldownInfo(token, DS4P);
-  assert.ok(lock, 'DS4P 的额度冷却必须能被 DS4P 自己读到');
+  const lock = workerVm.api.scopedCooldownInfo(token, GLM53);
+  assert.ok(lock, 'GLM 5.3 的额度冷却必须能被它自己读到');
   assert.equal(lock.reason, 'quota');
   assert.equal(lock.scope, 'pool:premium', '写入侧要跟读取侧一样使用实时 pool');
   assert.ok(workerVm.api.scopedCooldownInfo(token, DS4F),
     '同一 premium 池的 DS4F 也应看到这次池级冷却');
-  assert.equal(workerVm.api.scopedCooldownInfo(token, 'openai/gpt-5.6-luna'), null,
-    'luna 是独立池，不该被 premium 冷却牵连');
+  assert.equal(workerVm.api.scopedCooldownInfo(token, 'z-ai/glm-5.2'), null,
+    'GLM 5.2 是独立 referral 池，不该被 premium 冷却牵连');
   assert.equal(workerVm.api.cooldownInfo(token), null, '不得升级成账号级冷却');
 });
 
-// 反向：没有实时快照时写下的静态池冷却（DS4P → deepseek_pro），在快照到达、
+// 反向：没有实时快照时按静态兜底池写下的冷却（GLM 5.3 → glm_v53_flash），在快照到达、
 // 归属变成 premium 之后仍然必须被读到，否则冷却会在切换瞬间凭空消失。
 test('实时 pool 归属变化后，先前写下的池级冷却仍然有效', () => {
   const workerVm = createWorkerVm();
   const token = 'quota-scope-migration-account-1234567890';
-  const DS4P = 'deepseek/deepseek-v4-pro';
+  const GLM53 = 'z-ai/glm-5.3-flash';
 
-  workerVm.api.cooldown(token, 60 * 1000, { reason: 'quota', retryAfterMs: 60 * 1000, model: DS4P });
-  const before = workerVm.api.scopedCooldownInfo(token, DS4P);
+  workerVm.api.cooldown(token, 60 * 1000, { reason: 'quota', retryAfterMs: 60 * 1000, model: GLM53 });
+  const before = workerVm.api.scopedCooldownInfo(token, GLM53);
   assert.ok(before, '无快照时按静态兜底池写入，也要能读到');
-  assert.equal(before.scope, 'pool:deepseek_pro');
+  assert.equal(before.scope, 'pool:glm_v53_flash');
 
   workerVm.api.recordAccountObservation(token, 200, { status: 'ok' }, {
-    quota: { [DS4P]: { recentCount: 5, limit: 5, pool: 'premium' } },
+    quota: { [GLM53]: { recentCount: 5, limit: 5, pool: 'premium' } },
   });
-  const after = workerVm.api.scopedCooldownInfo(token, DS4P);
+  const after = workerVm.api.scopedCooldownInfo(token, GLM53);
   assert.ok(after, '池归属变化不得让还没到期的冷却失效');
-  assert.equal(after.scope, 'pool:deepseek_pro');
+  assert.equal(after.scope, 'pool:glm_v53_flash');
 });
 
 test('generic 429 按 Retry-After 锁定当前模型并在到期时恢复', () => {
   const start = Date.UTC(2030, 0, 1);
   const workerVm = createWorkerVm({ now: start });
   const token = 'generic-retry-after-account-123456';
-  const model = 'deepseek/deepseek-v4-pro';
+  const model = 'openai/gpt-5.6-luna';
   const env = { FREEBUFF_TOKEN: token, FREEBUFF_ACCOUNT_STATE: {} };
   const decision = workerVm.api.classifyRateLimit('{}', 429, { 'Retry-After': '7' }, model, start);
   assert.equal(decision.retryAfterMs, 7000);
@@ -790,7 +918,7 @@ test('新鲜额度快照不被旧的 Retry-After 截止时间遮蔽', async () =
   const start = Date.UTC(2030, 0, 1);
   const workerVm = createWorkerVm({ now: start });
   const token = 'retry-after-fresh-quota-account-123456';
-  const model = 'deepseek/deepseek-v4-pro';
+  const model = 'openai/gpt-5.6-luna';
 
   workerVm.api.recordAccountObservation(token, 429, {}, {
     model,
@@ -810,7 +938,7 @@ test('新鲜额度快照不被旧的 Retry-After 截止时间遮蔽', async () =
 
 test('startRun 的 typed 429 只锁定对应 quota pool，不污染异池模型', async () => {
   const token = 'start-run-rate-limit-account-123456';
-  const sourceModel = 'deepseek/deepseek-v4-pro';
+  const sourceModel = 'z-ai/glm-5.3-flash';
   const otherPoolModel = 'z-ai/glm-5.2';
   const workerVm = createWorkerVm({
     fetchImpl: async (url) => {
@@ -823,18 +951,18 @@ test('startRun 的 typed 429 只锁定对应 quota pool，不污染异池模型'
 
   await assert.rejects(
     workerVm.api.startRun(token, 'base-agent', [], sourceModel),
-    (error) => error?.name === 'QuotaExhaustedError' && error.scope === 'pool:deepseek_pro',
+    (error) => error?.name === 'QuotaExhaustedError' && error.scope === 'pool:glm_v53_flash',
   );
   await assert.rejects(
     workerVm.api.freshQuotaProbe(token, sourceModel),
-    (error) => error?.name === 'QuotaExhaustedError' && error.scope === 'pool:deepseek_pro',
+    (error) => error?.name === 'QuotaExhaustedError' && error.scope === 'pool:glm_v53_flash',
   );
   await assert.doesNotReject(workerVm.api.freshQuotaProbe(token, otherPoolModel));
 });
 
-test('startRun typed 429 继承账号实时 pool，不回退到 DS4P 旧静态池', async () => {
+test('startRun typed 429 继承账号实时 pool，不回退到旧静态池', async () => {
   const token = 'start-run-dynamic-pool-account-123456';
-  const model = 'deepseek/deepseek-v4-pro';
+  const model = 'z-ai/glm-5.3-flash';
   const workerVm = createWorkerVm({
     fetchImpl: async (url) => {
       if (new URL(String(url)).pathname === '/api/v1/agent-runs') {
@@ -1288,7 +1416,9 @@ for (const scenario of [
 test('新鲜已知 quota 按剩余额度降序选号，过期快照回到轮询', () => {
   const start = Date.UTC(2030, 0, 1);
   const workerVm = createWorkerVm({ now: start });
-  const model = 'deepseek/deepseek-v4-pro';
+  // 选号排序与模型无关，但主体必须是未被官方 paused 的模型：paused 闸门会让
+  // pickToken 直接不返回账号（d4p 已撤下）。
+  const model = 'deepseek/deepseek-v4-flash';
   const tokenA = 'quota-picker-account-a-123456';
   const tokenB = 'quota-picker-account-b-123456';
   const tokenC = 'quota-picker-account-c-123456';

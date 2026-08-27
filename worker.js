@@ -70,7 +70,7 @@ const DYNAMIC_MODELS_FETCH_TIMEOUT_MS = 10000;
 let dynamicModelsCache = {
   fetchedAt: 0,
   models: null, // 动态模型表（含分类）
-  pool: null, // { premium: Set, standard: Set, glm: Set }
+  pool: null, // { premium: Set, standard: Set, glm: Set, perModelCaps: Object, paused: Set }
 };
 let dynamicModelsRefreshFlight = null;
 const dynamicEndpointRefreshFlights = new Map();
@@ -135,8 +135,49 @@ function parseAgentMapping(source, modelIdConstants) {
   return parseAgentMappings(source, modelIdConstants).root;
 }
 
-// 解析 freebuff-models.ts 的池定义（PREMIUM / GLM；STANDARD 由 non-premium 推导）
-// FREEBUFF_WEB_PREMIUM_MODEL_IDS 含 spread（...FREEBUFF_PREMIUM_MODEL_IDS）
+function parseConstArray(source, name, modelIdConstants) {
+  const match = new RegExp(`export\\s+const\\s+${name}[^=]*=\\s*\\[([\\s\\S]*?)\\]`).exec(source);
+  if (!match) return [];
+  const out = [];
+  const itemRe = /'([^']*)'|"([^"]*)"|([A-Z][A-Z0-9_]+)/g;
+  let item;
+  while ((item = itemRe.exec(match[1])) !== null) {
+    const id = item[1] ?? item[2] ?? modelIdConstants[item[3]];
+    if (id && !out.includes(id)) out.push(id);
+  }
+  return out;
+}
+
+function parsePerModelSessionCaps(source, modelIdConstants) {
+  const start = source.search(/export\s+const\s+FREEBUFF_PER_MODEL_SESSION_CAPS\b/);
+  if (start < 0) return {};
+  const bodyStart = source.indexOf('{', source.indexOf('=', start));
+  if (bodyStart < 0) return {};
+  let depth = 0;
+  let bodyEnd = -1;
+  for (let i = bodyStart; i < source.length; i++) {
+    if (source[i] === '{') depth++;
+    else if (source[i] === '}' && --depth === 0) { bodyEnd = i; break; }
+  }
+  if (bodyEnd < 0) return {};
+  const body = source.slice(bodyStart + 1, bodyEnd);
+  const caps = {};
+  const entryRe = /\[\s*([A-Z0-9_]+)\s*\]\s*:\s*\{([\s\S]*?)\}\s*,?/g;
+  let entry;
+  while ((entry = entryRe.exec(body)) !== null) {
+    const id = modelIdConstants[entry[1]];
+    if (!id) continue;
+    const limit = Number(/\blimit\s*:\s*([0-9]+(?:\.[0-9]+)?)/.exec(entry[2])?.[1]);
+    const pool = /\bpool\s*:\s*['"]([^'"]+)['"]/.exec(entry[2])?.[1] || '';
+    const poolLabel = /\bpoolLabel\s*:\s*['"]([^'"]+)['"]/.exec(entry[2])?.[1] || '';
+    if (Number.isFinite(limit) && pool) caps[id] = { limit, pool, ...(poolLabel ? { poolLabel } : {}) };
+  }
+  return caps;
+}
+
+// 解析 freebuff-models.ts 的共享池、单模型 cap 与暂停清单。
+// STANDARD 仍由 non-premium/non-GLM 推导；独立 cap 只覆盖展示/作用域，不会抹掉
+// GLM 5.3 Flash 同时属于共享 Premium 池的事实。
 function parseModelPools(source, modelIdConstants) {
   const premium = new Set();
   const glm = new Set();
@@ -191,8 +232,10 @@ function parseModelPools(source, modelIdConstants) {
       for (const id of items) premium.add(id);
     }
   }
-  // FREEBUFF_PREMIUM_MODEL_IDS 与 FREEBUFF_WEB_PREMIUM_MODEL_IDS 都算 premium
-  return { premium: [...premium], glm: [...glm] };
+  const perModelCaps = parsePerModelSessionCaps(source, modelIdConstants);
+  const paused = parseConstArray(source, "FREEBUFF_PAUSED_FREE_MODEL_IDS", modelIdConstants);
+  // FREEBUFF_PREMIUM_MODEL_IDS 与 FREEBUFF_WEB_PREMIUM_MODEL_IDS 都算 premium。
+  return { premium: [...premium], glm: [...glm], perModelCaps, paused };
 }
 
 // 上游把这些模型的 base2 root agent 在服务端下线了：session 200、agent-runs 200，
@@ -228,9 +271,24 @@ function buildDynamicModelTable(agentMappings) {
 function annotateDynamicModelPools(models, pool) {
   const premium = pool?.premium instanceof Set ? pool.premium : new Set(pool?.premium || []);
   const glm = pool?.glm instanceof Set ? pool.glm : new Set(pool?.glm || []);
+  const perModelCaps = pool?.perModelCaps && typeof pool.perModelCaps === "object"
+    ? pool.perModelCaps : {};
   return (Array.isArray(models) ? models : []).map((model) => {
-    if (model && typeof model === "object" && String(model.pool || "").trim()) return model;
     const id = String(model?.id || "");
+    const cap = perModelCaps[id];
+    if (cap && typeof cap === "object" && String(cap.pool || "").trim()) {
+      return {
+        ...model,
+        pool: String(cap.pool),
+        perModelCap: {
+          limit: Number(cap.limit),
+          pool: String(cap.pool),
+          ...(String(cap.poolLabel || "").trim() ? { poolLabel: String(cap.poolLabel) } : {}),
+        },
+        ...(premium.has(id) ? { sharedPool: "premium" } : {}),
+      };
+    }
+    if (model && typeof model === "object" && String(model.pool || "").trim()) return model;
     const category = glm.has(id) ? "glm" : premium.has(id) ? "premium" : null;
     return category ? { ...model, pool: category } : model;
   });
@@ -443,6 +501,8 @@ async function performDynamicModelsRefresh() {
         premium: new Set(pools.premium),
         standard: null,
         glm: new Set(pools.glm),
+        perModelCaps: pools.perModelCaps || {},
+        paused: new Set(pools.paused || []),
       };
       nextCache = {
         fetchedAt: Date.now(),
@@ -521,6 +581,9 @@ async function tryReleaseFallback() {
               premium: new Set(json.pools?.premium ?? []),
               standard: null,
               glm: new Set(json.pools?.glm ?? []),
+              perModelCaps: json.upstream?.perModelCaps && typeof json.upstream.perModelCaps === "object"
+                ? json.upstream.perModelCaps : {},
+              paused: new Set(Array.isArray(json.upstream?.paused) ? json.upstream.paused : []),
             };
             return {
               fetchedAt: Date.now(),
@@ -546,7 +609,9 @@ function dynamicStandardModels(cache = dynamicModelsCache) {
   return new Set(cache.models.map((m) => m.id).filter((id) => !premium.has(id) && !glm.has(id)));
 }
 
-const KNOWN_QUOTA_POOLS = new Set(["premium", "luna", "deepseek_pro", "glm", "standard"]);
+const KNOWN_QUOTA_POOLS = new Set([
+  "premium", "luna", "deepseek_pro", "glm", "glm_v53_flash", "standard",
+]);
 
 function normalizePoolName(value) {
   const raw = String(value ?? "").trim().toLowerCase();
@@ -580,7 +645,7 @@ function dynamicModelForId(modelId, cache = dynamicModelsCache) {
 // 未知 pool 返回 null，调用层按模型隔离，不能猜测为共享池。
 function modelPoolCategory(modelId, quota = null, cache = dynamicModelsCache) {
   const id = String(modelId || "").trim();
-  if (!id || PAUSED_QUOTA_MODELS.has(id) || isHiddenModelId(id)) return null;
+  if (!id || isPausedModelId(id, cache) || isHiddenModelId(id)) return null;
 
   const quotaRow = quotaRowForModel(quota, id);
   if (quotaRow && String(quotaRow.pool || "").trim()) {
@@ -601,8 +666,7 @@ function modelPoolCategory(modelId, quota = null, cache = dynamicModelsCache) {
     if (dynamicStandardModels(cache).has(id)) return "standard";
   }
   // 静态兼容兜底只在没有实时/动态 pool 时使用。
-  if (DEEPSEEK_PRO_QUOTA_MODELS.has(id)) return "deepseek_pro";
-  if (LUNA_QUOTA_MODELS.has(id)) return "luna";
+  if (GLM_V53_FLASH_QUOTA_MODELS.has(id)) return "glm_v53_flash";
   if (PREMIUM_QUOTA_MODELS.has(id)) return "premium";
   if (STANDARD_MODELS.has(id)) return "standard";
   if (GLM_QUOTA_MODELS.has(id)) return "glm";
@@ -640,22 +704,26 @@ const MODEL_TIERS = [
     "meta/muse-spark-1.2-contributor",
   ])],
   ["limited", new Set([
-    "deepseek/deepseek-v4-pro",
-    "openai/gpt-5.6-luna",
     "z-ai/glm-5.2",
+    "z-ai/glm-5.3-flash",
     "anthropic/claude-fable-5",
   ])],
 ];
 
-// DS4P/Luna 的目录分组跟随实际额度池：共享 Premium 归入 US/SG，
-// 只有独立池时才留在限定组；面板再把独立池分别标成 DS4P/Luna。
+// Luna 跟随共享 Premium 归入 US/SG；GLM 5.3 Flash 虽也是 Premium 成员，
+// 但独立 cap 在目录/面板中优先显示为限定 GLM 池。
 const POOL_DRIVEN_TIER_MODELS = new Set([
-  "deepseek/deepseek-v4-pro",
   "openai/gpt-5.6-luna",
 ]);
+// luna 是 premium 的旧兼容池名（见下方额度池说明），上游偶尔还会在旧快照里回它。
+// 不折算的话 luna 拿到 pool='luna' 就两头落空：不等于 "premium" 拿不到 us_sg，
+// 又不在 MODEL_TIERS 里 → tier=null，目录上直接掉标签。面板侧 normalizeQuotaPool
+// 已经做了同样的折算。
+const LEGACY_POOL_ALIASES = { luna: "premium" };
 function modelCatalogTier(modelId, pool) {
   const id = String(modelId || "");
-  const normalizedPool = String(pool || "").trim().toLowerCase();
+  const raw = String(pool || "").trim().toLowerCase();
+  const normalizedPool = LEGACY_POOL_ALIASES[raw] || raw;
   if (POOL_DRIVEN_TIER_MODELS.has(id) && normalizedPool === "premium") return "us_sg";
   const rank = MODEL_TIERS.findIndex(([, ids]) => ids.has(id));
   return rank >= 0 ? MODEL_TIERS[rank][0] : null;
@@ -664,21 +732,40 @@ function modelCatalogTier(modelId, pool) {
 // ---------------------------------------------------------------------------
 // 额度池说明（上游 rateLimitsByModel）：
 //   同一模型的 pool 会随上游 entitlement/rollout 变化；账号实时快照优先。
-//   deepseek_pro / luna / premium / glm 只作为已知池名和无快照时的兼容兜底，
-//   不能再假设 DS4P 永远属于 deepseek_pro。
+//   premium / glm / glm_v53_flash 是当前有效池；deepseek_pro / luna 仅保留为
+//   旧快照兼容池名，不能作为当前静态归属。
 //   glm：GLM referral 独立池
 // M3 虽曾出现在旧 Premium 快照里，但已于 2026-08-20 暂停，不得再据旧表
 // 认定为当前可运行额度池。额度只用于本地调度/错误作用域，不改变调用方模型。
 // ---------------------------------------------------------------------------
-const DEEPSEEK_PRO_QUOTA_MODELS = new Set([
-  "deepseek/deepseek-v4-pro",
-]);
-const LUNA_QUOTA_MODELS = new Set([
-  "openai/gpt-5.6-luna",
-]);
 const PAUSED_QUOTA_MODELS = new Set([
   "minimax/minimax-m3",
+  // 官方 2026-08-26 已从免费目录和所有额度池撤下；仅保留 wire id 供旧客户端
+  // 被上游识别/替换。代理不能继续把兼容 ID 暴露成可调用模型。
+  "deepseek/deepseek-v4-pro",
+  "stealth/ox-alpha",
 ]);
+function isPausedModelId(modelId, cache = dynamicModelsCache) {
+  const value = String(modelId || "").trim().toLowerCase();
+  if (!value) return false;
+  const paused = new Set(PAUSED_QUOTA_MODELS);
+  const dynamicPaused = cache?.pool?.paused;
+  if (dynamicPaused && typeof dynamicPaused[Symbol.iterator] === "function") {
+    for (const id of dynamicPaused) {
+      const normalized = String(id || "").trim().toLowerCase();
+      if (normalized) paused.add(normalized);
+    }
+  }
+  for (const base of paused) {
+    const normalizedBase = String(base || "").trim().toLowerCase();
+    if (!normalizedBase) continue;
+    if (value === normalizedBase) return true;
+    if (!value.startsWith(normalizedBase + "-")) continue;
+    const suffix = value.slice(normalizedBase.length + 1);
+    if (/^\d{6,8}(?:$|[-:])/.test(suffix)) return true;
+  }
+  return false;
+}
 // God-only / 服务专用模型。普通 token 一定调不通，动态源即使返回也必须 fail closed。
 // stealth/ox-alpha 曾在此列（当时官方 FREEBUFF_SERVICE_ONLY_MODEL_IDS 非空）；2026-08-24
 // 官方把它放进了 CLI/Desktop 目录并清空该名单（d534205ad39d），隐藏前提失效，已开放。
@@ -699,6 +786,8 @@ function isHiddenModelId(modelId) {
 }
 const PREMIUM_QUOTA_MODELS = new Set([
   "deepseek/deepseek-v4-flash",
+  "openai/gpt-5.6-luna",
+  "z-ai/glm-5.3-flash",
   "meta/muse-spark-1.2-contributor",
 ]);
 const STANDARD_MODELS = new Set([
@@ -706,6 +795,9 @@ const STANDARD_MODELS = new Set([
 ]);
 const GLM_QUOTA_MODELS = new Set([
   "z-ai/glm-5.2",
+]);
+const GLM_V53_FLASH_QUOTA_MODELS = new Set([
+  "z-ai/glm-5.3-flash",
 ]);
 
 // ---------------------------------------------------------------------------
@@ -2055,7 +2147,7 @@ function isTransientUpstreamError(error) {
 }
 
 function pickToken(env, sessionModel, attempted = new Set(), client = null) {
-  if (PAUSED_QUOTA_MODELS.has(String(sessionModel || '')) || isHiddenModelId(sessionModel)) return null;
+  if (isPausedModelId(sessionModel) || isHiddenModelId(sessionModel)) return null;
   syncAccountState(env);
   const pool = parseAccounts(env);
   if (pool.length === 0) return null;
@@ -2316,11 +2408,30 @@ function scopedCooldownKey(token, scope) {
 function quotaScopeForModel(model, quota = null) {
   const id = String(model || "").trim();
   if (!id) return "account";
+  // GLM 5.3 Flash 同时消耗 Premium 共享池，并额外受独立 2 次/日上限约束。
+  // rateLimitsByModel 的精确行优先；typed 429 未携带快照时按官方独立 cap
+  // fail closed，不能退成模型级或误锁整个 Premium 池。
+  if (GLM_V53_FLASH_QUOTA_MODELS.has(id)) {
+    const exactPool = normalizePoolName(quotaRowForModel(quota, id)?.pool);
+    return "pool:" + (exactPool || "glm_v53_flash");
+  }
   const category = modelPoolCategory(id, quota);
   if (["deepseek_pro", "luna", "premium"].includes(category)) return "pool:" + category;
   if (category === "glm") return "pool:glm";
+  if (category === "glm_v53_flash") return "pool:glm_v53_flash";
   // Standard/Limited grouping is not assumed without a confirmed upstream pool.
   return "model:" + id;
+}
+
+function quotaScopesForModel(model, quota = null) {
+  const id = String(model || "").trim();
+  if (!id) return ["account"];
+  if (GLM_V53_FLASH_QUOTA_MODELS.has(id)) {
+    const exactPool = normalizePoolName(quotaRowForModel(quota, id)?.pool);
+    if (exactPool === "premium") return ["pool:premium"];
+    return ["pool:glm_v53_flash", "pool:premium"];
+  }
+  return [quotaScopeForModel(id, quota)];
 }
 
 function accountQuotaSnapshot(token) {
@@ -2385,8 +2496,8 @@ function scopedCooldownInfo(token, model, now = Date.now()) {
   if (model) {
     keys.push(scopedCooldownKey(token, "model:" + String(model)));
     const scopes = new Set([
-      quotaScopeForModel(model, accountQuotaSnapshot(token)),
-      quotaScopeForModel(model, null),
+      ...quotaScopesForModel(model, accountQuotaSnapshot(token)),
+      ...quotaScopesForModel(model, null),
     ]);
     for (const scope of scopes) {
       if (scope !== "account") keys.push(scopedCooldownKey(token, scope));
@@ -2444,34 +2555,12 @@ function isStaleSessionGate(status, body) {
 
 function quotaEntryForModel(quota, sessionModel) {
   const id = String(sessionModel || "").trim();
-  if (!quota || typeof quota !== "object" || PAUSED_QUOTA_MODELS.has(id) || isHiddenModelId(id)) return null;
+  if (!quota || typeof quota !== "object" || isPausedModelId(id) || isHiddenModelId(id)) return null;
   const exact = quotaRowForModel(quota, id);
   const declaredPool = safePoolName(exact?.pool);
   const scope = quotaScopeForModel(id, quota);
   const pool = scope.startsWith("pool:") ? scope.slice(5) : null;
-  if (pool === "premium") {
-    const pooled = [];
-    for (const [model, entry] of Object.entries(quota)) {
-      if (!entry || typeof entry !== "object" || PAUSED_QUOTA_MODELS.has(model) || isHiddenModelId(model)) continue;
-      const entryPool = safePoolName(entry.pool);
-      if (entryPool === "premium" || (!entryPool && PREMIUM_QUOTA_MODELS.has(model))) pooled.push(entry);
-    }
-    if (pooled.length) {
-      const limits = pooled.map((entry) => Number(entry.limit)).filter(Number.isFinite);
-      const counts = pooled.map((entry) => Number(entry.recentCount)).filter(Number.isFinite);
-      const limit = limits.length ? Math.min(...limits) : null;
-      const recentCount = counts.length ? Math.max(...counts) : null;
-      if (exact && (!limits.length || Number(exact.limit) === limit)
-        && (!counts.length || Number(exact.recentCount) === recentCount)) return exact;
-      return {
-        ...pooled[0],
-        ...(limits.length ? { limit } : {}),
-        ...(counts.length ? { recentCount } : {}),
-        pool: "premium",
-      };
-    }
-    return null;
-  }
+  if (pool === "premium") return premiumQuotaEntry(quota, exact);
   if (exact && typeof exact === "object") {
     if (!declaredPool || !pool || declaredPool === pool) return exact;
   }
@@ -2482,14 +2571,74 @@ function quotaEntryForModel(quota, sessionModel) {
   return null;
 }
 
+function premiumQuotaEntry(quota, exact = null) {
+  if (!quota || typeof quota !== "object") return null;
+  const pooled = [];
+  for (const [model, entry] of Object.entries(quota)) {
+    if (!entry || typeof entry !== "object" || isPausedModelId(model) || isHiddenModelId(model)) continue;
+    const entryPool = safePoolName(entry.pool);
+    if (entryPool === "premium" || (!entryPool && PREMIUM_QUOTA_MODELS.has(model))) pooled.push(entry);
+  }
+  if (!pooled.length) return null;
+  const limits = pooled.map((entry) => Number(entry.limit)).filter(Number.isFinite);
+  const counts = pooled.map((entry) => Number(entry.recentCount)).filter(Number.isFinite);
+  const limit = limits.length ? Math.min(...limits) : null;
+  const recentCount = counts.length ? Math.max(...counts) : null;
+  if (exact && (!limits.length || Number(exact.limit) === limit)
+    && (!counts.length || Number(exact.recentCount) === recentCount)) return exact;
+  return {
+    ...pooled[0],
+    ...(limits.length ? { limit } : {}),
+    ...(counts.length ? { recentCount } : {}),
+    pool: "premium",
+  };
+}
+
+function quotaEntryForScope(quota, scope) {
+  const pool = String(scope || "").startsWith("pool:") ? String(scope).slice(5) : "";
+  if (!pool) return null;
+  if (pool === "premium") return premiumQuotaEntry(quota);
+  for (const entry of Object.values(quota || {})) {
+    if (entry && typeof entry === "object" && safePoolName(entry.pool) === pool) return entry;
+  }
+  return null;
+}
+
+function quotaConstraintsForModel(quota, sessionModel) {
+  const id = String(sessionModel || "").trim();
+  if (!GLM_V53_FLASH_QUOTA_MODELS.has(id)) {
+    const primary = quotaEntryForModel(quota, id);
+    return primary ? [{ entry: primary, scope: quotaScopeForModel(id, quota) }] : [];
+  }
+
+  return quotaScopesForModel(id, quota)
+    .map((scope) => ({ scope, entry: quotaEntryForScope(quota, scope) }))
+    .filter((constraint) => constraint.entry);
+}
+
+function quotaConstraintRemaining(constraint) {
+  const entry = constraint?.entry;
+  if (!entry || typeof entry.recentCount !== "number" || typeof entry.limit !== "number") return null;
+  return entry.limit - entry.recentCount;
+}
+
+function exhaustedQuotaScope(info, sessionModel) {
+  for (const constraint of quotaConstraintsForModel(info?.quota, sessionModel)) {
+    const remaining = quotaConstraintRemaining(constraint);
+    if (remaining !== null && remaining <= 0) return constraint.scope;
+  }
+  return null;
+}
+
 // 仅供流式无首数据时确认对应额度池是否耗尽；不参与账号轮询排序。
 function remainingQuota(token, sessionModel) {
   const h = acctHealth.get(token);
   if (!h || !h.quota || !Number.isFinite(Number(h.quotaCheckedAt))) return null;
   if (Date.now() - Number(h.quotaCheckedAt) > HEALTH_OBSERVATION_TTL_MS) return null;
-  const entry = quotaEntryForModel(h.quota, sessionModel);
-  if (!entry || typeof entry.recentCount !== "number" || typeof entry.limit !== "number") return null;
-  return entry.limit - entry.recentCount;
+  const remaining = quotaConstraintsForModel(h.quota, sessionModel)
+    .map(quotaConstraintRemaining)
+    .filter((value) => value !== null);
+  return remaining.length ? Math.min(...remaining) : null;
 }
 
 // 长流不应因为固定秒数被误杀：只有上游额度探测明确表示不可用时，
@@ -2503,18 +2652,16 @@ function isQuotaExhausted(info, sessionModel) {
     // A missing scope is not evidence of a shared pool. Only reuse the
     // observation for the exact model that produced it; typed pool/account
     // scopes may be shared according to the upstream contract.
-    const expectedScope = quotaScopeForModel(sessionModel, info.quota || null);
+    const expectedScopes = new Set(quotaScopesForModel(sessionModel, info.quota || null));
     return scope
-      ? scope === "account" || scope === modelScope || scope === expectedScope
+      ? scope === "account" || scope === modelScope || expectedScopes.has(scope)
       : info.quotaModel != null && String(info.quotaModel) === String(sessionModel);
   }
   // STANDARD 没有可靠的剩余次数查询；只处理明确的账号/上游状态，
   // 不根据 rateLimitsByModel 的 STANDARD 数字判断耗尽。
   if (modelPoolCategory(sessionModel, info.quota) === "standard") return false;
   if (!info.quota) return false;
-  const entry = quotaEntryForModel(info.quota, sessionModel);
-  if (!entry || typeof entry.recentCount !== "number" || typeof entry.limit !== "number") return false;
-  return entry.limit - entry.recentCount <= 0;
+  return exhaustedQuotaScope(info, sessionModel) !== null;
 }
 
 function parseJsonBody(text) {
@@ -2717,12 +2864,17 @@ function classifyRateLimit(text, status = 429, headers = {}, model = null, now =
     return { state: null, reason: "egress", scope: "egress", retryAfterMs };
   }
   if (status === 429 || state === "rate_limited" || state === "rate_limit_exceeded" || state === "quota_exceeded") {
+    const exhaustedScope = state
+      ? exhaustedQuotaScope({ quota }, model)
+      : null;
     return {
       state: "rate_limited",
       reason: "quota",
       // 只有明确的 typed quota 状态才能证明对应共享池；generic 429
       // 没有作用域信息，只锁当前模型，避免误伤同账号其他 Premium 模型。
-      scope: state ? quotaScopeForModel(model, quota) : (model ? "model:" + String(model) : "account"),
+      scope: state
+        ? (exhaustedScope || quotaScopeForModel(model, quota))
+        : (model ? "model:" + String(model) : "account"),
       retryAfterMs,
     };
   }
@@ -3284,11 +3436,12 @@ async function freshQuotaProbe(token, sessionModel) {
   const freshnessAt = hasQuotaSnapshot ? Number(cached.quotaCheckedAt) : Number(cached.checkedAt);
   if (!Number.isFinite(freshnessAt) || now - freshnessAt > HEALTH_OBSERVATION_TTL_MS) return;
   if (isQuotaExhausted(cached, sessionModel)) {
+    const snapshotScope = exhaustedQuotaScope(cached, sessionModel);
     throw new QuotaExhaustedError({
       ...cached,
       scope: cached.state === "spend_limited"
         ? "account"
-        : cached.quotaScope || quotaScopeForModel(sessionModel, cached.quota || null),
+        : cached.quotaScope || snapshotScope || quotaScopeForModel(sessionModel, cached.quota || null),
     });
   }
 }
@@ -3825,11 +3978,18 @@ function namedEffort(value) {
 //   - meta/muse-spark:   EFFORTS_THROUGH_XHIGH（minimal..xhigh，ALWAYS reasons，none=400）
 //   - gpt-5.6-luna:      见 MODEL_PINNED_EFFORT —— 目录里写的是 EFFORTS_THROUGH_MAX，
 //                        但那是 OpenRouter 广告的档位，实际链路只收 high
-//   - minimax-m3 / mimo / glm / fable：无 effort 档位或不接受 effort → 不在表中，原样透传
+//   - minimax-m3 / mimo / fable：无 effort 档位或不接受 effort → 不在表中，原样透传
 const MODEL_EFFORTS = {
   "deepseek/deepseek-v4-flash": ["low", "high", "max"],
   "deepseek/deepseek-v4-pro": ["low", "high", "max"],
   "meta/muse-spark-1.2-contributor": ["minimal", "low", "medium", "high", "xhigh"],
+  // 官方目录给 glm-5.3-flash 不带 reasoningEffort 字段（= 不在 effort 表里），
+  // 但实测 2026-08-27（容器内直连 12 个 OpenRouter endpoint）与目录相反：
+  // minimal/low/medium/high/xhigh/max 全部 200，ultra 被上游 400 并回吐合法集
+  //   "max"|"xhigh"|"high"|"medium"|"low"|"minimal"|"none"
+  // none 另有一条 400："Reasoning is mandatory for this endpoint and cannot be disabled."
+  // 目录漏字段 ≠ 不收 effort，按实测建表：ultra 下取 max，none 由 clamp 兜到 minimal。
+  "z-ai/glm-5.3-flash": ["minimal", "low", "medium", "high", "xhigh", "max"],
   // 官方 OX_ALPHA_REASONING_EFFORTS = ['low','high','max']（d534205），
   // defaultEffort:'high' 只是未点名时的默认，不是唯一可发值。客户端点名 max
   // 原样透传（官方 Web UI 自己就发 max）；low/medium 这类不在 ladder 上的值
@@ -3857,8 +4017,15 @@ const MODEL_PINNED_EFFORT = {
 
 function clampReasoningEffort(requested, allowed) {
   if (!Array.isArray(allowed) || allowed.length === 0) return requested;
-  const wanted = REASONING_EFFORT_RANK.indexOf(requested);
-  if (wanted < 0) return requested; // 未知档位 → 原样透传，交由上游
+  // none/disabled/off 不在 ladder 上，但它是「比 minimal 更低」的语义档，不是未知值。
+  // 列了 efforts 表的模型都是强制思考的 endpoint，收到 none 会 400
+  // （glm-5.3-flash: "Reasoning is mandatory for this endpoint and cannot be disabled."；
+  // muse-spark 同样 ALWAYS reasons）。按 rank=-1 走下面的「所有档都高于请求」分支，
+  // 兜到最低可用档 —— 关思考的客户端（Anthropic thinking.type=disabled、
+  // budget_tokens=0）因此拿到最省的一档而不是 400。
+  const off = namedEffort(requested) === "none";
+  const wanted = off ? -1 : REASONING_EFFORT_RANK.indexOf(requested);
+  if (wanted < 0 && !off) return requested; // 真正的未知档位 → 原样透传，交由上游
   let best = null;
   let bestRank = -1;
   for (const cand of allowed) {
@@ -3987,7 +4154,7 @@ function resolveModelAlias(modelId) {
 // 查找模型配置：自定义别名 → 硬编码 MODELS → 动态表（合并表）
 function findModelConfig(modelId) {
   const target = resolveModelAlias(modelId) || modelId;
-  if (PAUSED_QUOTA_MODELS.has(target) || isHiddenModelId(target) || !modelIsAvailable(target)) return null;
+  if (isPausedModelId(target) || isHiddenModelId(target) || !modelIsAvailable(target)) return null;
   const hit = MODELS.find((m) => m.id === target);
   if (hit) return hit;
   const dyn = dynamicModelsCache.models;
@@ -4002,7 +4169,7 @@ function findModelConfig(modelId) {
 // 不能依赖 /v1/models 先被调用：Cloudflare 不保证两个请求落在同一 isolate。
 async function resolveModelConfig(modelId) {
   const target = resolveModelAlias(modelId) || modelId;
-  if (PAUSED_QUOTA_MODELS.has(target) || isHiddenModelId(target)) return null;
+  if (isPausedModelId(target) || isHiddenModelId(target)) return null;
 
   // 受 endpoint 管理的模型必须在 TTL 到期后重新确认。普通模型仍可直接命中
   // 已发布快照，不会被公开源刷新阻塞。
@@ -5634,7 +5801,7 @@ async function handleModels(client = null, { forceRefresh = false } = {}) {
   const snapshotCache = refreshResult.cache;
   const snapshotAvailability = refreshResult.availability;
   modelList = modelList.filter((m) =>
-    !PAUSED_QUOTA_MODELS.has(m.id)
+    !isPausedModelId(m.id, snapshotCache)
       && !isHiddenModelId(m.id)
       && modelIsAvailable(m.id, snapshotAvailability));
   const data = modelList

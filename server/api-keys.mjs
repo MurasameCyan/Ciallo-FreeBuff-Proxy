@@ -34,7 +34,20 @@ const MAX_NAME_LEN = 40;
 const MAX_MODELS = 64;
 const MAX_CONCURRENCY = 32;
 const MAX_DAILY_LIMIT = 100000;
-const PAUSED_MODEL_IDS = new Set(['minimax/minimax-m3']);
+const PAUSED_MODEL_IDS = new Set([
+  'minimax/minimax-m3',
+  'deepseek/deepseek-v4-pro',
+  'stealth/ox-alpha',
+]);
+
+function isPausedModelId(modelId) {
+  const id = String(modelId ?? '').trim().toLowerCase();
+  for (const base of PAUSED_MODEL_IDS) {
+    if (id === base) return true;
+    if (id.startsWith(base) && /^-\d{6,8}(?:$|[-:])/.test(id.slice(base.length))) return true;
+  }
+  return false;
+}
 
 function invalid(message) {
   return Object.assign(new Error(message), { code: 'INVALID_KEY_CONFIG' });
@@ -176,7 +189,7 @@ export function createApiKeyStore(file) {
         if (
           models.length === 0
           && cur.models.length > 0
-          && cur.models.every((model) => PAUSED_MODEL_IDS.has(model))
+          && cur.models.every(isPausedModelId)
         ) {
           throw invalid('该 Key 只允许已暂停模型，不能改成不限模型');
         }
