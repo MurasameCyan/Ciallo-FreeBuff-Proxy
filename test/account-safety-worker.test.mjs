@@ -136,6 +136,96 @@ test('一个账号的本地出站不可用时继续使用下一个账号', async
     String(init.headers?.Authorization || '').endsWith(tokenB)), true);
 });
 
+test('前两个账号 lane 未就绪时直接选择后面的 ready 账号，不消耗建会话换号预算', async () => {
+  const tokenA = 'egress-probing-account-a-123456';
+  const tokenB = 'egress-probing-account-b-123456';
+  const tokenReady = 'egress-ready-account-c-12345678';
+  const routed = [];
+  const workerVm = createWorkerVm({
+    fetchImpl: flakySessionFetch({ failToken: 'unused-egress-ready-token' }),
+  });
+  workerVm.worker.configureUpstreamRouting({
+    resolveAccountFetch(token) {
+      if (token === tokenReady) return null;
+      return async () => {
+        routed.push(token);
+        const error = new Error('account egress is unavailable');
+        error.code = 'ACCOUNT_EGRESS_UNAVAILABLE';
+        throw error;
+      };
+    },
+    isAccountRouteReady: (token) => token === tokenReady,
+  });
+  // 这个顺序会让旧轮询在默认预算 2 内依次选中 A、B，永远到不了 ready 的 C。
+  const env = terminalEnv(`${tokenA},${tokenB},${tokenReady}`, {
+    FREEBUFF_ACCOUNT_SWITCH_JITTER_MS: '0',
+  });
+
+  const response = await workerVm.api.executeChat(
+    env, terminalChatParams, terminalModel, false, 'chat',
+  );
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(routed, [], '明确未就绪的 lane 不应进入上游请求链');
+  assert.equal(workerVm.upstreamCalls.some(({ init }) =>
+    String(init.headers?.Authorization || '').endsWith(tokenReady)), true);
+});
+
+test('全部账号 lane 未就绪时仍返回明确的 egress_unavailable', async () => {
+  const tokenA = 'all-egress-probing-account-a-123456';
+  const tokenB = 'all-egress-probing-account-b-123456';
+  const routed = [];
+  const workerVm = createWorkerVm({
+    fetchImpl: flakySessionFetch({ failToken: 'unused-all-egress-token' }),
+  });
+  workerVm.worker.configureUpstreamRouting({
+    resolveAccountFetch(token) {
+      return async () => {
+        routed.push(token);
+        const error = new Error('account egress is unavailable');
+        error.code = 'ACCOUNT_EGRESS_UNAVAILABLE';
+        throw error;
+      };
+    },
+    isAccountRouteReady: () => false,
+  });
+  const env = terminalEnv(`${tokenA},${tokenB}`, {
+    FREEBUFF_ACCOUNT_SWITCH_JITTER_MS: '0',
+  });
+
+  const response = await workerVm.api.executeChat(
+    env, terminalChatParams, terminalModel, false, 'chat',
+  );
+  const body = await response.json();
+
+  assert.equal(response.status, 503);
+  assert.equal(body.error?.type, 'egress_unavailable');
+  assert.ok(routed.length > 0, '全池未就绪时应保留本地 lane 错误归因');
+});
+
+test('已有 active session 的未就绪 lane 也必须跳过', async () => {
+  const tokenStale = 'active-session-stale-lane-12345678';
+  const tokenReady = 'active-session-ready-lane-12345678';
+  const model = terminalModel.session;
+  const client = {
+    key: 'active-session-route-client-key',
+    name: 'active-session-route-client',
+    owner: false,
+    dailyLimit: 2,
+  };
+  const workerVm = createWorkerVm({ fetchImpl: flakySessionFetch({ failToken: 'unused-active-route-token' }) });
+  await workerVm.api.createSession(tokenStale, model, false, client);
+  workerVm.worker.configureUpstreamRouting({
+    isAccountRouteReady: (token) => token === tokenReady,
+  });
+  const selected = await workerVm.api.pickTokenWithSessionWait(
+    terminalEnv(`${tokenStale},${tokenReady}`), model, new Set(), null, 0, client,
+  );
+
+  assert.equal(selected?.token, tokenReady);
+  releaseIfSelected(workerVm, selected);
+});
+
 test('Code review 首账号本地出站不可用时继续使用下一个账号', async () => {
   const tokenA = 'review-egress-fallback-account-a-123456';
   const tokenB = 'review-egress-fallback-account-b-123456';

@@ -1535,6 +1535,16 @@ test('worker 账号路由动态解析，已删除托管 token 必须 fail closed
     '已删除托管 token 不得回落全局出口');
 });
 
+test('server 向 worker 注入账号 lane 就绪判定，选号阶段可跳过 probing lane', () => {
+  const source = readFileSync(new URL('../server.js', import.meta.url), 'utf8');
+  assert.match(source,
+    /function isAccountUpstreamRouteReady\(token\)[\s\S]*?accountEgressFetch\(account, \{ schedule: false \}\)[\s\S]*?selectedFetch !== accountEgressUnavailableFetch/,
+    'lane 就绪判定必须与实际账号路由使用同一份 fetch 结果');
+  assert.match(source,
+    /configureUpstreamRouting\?\.\(\{[\s\S]*?isAccountRouteReady:\s*isAccountUpstreamRouteReady/,
+    'server 必须把 lane 就绪判定注入 worker 选号器');
+});
+
 test('token:uid 账号按 Bearer token 命中专属 lane，删除后仍 fail closed', () => {
   const source = readFileSync(new URL('../server.js', import.meta.url), 'utf8');
   const start = source.indexOf('function accountByToken(');

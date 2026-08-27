@@ -692,6 +692,19 @@ function resolveAccountUpstreamRoute(token) {
   return null;
 }
 
+function isAccountUpstreamRouteReady(token) {
+  const wanted = normalizeAccountToken(token);
+  if (!wanted) return false;
+  const account = accountByToken(wanted);
+  if (account) {
+    managedAccountTokenHistory.add(wanted);
+    const selectedFetch = accountEgressFetch(account, { schedule: false });
+    return selectedFetch !== accountEgressUnavailableFetch;
+  }
+  if (managedAccountTokenHistory.has(wanted)) return false;
+  return null;
+}
+
 function accountEgressFetch(account, { schedule = true, withRoute = false, allowTerminal = false } = {}) {
   if (!account) return null;
   const route = (selectedFetch) => {
@@ -1831,6 +1844,7 @@ const handler = worker.default;
 handler.configureUpstreamRouting?.({
   getUpstreamFetch,
   resolveAccountFetch: resolveAccountUpstreamRoute,
+  isAccountRouteReady: isAccountUpstreamRouteReady,
   onReject: handleEgressReject,
 });
 

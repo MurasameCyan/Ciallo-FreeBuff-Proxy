@@ -729,9 +729,10 @@ export default {
   usageSnapshot,
   // Node 服务启动时只配置一次。避免并发请求各自携带的 env 函数互相覆盖
   // 模块级出站状态；Cloudflare Worker 不调用此入口，仍使用每请求 env。
-  configureUpstreamRouting({ getUpstreamFetch, resolveAccountFetch, onReject } = {}) {
+  configureUpstreamRouting({ getUpstreamFetch, resolveAccountFetch, isAccountRouteReady, onReject } = {}) {
     configuredUpstreamFetch = typeof getUpstreamFetch === "function" ? getUpstreamFetch : null;
     upstreamFetchForAccount = typeof resolveAccountFetch === "function" ? resolveAccountFetch : null;
+    accountRouteReady = typeof isAccountRouteReady === "function" ? isAccountRouteReady : null;
     onEgressReject = typeof onReject === "function" ? onReject : null;
     upstreamRoutingConfigured = true;
   },
@@ -848,6 +849,10 @@ function singleFlight(key, fn) {
 function markSessionInvalidated(token, model) {
   if (!token) return;
   sessionInvalidated.set(token + ":" + (model || ""), Date.now());
+}
+
+function accountRouteSelectable(token) {
+  return !accountRouteReady || accountRouteReady(token) !== false;
 }
 
 function wasRecentlyInvalidated(token, model, now = Date.now()) {
@@ -1966,6 +1971,7 @@ async function pickTokenWithSessionWait(
         const session = sessCache.get(acct.token + ":" + sessionModel);
         return !accountIsBlocked(acct.token)
           && !inScopedCooldown(acct.token, sessionModel)
+          && accountRouteSelectable(acct.token)
           && (preserveBudget ? isLiveSession(session) : isUsableSession(session))
           // 别的 Key 开的同模型会话不等也不复用：共用一个 instanceId 会串上下文。
           // 这种号交给 pickToken 排到候选末尾，优先换个干净的号新建会话。
@@ -1990,6 +1996,7 @@ async function pickTokenWithSessionWait(
           const fresh = accounts.find((acct) => {
             if (accountIsBlocked(acct.token) || inScopedCooldown(acct.token, sessionModel)) return false;
             if (tokenBusy(acct.token)) return false;
+            if (!accountRouteSelectable(acct.token)) return false;
             const session = sessCache.get(acct.token + ":" + sessionModel);
             return !isLiveSession(session);
           });
@@ -2055,12 +2062,21 @@ function pickToken(env, sessionModel, attempted = new Set(), client = null) {
 
   // 只选择没有明确隔离、短期冷却或并发租约的账号。acctHealth 还承载
   // rate_limited/country_blocked 等临时观测，只用于面板展示，不能永久摘号。
-  const alivePool = pool.filter((acct) => {
+  const eligiblePool = pool.filter((acct) => {
     if (attempted && attempted.has(acct.token)) return false;
     if (accountIsBlocked(acct.token)) return false;
     if (tokenBusy(acct.token)) return false;
     return true;
   });
+  // Node adapter 能直接看见每个账号 lane 的 dispatcher 状态。有任意可路由账号时，
+  // 在选号前跳过明确未就绪的 lane：本地拒绝没有创建 session，不应白占
+  // MAX_ACCOUNT_SWITCHES 的 admission 预算。若全池都未就绪，保留原池走一次正常错误
+  // 路径，客户端仍得到准确的 egress_unavailable，而不是泛化的池耗尽提示。
+  // 未注入或返回 null 表示未知，Cloudflare/直连部署保持原有行为。
+  const routablePool = accountRouteReady
+    ? eligiblePool.filter((acct) => accountRouteSelectable(acct.token))
+    : eligiblePool;
+  const alivePool = routablePool.length > 0 ? routablePool : eligiblePool;
   const usePool = alivePool;
   if (usePool.length === 0) return null;
 
@@ -3164,6 +3180,7 @@ function jitterMs() {
 const defaultUpstreamFetch = typeof fetch === "function" ? fetch : globalThis.fetch;
 let upstreamFetch = defaultUpstreamFetch;
 let upstreamFetchForAccount = null;
+let accountRouteReady = null;
 let configuredUpstreamFetch = null;
 let upstreamRoutingConfigured = false;
 const upstreamEgressByHeaders = new WeakMap();
