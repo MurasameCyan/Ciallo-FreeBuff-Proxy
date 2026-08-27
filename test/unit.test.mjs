@@ -6,9 +6,12 @@ const src = readFileSync(new URL('../worker.js', import.meta.url), 'utf-8');
 // worker.js 使用 ESM `export default {...}`，vm 沙箱不支持 ESM 语法。
 // 把首处 `export default {` 替换为普通 const 声明，并在文件末尾附加导出赋值，
 // 使内部函数在沙箱全局可见，供单测直接调用。
-const wrapper = src.replace('export default {', 'const __workerDefault__ = {') +
+const wrapper = src
+  .replace('export default {', 'const __workerDefault__ = {')
+  .replace('const DYNAMIC_MODELS_FETCH_TIMEOUT_MS = 10000;', 'const DYNAMIC_MODELS_FETCH_TIMEOUT_MS = 25;')
+  .replace('const DYNAMIC_MODEL_ENDPOINT_RETRY_MS = 60 * 1000;', 'const DYNAMIC_MODEL_ENDPOINT_RETRY_MS = 25;') +
   '\n\nglobalThis.__workerDefault__ = __workerDefault__;\n' +
-  'globalThis.__unitTestApi__ = { normalizeChatThinking, anthropicThinkingToEffort, namedEffort, normalizeReasoningEffort, collectReasoningTexts, anthropicStopReason, anthropicModelToOpenAI, parseModelAliases, resolveModelAlias, resolveModelConfig, findModelConfig, setTestAliases: (raw) => { currentAliases = parseModelAliases(raw); }, setTestDynamicModels: (models) => { dynamicModelsCache = { fetchedAt: Date.now(), models, pool: { premium: new Set(), standard: null, glm: new Set() } }; if (typeof dynamicModelAvailability !== "undefined") dynamicModelAvailability = new Map(); }, setTestModelAvailability: (id, available) => { if (typeof dynamicModelAvailability !== "undefined") dynamicModelAvailability.set(id, { available, checkedAt: Date.now() }); }, cooldown, cooldownInfo, inCooldown, parseCooldown, nextPacificMidnight: typeof nextPacificMidnight === "function" ? nextPacificMidnight : null, pickToken, releaseToken: typeof releaseToken === "function" ? releaseToken : null, accountPoolExhaustion: typeof accountPoolExhaustion === "function" ? accountPoolExhaustion : null, waitingRoomResponse: typeof waitingRoomResponse === "function" ? waitingRoomResponse : null, pipeUpstreamToClient, pipeUpstreamToResponsesStream, anthropicStream, streamToNonStream, buildUpstreamPayload, anthropicFromChat, responsesToNonStream, markSessionInvalidated, wasRecentlyInvalidated, singleFlight, sessionRemainingMs, INVALIDATION_WINDOW_MS, SESSION_REUSE_SAFE_MS, SESSION_VERIFY_WINDOW_MS, executeChat, readCallUsage, accountLabel, summarizeAccountHealth, logCall, callLogSnapshot, readUsageFull, recordRequest, blankUsageTotals, recordAccountObservation, configureUsagePersistence, restoreUsageSnapshot, usageSnapshot, setTestEgressReject: (fn) => { onEgressReject = fn; }, egressRejectedResponse: typeof egressRejectedResponse === "function" ? egressRejectedResponse : null, MODEL_TIERS, handleModels };\n';
+  'globalThis.__unitTestApi__ = { normalizeChatThinking, anthropicThinkingToEffort, namedEffort, normalizeReasoningEffort, collectReasoningTexts, anthropicStopReason, anthropicModelToOpenAI, parseModelAliases, resolveModelAlias, resolveModelConfig, findModelConfig, refreshDynamicModelsIfStale, modelIsAvailable, setTestAliases: (raw) => { currentAliases = parseModelAliases(raw); }, setTestDynamicModels: (models, fetchedAt = Date.now()) => { dynamicModelsCache = { fetchedAt, models, pool: { premium: new Set(), standard: null, glm: new Set() } }; if (typeof dynamicModelAvailability !== "undefined") dynamicModelAvailability = new Map(); if (typeof dynamicEndpointRefreshFlights !== "undefined") dynamicEndpointRefreshFlights.clear(); }, setTestModelAvailability: (id, available) => { if (typeof dynamicModelAvailability !== "undefined") dynamicModelAvailability.set(id, { available, checkedAt: Date.now(), retryAt: 0 }); }, resetTestModelRefreshFlight: () => { dynamicModelsRefreshFlight = null; if (typeof dynamicEndpointRefreshFlights !== "undefined") dynamicEndpointRefreshFlights.clear(); }, cooldown, cooldownInfo, inCooldown, parseCooldown, nextPacificMidnight: typeof nextPacificMidnight === "function" ? nextPacificMidnight : null, pickToken, releaseToken: typeof releaseToken === "function" ? releaseToken : null, accountPoolExhaustion: typeof accountPoolExhaustion === "function" ? accountPoolExhaustion : null, waitingRoomResponse: typeof waitingRoomResponse === "function" ? waitingRoomResponse : null, pipeUpstreamToClient, pipeUpstreamToResponsesStream, anthropicStream, streamToNonStream, buildUpstreamPayload, anthropicFromChat, responsesToNonStream, markSessionInvalidated, wasRecentlyInvalidated, singleFlight, sessionRemainingMs, INVALIDATION_WINDOW_MS, SESSION_REUSE_SAFE_MS, SESSION_VERIFY_WINDOW_MS, executeChat, readCallUsage, accountLabel, summarizeAccountHealth, logCall, callLogSnapshot, readUsageFull, recordRequest, blankUsageTotals, recordAccountObservation, configureUsagePersistence, restoreUsageSnapshot, usageSnapshot, setTestEgressReject: (fn) => { onEgressReject = fn; }, egressRejectedResponse: typeof egressRejectedResponse === "function" ? egressRejectedResponse : null, MODEL_TIERS, handleModels };\n';
 
 // 可编程 fetch mock：测试里可替换 sandbox.fetch，返回可定制的 Response 形状
 // （worker 里用的是 { status, ok, headers, text() } 简化形状）。
@@ -30,7 +33,7 @@ sandbox.globalThis = sandbox;
 vm.createContext(sandbox);
 vm.runInContext(wrapper, sandbox);
 
-const { normalizeChatThinking, anthropicThinkingToEffort, namedEffort, normalizeReasoningEffort, collectReasoningTexts, anthropicStopReason, anthropicModelToOpenAI, parseModelAliases, resolveModelAlias, resolveModelConfig, findModelConfig, setTestAliases, setTestDynamicModels, setTestModelAvailability, cooldown, cooldownInfo, inCooldown, parseCooldown, nextPacificMidnight, pickToken, releaseToken, accountPoolExhaustion, waitingRoomResponse, pipeUpstreamToClient, pipeUpstreamToResponsesStream, anthropicStream, streamToNonStream, buildUpstreamPayload, anthropicFromChat, responsesToNonStream, markSessionInvalidated, wasRecentlyInvalidated, singleFlight, sessionRemainingMs, INVALIDATION_WINDOW_MS, SESSION_REUSE_SAFE_MS, SESSION_VERIFY_WINDOW_MS, executeChat, readCallUsage, accountLabel, summarizeAccountHealth, logCall, callLogSnapshot, readUsageFull, recordRequest, blankUsageTotals, recordAccountObservation, configureUsagePersistence, restoreUsageSnapshot, usageSnapshot, setTestEgressReject, egressRejectedResponse, MODEL_TIERS, handleModels } = sandbox.__unitTestApi__;
+const { normalizeChatThinking, anthropicThinkingToEffort, namedEffort, normalizeReasoningEffort, collectReasoningTexts, anthropicStopReason, anthropicModelToOpenAI, parseModelAliases, resolveModelAlias, resolveModelConfig, findModelConfig, refreshDynamicModelsIfStale, modelIsAvailable, setTestAliases, setTestDynamicModels, setTestModelAvailability, resetTestModelRefreshFlight, cooldown, cooldownInfo, inCooldown, parseCooldown, nextPacificMidnight, pickToken, releaseToken, accountPoolExhaustion, waitingRoomResponse, pipeUpstreamToClient, pipeUpstreamToResponsesStream, anthropicStream, streamToNonStream, buildUpstreamPayload, anthropicFromChat, responsesToNonStream, markSessionInvalidated, wasRecentlyInvalidated, singleFlight, sessionRemainingMs, INVALIDATION_WINDOW_MS, SESSION_REUSE_SAFE_MS, SESSION_VERIFY_WINDOW_MS, executeChat, readCallUsage, accountLabel, summarizeAccountHealth, logCall, callLogSnapshot, readUsageFull, recordRequest, blankUsageTotals, recordAccountObservation, configureUsagePersistence, restoreUsageSnapshot, usageSnapshot, setTestEgressReject, egressRejectedResponse, MODEL_TIERS, handleModels } = sandbox.__unitTestApi__;
 const workerDefault = sandbox.__workerDefault__;
 
 let pass = 0, fail = 0;
@@ -998,8 +1001,256 @@ await tAsync('进程冷启动直接调用 Ox 时也先检查 endpoints，不漏�
   }
 });
 
-await tAsync('模型刷新单飞且原子发布，并发目录与调用不会看到未检查的 Ox', async () => {
+await tAsync('Ox 旧快照过期后直接调用也要刷新 endpoints', async () => {
+  setTestDynamicModels([
+    { id: 'stealth/ox-alpha', session: 'stealth/ox-alpha', agent: 'base2-free-ox-alpha' },
+  ], 0);
+  setTestModelAvailability('stealth/ox-alpha', true);
+  installModelRefreshFetch(() => modelRefreshResponse(200, {
+    data: { id: 'stealth/ox-alpha', endpoints: [] },
+  }));
+
+  const resolved = await resolveModelConfig('stealth/ox-alpha');
+  const endpointWasCalled = fetchState.calls.some((call) =>
+    call.url.includes('/models/stealth/ox-alpha/endpoints'));
+
   setTestDynamicModels(null);
+  fetchState.impl = null;
+  fetchState.calls = [];
+
+  if (!endpointWasCalled) throw new Error('过期 Ox 快照被直接命中，未重新检查 endpoints');
+  if (resolved !== null) throw new Error('过期刷新已确认无 endpoints，Ox 仍可进入调用入口');
+});
+
+await tAsync('首次发现 Ox 但 endpoints 无法确认时保持下架', async () => {
+  setTestDynamicModels(null);
+  installModelRefreshFetch(() => modelRefreshResponse(503, {
+    error: { message: 'endpoint service unavailable' },
+  }));
+
+  const body = await (await requestModelRefresh()).json();
+  const resolved = await resolveModelConfig('stealth/ox-alpha');
+
+  setTestDynamicModels(null);
+  fetchState.impl = null;
+  fetchState.calls = [];
+
+  if (body.data.some((model) => model.id === 'stealth/ox-alpha')) {
+    throw new Error('没有上次可用状态且 endpoint 检查失败时 Ox 被默认上架');
+  }
+  if (resolved !== null) throw new Error('未经 endpoint 确认的新 Ox 可进入调用入口');
+});
+
+await tAsync('冷启动 endpoint 瞬时失败后普通调用只重试 endpoint 并自动恢复', async () => {
+  setTestDynamicModels(null);
+  let endpointCalls = 0;
+  let sourceCalls = 0;
+  installModelRefreshFetch(() => {
+    endpointCalls++;
+    return endpointCalls === 1
+      ? modelRefreshResponse(503, { error: { message: 'temporary endpoint outage' } })
+      : modelRefreshResponse(200, { data: { id: 'stealth/ox-alpha', endpoints: [{ name: 'restored' }] } });
+  });
+  const originalImpl = fetchState.impl;
+  fetchState.impl = (url, init) => {
+    if (String(url).includes('free-agents.ts')
+      || String(url).includes('freebuff-models.ts')
+      || String(url).includes('freebuff-model-ids.ts')) sourceCalls++;
+    return originalImpl(url, init);
+  };
+
+  try {
+    if (await resolveModelConfig('stealth/ox-alpha') !== null) {
+      throw new Error('冷启动首次 endpoint 瞬时失败时 Ox 不应立即放行');
+    }
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    const resolved = await resolveModelConfig('stealth/ox-alpha');
+    if (!resolved) throw new Error('endpoint 恢复后普通调用没有自动重新探测并恢复 Ox');
+    if (endpointCalls !== 2) throw new Error(`endpoint 重试次数错误: ${endpointCalls}`);
+    if (sourceCalls !== 3) throw new Error(`短重试不应重拉模型源，实际 source=${sourceCalls}`);
+    const body = await (await handleModels()).json();
+    if (!body.data.some((model) => model.id === 'stealth/ox-alpha')) {
+      throw new Error('endpoint 恢复后模型目录没有重新展示 Ox');
+    }
+  } finally {
+    setTestDynamicModels(null);
+    resetTestModelRefreshFlight();
+    fetchState.impl = null;
+    fetchState.calls = [];
+  }
+});
+
+await tAsync('已知可用 Ox 的 endpoint 瞬时失败保留旧状态并只重试 endpoint', async () => {
+  setTestDynamicModels([
+    { id: 'stealth/ox-alpha', session: 'stealth/ox-alpha', agent: 'base2-free-ox-alpha' },
+  ], 0);
+  setTestModelAvailability('stealth/ox-alpha', true);
+  let endpointCalls = 0;
+  let sourceCalls = 0;
+  installModelRefreshFetch(() => {
+    endpointCalls++;
+    return endpointCalls === 1
+      ? modelRefreshResponse(503, { error: { message: 'temporary endpoint outage' } })
+      : modelRefreshResponse(200, { data: { id: 'stealth/ox-alpha', endpoints: [{ name: 'restored' }] } });
+  });
+  const originalImpl = fetchState.impl;
+  fetchState.impl = (url, init) => {
+    if (String(url).includes('free-agents.ts')
+      || String(url).includes('freebuff-models.ts')
+      || String(url).includes('freebuff-model-ids.ts')) sourceCalls++;
+    return originalImpl(url, init);
+  };
+
+  try {
+    await refreshDynamicModelsIfStale(true);
+    const first = await resolveModelConfig('stealth/ox-alpha');
+    if (!first) throw new Error('endpoint 瞬时失败不应撤下上次已确认可用的 Ox');
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    const resolved = await resolveModelConfig('stealth/ox-alpha');
+    if (!resolved) throw new Error('endpoint 恢复后没有恢复 Ox 调用');
+    if (endpointCalls !== 2) throw new Error(`endpoint 应只重试一次，实际 ${endpointCalls}`);
+    if (sourceCalls !== 3) throw new Error(`endpoint 重试不应重拉模型源，实际 source=${sourceCalls}`);
+  } finally {
+    setTestDynamicModels(null);
+    resetTestModelRefreshFlight();
+    fetchState.impl = null;
+    fetchState.calls = [];
+  }
+});
+
+await tAsync('普通 Ox endpoint 重试与 Master 全量刷新共享同一探测请求', async () => {
+  setTestDynamicModels([
+    { id: 'stealth/ox-alpha', session: 'stealth/ox-alpha', agent: 'base2-free-ox-alpha' },
+  ], 0);
+  setTestModelAvailability('stealth/ox-alpha', true);
+  let endpointCalls = 0;
+  let releasePending;
+  let markEndpointStarted;
+  const endpointStarted = new Promise((resolve) => { markEndpointStarted = resolve; });
+  installModelRefreshFetch(() => {
+    endpointCalls++;
+    if (endpointCalls === 1) {
+      return modelRefreshResponse(503, { error: { message: 'temporary endpoint outage' } });
+    }
+    markEndpointStarted();
+    return new Promise((resolve) => {
+      releasePending = () => resolve(modelRefreshResponse(200, {
+        data: { id: 'stealth/ox-alpha', endpoints: [{ name: 'shared' }] },
+      }));
+    });
+  });
+
+  try {
+    await refreshDynamicModelsIfStale(true);
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    const direct = resolveModelConfig('stealth/ox-alpha');
+    await endpointStarted;
+    const forced = requestModelRefresh();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    releasePending();
+    const [resolved, response] = await Promise.all([direct, forced]);
+    await response.json();
+    if (!resolved) throw new Error('共享 endpoint 探测完成后 Ox 没有恢复');
+    if (endpointCalls !== 2) throw new Error(`普通重试与强刷重复探测 endpoint: ${endpointCalls}`);
+  } finally {
+    setTestDynamicModels(null);
+    resetTestModelRefreshFlight();
+    fetchState.impl = null;
+    fetchState.calls = [];
+  }
+});
+
+await tAsync('模型源响应体卡住时刷新按超时回落旧快照', async () => {
+  setTestDynamicModels([
+    { id: 'legacy/stale-model', session: 'legacy/stale-model', agent: 'legacy-agent' },
+  ], Date.now());
+  fetchState.calls = [];
+  const hangingBody = (signal) => new Promise((_, reject) => {
+    const abort = () => reject(new Error('aborted'));
+    if (signal?.aborted) abort();
+    else signal?.addEventListener?.('abort', abort, { once: true });
+  });
+  fetchState.impl = (url, init = {}) => {
+    const value = String(url);
+    if (value.includes('raw.githubusercontent.com')
+      || value.includes('cdn.jsdelivr.net')
+      || value.includes('freebuff-models.json')) {
+      return {
+        status: 200,
+        ok: true,
+        headers: {},
+        text: () => hangingBody(init.signal),
+        json: () => hangingBody(init.signal),
+      };
+    }
+    return modelRefreshResponse(404, { error: { message: 'not found' } });
+  };
+
+  try {
+    const outcome = await Promise.race([
+      refreshDynamicModelsIfStale(true).then(() => 'settled'),
+      new Promise((resolve) => setTimeout(() => resolve('timeout'), 500)),
+    ]);
+    resetTestModelRefreshFlight();
+    if (outcome === 'timeout') throw new Error('响应体卡住时刷新单飞未按超时结束');
+    const body = await (await handleModels()).json();
+    if (!body.data.some((model) => model.id === 'legacy/stale-model')) {
+      throw new Error('刷新超时后没有保留旧模型目录');
+    }
+  } finally {
+    setTestDynamicModels(null);
+    resetTestModelRefreshFlight();
+    fetchState.impl = null;
+    fetchState.calls = [];
+  }
+});
+
+await tAsync('冷启动刷新进行中时普通模型目录等待完整首个快照', async () => {
+  setTestDynamicModels(null);
+  let markEndpointStarted;
+  let releaseEndpoint;
+  const endpointStarted = new Promise((resolve) => { markEndpointStarted = resolve; });
+  installModelRefreshFetch(() => {
+    markEndpointStarted();
+    return new Promise((resolve) => {
+      releaseEndpoint = () => modelRefreshResponse(200, {
+        data: { id: 'stealth/ox-alpha', endpoints: [{ name: 'available' }] },
+      }).then(resolve);
+    });
+  });
+
+  const forcedRefresh = requestModelRefresh().then((response) => response.json());
+  await endpointStarted;
+  let regularSettled = false;
+  const regularRequest = requestModels().then(async (response) => {
+    const body = await response.json();
+    regularSettled = true;
+    return body;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const returnedIncompleteCatalog = regularSettled;
+
+  releaseEndpoint();
+  const [forcedBody, regularBody] = await Promise.all([forcedRefresh, regularRequest]);
+
+  setTestDynamicModels(null);
+  fetchState.impl = null;
+  fetchState.calls = [];
+
+  if (returnedIncompleteCatalog) throw new Error('冷启动并发目录提前返回了硬编码残缺列表');
+  for (const body of [forcedBody, regularBody]) {
+    if (!body.data.some((model) => model.id === 'stealth/ox-alpha')) {
+      throw new Error('首轮刷新完成后并发目录没有拿到完整模型快照');
+    }
+  }
+});
+
+await tAsync('模型刷新单飞且原子发布，无关请求读旧快照、Ox 等待检查', async () => {
+  setTestDynamicModels([
+    { id: 'legacy/old-model', session: 'legacy/old-model', agent: 'legacy-agent' },
+    { id: 'stealth/ox-alpha', session: 'stealth/ox-alpha', agent: 'base2-free-ox-alpha' },
+  ]);
+  setTestModelAvailability('stealth/ox-alpha', true);
   let markEndpointStarted;
   let releaseEndpoint;
   const endpointStarted = new Promise((resolve) => { markEndpointStarted = resolve; });
@@ -1016,22 +1267,28 @@ await tAsync('模型刷新单飞且原子发布，并发目录与调用不会看
   await endpointStarted;
 
   let regularSettled = false;
-  let resolveSettled = false;
+  let staticSettled = false;
+  let oxSettled = false;
   const regularRequest = requestModels().then(async (response) => {
     const body = await response.json();
     regularSettled = true;
     return body;
   });
-  const modelResolution = resolveModelConfig('stealth/ox-alpha').then((model) => {
-    resolveSettled = true;
+  const staticResolution = resolveModelConfig('mimo/mimo-v2.5').then((model) => {
+    staticSettled = true;
+    return model;
+  });
+  const oxResolution = resolveModelConfig('stealth/ox-alpha').then((model) => {
+    oxSettled = true;
     return model;
   });
   await new Promise((resolve) => setTimeout(resolve, 0));
-  const leakedBeforeProbe = regularSettled || resolveSettled;
+  const blockedUnrelated = !regularSettled || !staticSettled;
+  const leakedOxBeforeProbe = oxSettled;
 
   releaseEndpoint();
-  const [forcedBody, regularBody, resolvedModel] = await Promise.all([
-    forcedRefresh, regularRequest, modelResolution,
+  const [forcedBody, regularBody, staticModel, resolvedOx] = await Promise.all([
+    forcedRefresh, regularRequest, staticResolution, oxResolution,
   ]);
   const sourceFetches = fetchState.calls.filter((call) =>
     call.url.includes('free-agents.ts') || call.url.includes('freebuff-models.ts')
@@ -1043,16 +1300,63 @@ await tAsync('模型刷新单飞且原子发布，并发目录与调用不会看
   fetchState.impl = null;
   fetchState.calls = [];
 
-  if (leakedBeforeProbe) throw new Error('endpoint 检查完成前并发请求看到了半成品模型缓存');
+  if (blockedUnrelated) throw new Error('手动刷新阻塞了与 endpoint 检查无关的静态目录/模型调用');
+  if (leakedOxBeforeProbe) throw new Error('endpoint 检查完成前 Ox 调用看到了半成品模型缓存');
   if (sourceFetches.length !== 3 || endpointFetches.length !== 1) {
     throw new Error(`并发刷新没有复用同一轮请求: source=${sourceFetches.length}, endpoint=${endpointFetches.length}`);
   }
-  for (const body of [forcedBody, regularBody]) {
-    if (body.data.some((model) => model.id === 'stealth/ox-alpha')) {
-      throw new Error('并发目录请求仍返回无 endpoints 的 Ox');
-    }
+  // 旧快照里 Ox 上次已确认可用，普通目录请求可以继续读该原子快照；
+  // 强刷完成后再整批切换到无 Ox 的新快照。
+  if (!regularBody.data.some((model) => model.id === 'stealth/ox-alpha')) {
+    throw new Error('刷新中的普通目录请求没有立即返回上次已发布的 Ox 快照');
   }
-  if (resolvedModel !== null) throw new Error('并发调用仍解析到无 endpoints 的 Ox');
+  if (!regularBody.data.some((model) => model.id === 'legacy/old-model')) {
+    throw new Error('刷新中的普通目录请求没有读取上次已发布的模型目录');
+  }
+  if (!staticModel || staticModel.id !== 'mimo/mimo-v2.5') {
+    throw new Error('刷新期间静态模型调用没有立即命中旧快照');
+  }
+  if (forcedBody.data.some((model) => model.id === 'stealth/ox-alpha')) {
+    throw new Error('强刷完成后仍返回无 endpoints 的 Ox');
+  }
+  if (resolvedOx !== null) throw new Error('并发 Ox 调用仍解析到无 endpoints 的 Ox');
+});
+
+await tAsync('刷新中的旧目录快照绑定旧 availability，不混用新发布状态', async () => {
+  setTestDynamicModels([
+    { id: 'stealth/ox-alpha', session: 'stealth/ox-alpha', agent: 'base2-free-ox-alpha' },
+  ]);
+  setTestModelAvailability('stealth/ox-alpha', true);
+  let markEndpointStarted;
+  let releaseEndpoint;
+  const endpointStarted = new Promise((resolve) => { markEndpointStarted = resolve; });
+  installModelRefreshFetch(() => {
+    markEndpointStarted();
+    return new Promise((resolve) => {
+      releaseEndpoint = () => modelRefreshResponse(200, {
+        data: { id: 'stealth/ox-alpha', endpoints: [] },
+      }).then(resolve);
+    });
+  });
+
+  const forcedRefresh = refreshDynamicModelsIfStale(true);
+  await endpointStarted;
+  const oldSnapshot = await refreshDynamicModelsIfStale();
+  releaseEndpoint();
+  await forcedRefresh;
+
+  const oldOxAvailable = modelIsAvailable('stealth/ox-alpha', oldSnapshot.availability);
+  const newOxAvailable = modelIsAvailable('stealth/ox-alpha');
+
+  setTestDynamicModels(null);
+  fetchState.impl = null;
+  fetchState.calls = [];
+
+  if (!(oldSnapshot.availability instanceof Map)) {
+    throw new Error('模型刷新结果没有携带与 cache 同版本的 availability 快照');
+  }
+  if (!oldOxAvailable) throw new Error('旧目录快照混用了新发布的 Ox availability');
+  if (newOxAvailable) throw new Error('新快照没有发布 Ox 下架状态');
 });
 
 await tAsync('官方源码失败改走 Release 兜底时仍检查 Ox endpoints', async () => {
@@ -1109,6 +1413,62 @@ await tAsync('手动刷新全源失败时保留旧目录并明确标记未更新
   }
 });
 
+await tAsync('目录全源失败时连 Ox 可用性状态也完整保留', async () => {
+  setTestDynamicModels([
+    { id: 'stealth/ox-alpha', session: 'stealth/ox-alpha', agent: 'base2-free-ox-alpha' },
+  ]);
+  setTestModelAvailability('stealth/ox-alpha', true);
+  fetchState.calls = [];
+  fetchState.impl = (url) => {
+    const value = String(url);
+    if (value.includes('/models/stealth/ox-alpha/endpoints')) {
+      return modelRefreshResponse(200, { data: { id: 'stealth/ox-alpha', endpoints: [] } });
+    }
+    return modelRefreshResponse(503, { error: { message: 'source unavailable' } });
+  };
+
+  const body = await (await requestModelRefresh()).json();
+  const endpointWasCalled = fetchState.calls.some((call) =>
+    call.url.includes('/models/stealth/ox-alpha/endpoints'));
+
+  setTestDynamicModels(null);
+  fetchState.impl = null;
+  fetchState.calls = [];
+
+  if (endpointWasCalled) throw new Error('目录源全失败时不应单独改写 endpoint availability');
+  if (body.refresh?.updated !== false || body.refresh?.source !== 'cache') {
+    throw new Error('目录全失败没有标记为旧快照: ' + JSON.stringify(body.refresh));
+  }
+  if (!body.data.some((model) => model.id === 'stealth/ox-alpha')) {
+    throw new Error('目录全失败时旧快照里的可用 Ox 被部分更新撤下');
+  }
+});
+
+await tAsync('分享 Key 携带 refresh=1 也不能绕过新鲜缓存强刷', async () => {
+  setTestDynamicModels([
+    { id: 'legacy/cached-model', session: 'legacy/cached-model', agent: 'legacy-agent' },
+  ]);
+  fetchState.calls = [];
+  fetchState.impl = () => modelRefreshResponse(500, { error: { message: '不应发起网络请求' } });
+
+  const response = await requestModelRefresh('shared-key', {
+    FREEBUFF_API_KEY: 'owner-key',
+    FREEBUFF_API_KEYS: [{ key: 'shared-key', name: 'friend', models: [] }],
+  });
+  const body = await response.json();
+  const calls = fetchState.calls.length;
+
+  setTestDynamicModels(null);
+  fetchState.impl = null;
+  fetchState.calls = [];
+
+  if (calls !== 0) throw new Error(`分享 Key 触发了远端强刷: ${calls} 次请求`);
+  if ('refresh' in body) throw new Error('分享 Key 响应不应伪装成 Master Key 强刷结果');
+  if (!body.data.some((model) => model.id === 'legacy/cached-model')) {
+    throw new Error('分享 Key 没有使用新鲜缓存目录');
+  }
+});
+
 await tAsync('Ox 可用性检查失败时保留上次可用状态', async () => {
   setTestDynamicModels([
     { id: 'stealth/ox-alpha', session: 'stealth/ox-alpha', agent: 'base2-free-ox-alpha' },
@@ -1146,6 +1506,28 @@ await tAsync('Ox endpoints 恢复后重新进入模型目录', async () => {
   fetchState.calls = [];
 });
 
+await tAsync('Ox endpoints 返回 404 时从模型目录和调用入口撤下', async () => {
+  setTestDynamicModels([
+    { id: 'stealth/ox-alpha', session: 'stealth/ox-alpha', agent: 'base2-free-ox-alpha' },
+  ]);
+  setTestModelAvailability('stealth/ox-alpha', true);
+  installModelRefreshFetch(() => modelRefreshResponse(404, {
+    error: { message: 'model not found' },
+  }));
+
+  const body = await (await requestModelRefresh()).json();
+  const resolved = await resolveModelConfig('stealth/ox-alpha');
+
+  setTestDynamicModels(null);
+  fetchState.impl = null;
+  fetchState.calls = [];
+
+  if (body.data.some((model) => model.id === 'stealth/ox-alpha')) {
+    throw new Error('endpoint 404 后 Ox 仍留在模型目录');
+  }
+  if (resolved !== null) throw new Error('endpoint 404 后 Ox 仍可进入调用入口');
+});
+
 // stealth/ox-alpha 已开放（官方 2026-08-24 放进 CLI/Desktop 目录并清空
 // FREEBUFF_SERVICE_ONLY_MODEL_IDS，d534205ad39d）。动态源返回时必须正常出目录、
 // 可解析；effort 走官方 ladder ['low','high','max'] 的 clamp-down——点名 max
@@ -1157,6 +1539,7 @@ await tAsync('已开放的 ox-alpha 出现在目录、可经 ID 与短名调用�
       root_agent: 'base2-free-ox-alpha', upstream: 'stealth/ox-alpha',
     },
   ]);
+  setTestModelAvailability('stealth/ox-alpha', true);
   const body = await (await handleModels()).json();
   if (!body.data.some((model) => model.id === 'stealth/ox-alpha')) {
     throw new Error('开放的 ox-alpha 必须出现在 /v1/models');

@@ -62,6 +62,8 @@ const MODEL_ENDPOINTS_API = "https://openrouter.ai/api/v1/models";
 const ENDPOINT_CHECK_MODEL_IDS = new Set(["stealth/ox-alpha"]);
 // 刷新间隔：与 Quorinex 对齐，6 小时。失败时回退到硬编码 MODELS。
 const DYNAMIC_MODELS_REFRESH_MS = 6 * 60 * 60 * 1000;
+// endpoint 首次无法确认时保持下架，但不要跟着目录缓存冻结 6 小时。
+const DYNAMIC_MODEL_ENDPOINT_RETRY_MS = 60 * 1000;
 const DYNAMIC_MODELS_FETCH_TIMEOUT_MS = 10000;
 
 // 运行时动态模型缓存（内存，无 KV）
@@ -71,8 +73,9 @@ let dynamicModelsCache = {
   pool: null, // { premium: Set, standard: Set, glm: Set }
 };
 let dynamicModelsRefreshFlight = null;
-// 公开 provider 端点状态。只有明确拿到 endpoints: [] 才标记不可用；网络错误沿用
-// 上次结果，避免一次 OpenRouter 抖动把仍可用的模型从目录误删。
+const dynamicEndpointRefreshFlights = new Map();
+// 公开 provider 端点状态。endpoints: [] / 404 标记不可用；网络错误沿用上次
+// 结果。冷启动尚无可信状态时 fail closed，避免把未经确认的模型漏进目录。
 let dynamicModelAvailability = new Map(); // modelId -> { available, checkedAt }
 
 // 解析 freebuff-models.ts 的模型 ID 常量
@@ -252,17 +255,89 @@ async function fetchSourceList(urls) {
     try {
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), DYNAMIC_MODELS_FETCH_TIMEOUT_MS);
-      const resp = await fetch(url, { signal: ctrl.signal });
-      clearTimeout(timer);
-      if (resp.ok) {
-        const text = await resp.text();
-        // 阈值放宽：freebuff-model-ids.ts 只有 ~491B（3 个常量），
-        // 500 阈值会误杀。只过滤真正的空文件（<100B）。
-        if (text && text.length > 100) return text;
+      let timeoutReject;
+      const timeout = new Promise((_, reject) => {
+        timeoutReject = reject;
+      });
+      const timeoutError = () => {
+        ctrl.abort();
+        timeoutReject(new Error("model source timeout"));
+      };
+      const timeoutTimer = setTimeout(timeoutError, DYNAMIC_MODELS_FETCH_TIMEOUT_MS);
+      try {
+        const resp = await Promise.race([fetch(url, { signal: ctrl.signal }), timeout]);
+        if (resp.ok) {
+          const text = await Promise.race([resp.text(), timeout]);
+          // 阈值放宽：freebuff-model-ids.ts 只有 ~491B（3 个常量），
+          // 500 阈值会误杀。只过滤真正的空文件（<100B）。
+          if (text && text.length > 100) return text;
+        }
+      } finally {
+        // 响应头到了不代表 body 已读完；超时必须覆盖 text()。
+        clearTimeout(timer);
+        clearTimeout(timeoutTimer);
       }
     } catch {}
   }
   return null;
+}
+
+async function probeEndpointAvailability(modelId) {
+  const id = String(modelId || "");
+  const existing = dynamicEndpointRefreshFlights.get(id);
+  if (existing) return existing;
+  const flight = (async () => {
+    const attemptedAt = Date.now();
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), DYNAMIC_MODELS_FETCH_TIMEOUT_MS);
+      let timeoutReject;
+      const timeout = new Promise((_, reject) => {
+        timeoutReject = reject;
+      });
+      const timeoutError = () => {
+        ctrl.abort();
+        timeoutReject(new Error("endpoint timeout"));
+      };
+      const timeoutTimer = setTimeout(timeoutError, DYNAMIC_MODELS_FETCH_TIMEOUT_MS);
+      try {
+        const resp = await Promise.race([fetch(`${MODEL_ENDPOINTS_API}/${id}/endpoints`, {
+          signal: ctrl.signal,
+          headers: { Accept: "application/json" },
+        }), timeout]);
+        // OpenRouter 明确返回 404 表示该模型没有 endpoint；这不是瞬时网络
+        // 故障，应立即撤下。429/5xx/超时等仍沿用上次状态，避免抖动误删。
+        if (resp.status === 404) {
+          return { available: false, checkedAt: attemptedAt, lastAttemptAt: attemptedAt, retryAt: 0 };
+        }
+        if (!resp.ok) throw new Error(`endpoint status ${resp.status}`);
+        const body = await Promise.race([resp.json(), timeout]);
+        if (!Array.isArray(body?.data?.endpoints)) throw new Error("invalid endpoint response");
+        return {
+          available: body.data.endpoints.length > 0,
+          checkedAt: attemptedAt,
+          lastAttemptAt: attemptedAt,
+          retryAt: 0,
+        };
+      } finally {
+        // 同样覆盖 json()，避免单飞卡在只返回响应头的连接上。
+        clearTimeout(timer);
+        clearTimeout(timeoutTimer);
+      }
+    } catch {
+      return {
+        available: null,
+        lastAttemptAt: attemptedAt,
+        retryAt: attemptedAt + DYNAMIC_MODEL_ENDPOINT_RETRY_MS,
+      };
+    }
+  })();
+  dynamicEndpointRefreshFlights.set(id, flight);
+  try {
+    return await flight;
+  } finally {
+    if (dynamicEndpointRefreshFlights.get(id) === flight) dynamicEndpointRefreshFlights.delete(id);
+  }
 }
 
 async function refreshEndpointAvailability(models, previous = dynamicModelAvailability) {
@@ -270,32 +345,66 @@ async function refreshEndpointAvailability(models, previous = dynamicModelAvaila
   const ids = new Set((Array.isArray(models) ? models : []).map((model) => model?.id));
   for (const modelId of ENDPOINT_CHECK_MODEL_IDS) {
     if (!ids.has(modelId)) continue;
-    try {
-      const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), DYNAMIC_MODELS_FETCH_TIMEOUT_MS);
-      let resp;
-      try {
-        resp = await fetch(`${MODEL_ENDPOINTS_API}/${modelId}/endpoints`, {
-          signal: ctrl.signal,
-          headers: { Accept: "application/json" },
-        });
-      } finally {
-        clearTimeout(timer);
-      }
-      if (!resp.ok) continue;
-      const body = await resp.json();
-      if (!Array.isArray(body?.data?.endpoints)) continue;
+    const prior = next.get(modelId);
+    const result = await probeEndpointAvailability(modelId);
+    if (typeof result?.available === "boolean") {
+      next.set(modelId, result);
+    } else {
+      // 瞬时失败沿用调用方自己的明确状态，但安排短重试；冷启动未知状态继续 fail closed。
       next.set(modelId, {
-        available: body.data.endpoints.length > 0,
-        checkedAt: Date.now(),
+        ...(prior || { available: null, checkedAt: 0 }),
+        lastAttemptAt: result.lastAttemptAt,
+        retryAt: result.retryAt,
       });
-    } catch {}
+    }
   }
   return next;
 }
 
-function modelIsAvailable(modelId) {
-  return dynamicModelAvailability.get(String(modelId || ""))?.available !== false;
+function modelIsAvailable(modelId, availability = dynamicModelAvailability) {
+  const id = String(modelId || "");
+  const state = availability?.get(id);
+  // 只有列入 endpoint 检查的模型需要显式确认；首次检查失败时不能把“未知”
+  // 当成可用。普通模型不依赖 OpenRouter 状态，仍默认放行。
+  return state ? state.available === true : !ENDPOINT_CHECK_MODEL_IDS.has(id);
+}
+
+function endpointAvailabilityNeedsRetry(modelId, now = Date.now()) {
+  const id = String(modelId || "");
+  if (!ENDPOINT_CHECK_MODEL_IDS.has(id)) return false;
+  // 冷启动需要先拉目录；已发布目录里没有这个模型时按正常 6 小时 TTL 等待。
+  if (!Array.isArray(dynamicModelsCache.models)) return true;
+  if (!dynamicModelsCache.models.some((model) => model?.id === id)) return false;
+  const state = dynamicModelAvailability.get(id);
+  if (Number.isFinite(Number(state?.retryAt)) && Number(state.retryAt) > 0) {
+    return now >= Number(state.retryAt);
+  }
+  if (typeof state?.available === "boolean") return false;
+  const checkedAt = Number(state?.checkedAt) || 0;
+  return now - checkedAt >= DYNAMIC_MODEL_ENDPOINT_RETRY_MS;
+}
+
+async function refreshEndpointModelAvailability(modelId) {
+  const id = String(modelId || "");
+  if (!ENDPOINT_CHECK_MODEL_IDS.has(id)) return dynamicModelsSnapshot();
+  const cacheAtStart = dynamicModelsCache;
+  const model = Array.isArray(cacheAtStart.models)
+    ? cacheAtStart.models.find((entry) => entry?.id === id)
+    : null;
+  if (!model) return dynamicModelsSnapshot();
+  const next = await refreshEndpointAvailability([model], dynamicModelAvailability);
+  // 若目录刷新已发布新快照，旧 probe 不能把新 generation 的状态覆盖掉。
+  if (dynamicModelsCache === cacheAtStart) dynamicModelAvailability = next;
+  return dynamicModelsSnapshot(false, "endpoint");
+}
+
+function dynamicModelsSnapshot(refreshed = false, source = "cache") {
+  return {
+    cache: dynamicModelsCache,
+    availability: dynamicModelAvailability,
+    refreshed,
+    source,
+  };
 }
 
 async function performDynamicModelsRefresh() {
@@ -354,20 +463,30 @@ async function performDynamicModelsRefresh() {
     // 保留旧缓存
   }
 
+  // 目录源全失败时必须完整保留旧快照，不能只更新 availability 后却宣称
+  // “使用缓存”。下一次成功拿到目录时再一起更新两份状态。
+  if (!refreshed) return dynamicModelsSnapshot();
+
   // 先完成 endpoint 检查，再在同一 tick 发布两份状态。并发请求不会看到
   // “新目录 + 旧/未知 availability” 的半成品。
   const nextAvailability = await refreshEndpointAvailability(nextCache.models, dynamicModelAvailability);
   dynamicModelAvailability = nextAvailability;
   dynamicModelsCache = nextCache;
-  return { cache: dynamicModelsCache, refreshed, source };
+  return dynamicModelsSnapshot(refreshed, source);
 }
 
 async function refreshDynamicModelsIfStale(force = false) {
-  // 强刷进行中时，普通目录请求也等待同一轮；必须早于 fresh-cache 判断。
-  if (dynamicModelsRefreshFlight) return dynamicModelsRefreshFlight;
+  // 强刷调用等待同一轮；普通目录请求继续读取已发布的旧快照，避免公开源
+  // 抖动时把所有模型列表/静态模型调用一起阻塞数十秒。
+  if (dynamicModelsRefreshFlight) {
+    // 冷启动还没有可发布快照时不能回硬编码残缺目录；等待首轮刷新。已有旧
+    // 快照时则立即返回 cache + availability 的同版本组合。
+    if (force || !Array.isArray(dynamicModelsCache.models)) return dynamicModelsRefreshFlight;
+    return dynamicModelsSnapshot();
+  }
   const now = Date.now();
   if (!force && dynamicModelsCache.models && now - dynamicModelsCache.fetchedAt < DYNAMIC_MODELS_REFRESH_MS) {
-    return { cache: dynamicModelsCache, refreshed: false, source: "cache" };
+    return dynamicModelsSnapshot();
   }
   const flight = performDynamicModelsRefresh();
   dynamicModelsRefreshFlight = flight;
@@ -384,22 +503,35 @@ async function tryReleaseFallback() {
     try {
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), DYNAMIC_MODELS_FETCH_TIMEOUT_MS);
-      const resp = await fetch(url, { signal: ctrl.signal });
-      clearTimeout(timer);
-      if (resp.ok) {
-        const json = await resp.json();
-        if (json && Array.isArray(json.models) && json.models.length > 0) {
-          const pool = {
-            premium: new Set(json.pools?.premium ?? []),
-            standard: null,
-            glm: new Set(json.pools?.glm ?? []),
-          };
-          return {
-            fetchedAt: Date.now(),
-            models: annotateDynamicModelPools(json.models, pool),
-            pool,
-          };
+      let timeoutReject;
+      const timeout = new Promise((_, reject) => {
+        timeoutReject = reject;
+      });
+      const timeoutError = () => {
+        ctrl.abort();
+        timeoutReject(new Error("release model source timeout"));
+      };
+      const timeoutTimer = setTimeout(timeoutError, DYNAMIC_MODELS_FETCH_TIMEOUT_MS);
+      try {
+        const resp = await Promise.race([fetch(url, { signal: ctrl.signal }), timeout]);
+        if (resp.ok) {
+          const json = await Promise.race([resp.json(), timeout]);
+          if (json && Array.isArray(json.models) && json.models.length > 0) {
+            const pool = {
+              premium: new Set(json.pools?.premium ?? []),
+              standard: null,
+              glm: new Set(json.pools?.glm ?? []),
+            };
+            return {
+              fetchedAt: Date.now(),
+              models: annotateDynamicModelPools(json.models, pool),
+              pool,
+            };
+          }
         }
+      } finally {
+        clearTimeout(timer);
+        clearTimeout(timeoutTimer);
       }
     } catch {}
   }
@@ -407,8 +539,7 @@ async function tryReleaseFallback() {
 }
 
 // 动态 STANDARD = 动态表里不在 premium/glm 池的模型
-function dynamicStandardModels() {
-  const cache = dynamicModelsCache;
+function dynamicStandardModels(cache = dynamicModelsCache) {
   if (!cache || !cache.models || !cache.pool) return new Set();
   const premium = cache.pool.premium;
   const glm = cache.pool.glm;
@@ -438,16 +569,16 @@ function quotaRowForModel(quota, modelId) {
   return hit ? hit[1] : null;
 }
 
-function dynamicModelForId(modelId) {
+function dynamicModelForId(modelId, cache = dynamicModelsCache) {
   const id = String(modelId || "");
-  return Array.isArray(dynamicModelsCache.models)
-    ? dynamicModelsCache.models.find((model) => model?.id === id) || null
+  return Array.isArray(cache?.models)
+    ? cache.models.find((model) => model?.id === id) || null
     : null;
 }
 
 // 模型池分类查询：实时账号快照 > 动态模型元数据 > 动态池集合 > 静态兜底。
 // 未知 pool 返回 null，调用层按模型隔离，不能猜测为共享池。
-function modelPoolCategory(modelId, quota = null) {
+function modelPoolCategory(modelId, quota = null, cache = dynamicModelsCache) {
   const id = String(modelId || "").trim();
   if (!id || PAUSED_QUOTA_MODELS.has(id) || isHiddenModelId(id)) return null;
 
@@ -457,17 +588,17 @@ function modelPoolCategory(modelId, quota = null) {
     return KNOWN_QUOTA_POOLS.has(pool) ? pool : null;
   }
 
-  const dynamic = dynamicModelForId(id);
+  const dynamic = dynamicModelForId(id, cache);
   if (dynamic && String(dynamic.pool || "").trim()) {
     const pool = normalizePoolName(dynamic.pool);
     return KNOWN_QUOTA_POOLS.has(pool) ? pool : null;
   }
 
-  const dyn = dynamicModelsCache;
+  const dyn = cache;
   if (dyn && dyn.pool) {
     if (dyn.pool.premium?.has(id)) return "premium";
     if (dyn.pool.glm?.has(id)) return "glm";
-    if (dynamicStandardModels().has(id)) return "standard";
+    if (dynamicStandardModels(cache).has(id)) return "standard";
   }
   // 静态兼容兜底只在没有实时/动态 pool 时使用。
   if (DEEPSEEK_PRO_QUOTA_MODELS.has(id)) return "deepseek_pro";
@@ -3853,13 +3984,35 @@ function findModelConfig(modelId) {
 // 查找模型配置前确保动态注册表已加载。
 // 不能依赖 /v1/models 先被调用：Cloudflare 不保证两个请求落在同一 isolate。
 async function resolveModelConfig(modelId) {
+  const target = resolveModelAlias(modelId) || modelId;
+  if (PAUSED_QUOTA_MODELS.has(target) || isHiddenModelId(target)) return null;
+
+  // 受 endpoint 管理的模型必须在 TTL 到期后重新确认。普通模型仍可直接命中
+  // 已发布快照，不会被公开源刷新阻塞。
+  if (ENDPOINT_CHECK_MODEL_IDS.has(target)) {
+    try {
+      if (dynamicModelsRefreshFlight) await dynamicModelsRefreshFlight;
+      else {
+        const cacheStale = !Array.isArray(dynamicModelsCache.models)
+          || Date.now() - Number(dynamicModelsCache.fetchedAt || 0) >= DYNAMIC_MODELS_REFRESH_MS;
+        if (cacheStale) await refreshDynamicModelsIfStale();
+        if (endpointAvailabilityNeedsRetry(target)) await refreshEndpointModelAvailability(target);
+      }
+    } catch {}
+    return findModelConfig(target);
+  }
+
+  if (!modelIsAvailable(target)) return null;
+  let hit = findModelConfig(target);
+  // 已发布快照里的普通模型可直接用；快照里没有的模型等待当前刷新，才能
+  // 判断它是否刚被官方加入。
+  if (hit) return hit;
   if (dynamicModelsRefreshFlight) {
     try { await dynamicModelsRefreshFlight; } catch {}
+    if (!modelIsAvailable(target)) return null;
+    hit = findModelConfig(target);
+    if (hit) return hit;
   }
-  const target = resolveModelAlias(modelId) || modelId;
-  if (PAUSED_QUOTA_MODELS.has(target) || isHiddenModelId(target) || !modelIsAvailable(target)) return null;
-  let hit = findModelConfig(target);
-  if (hit) return hit;
   try {
     const { cache: dyn } = await refreshDynamicModelsIfStale();
     if (dyn && dyn.models) {
@@ -5446,7 +5599,7 @@ function cleanCache() {
 // 自定义别名不在此展示（面板单独管理），避免污染客户端模型列表。
 async function handleModels(client = null, { forceRefresh = false } = {}) {
   let modelList = MODELS;
-  let refreshResult = null;
+  let refreshResult = dynamicModelsSnapshot();
   try {
     refreshResult = await refreshDynamicModelsIfStale(forceRefresh);
     const dyn = refreshResult.cache;
@@ -5461,14 +5614,19 @@ async function handleModels(client = null, { forceRefresh = false } = {}) {
   }
   // 官方暂停模型可能残留在动态源/旧 Key 白名单中；它不能继续出现在正常
   // 模型目录，否则客户端会先选中再收到上游 409。
-  modelList = modelList.filter((m) => !PAUSED_QUOTA_MODELS.has(m.id) && !isHiddenModelId(m.id) && modelIsAvailable(m.id));
+  const snapshotCache = refreshResult.cache;
+  const snapshotAvailability = refreshResult.availability;
+  modelList = modelList.filter((m) =>
+    !PAUSED_QUOTA_MODELS.has(m.id)
+      && !isHiddenModelId(m.id)
+      && modelIsAvailable(m.id, snapshotAvailability));
   const data = modelList
     .map((m) => {
       // 实测（2026-08-15）：免费账号只有 Flash / MiMo 2.5 两个模型能建会话
       // （上游 409 session_model_mismatch / 403 free_mode_invalid_agent_model 拒绝其余模型）。
       // 分组键与排序都取自 MODEL_TIERS：免费 → US/SG → 限定 → 未分组。
       const declaredPool = safePoolName(m.pool);
-      const pool = declaredPool || modelPoolCategory(m.id) || "";
+      const pool = declaredPool || modelPoolCategory(m.id, null, snapshotCache) || "";
       const tier = modelCatalogTier(m.id, pool);
       const rank = tier ? MODEL_TIERS.findIndex(([key]) => key === tier) : -1;
       return {
