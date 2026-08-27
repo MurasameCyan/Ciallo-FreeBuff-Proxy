@@ -1659,9 +1659,24 @@ export const mihomo = {
   get providerName() { return PROVIDER_NAME; },
 };
 
+// keepAliveTimeout 用 undici 默认的 4000ms，别再写 10。
+// 那个 10 的单位是毫秒（不是秒），等于「空闲 10ms 就关连接」。undici 的规则是：
+// 上游给了 `Keep-Alive: timeout=N` 就用上游值，没给才落到这个选项
+// （node_modules/undici/lib/dispatcher/client-h1.js 的 onHeadersComplete）。
+// 实测上游是 Cloudflare，只发 `Connection: keep-alive`、不带 timeout=N，所以这个 10
+// 全程生效：每个上游调用都在重建 TCP + 到 codebuff 的 TLS。
+// 收益集中在冷路——建会话那条链在同一条 lane 上背靠背串 5~8 个调用（广告链、usage、
+// GET/POST session、agent-runs），间隔毫秒级，实测每个省约 79ms，合计 0.4~0.6s。
+// 热路（session 命中缓存，只剩 chat 一个调用）本来就吃不到，两次用户请求间隔远超任何
+// keep-alive 窗口。所以不必显式写 30s：默认 4000ms 已经吃满毫秒级间隔那部分，
+// 写更长只会把「命中对端已关的 socket」的窗口拉大。那个失败形状
+// （ECONNRESET / socket hang up）已被 isTransientUpstreamError 归为上游抖动、
+// 原地重试同号，不会白扣额度，但没必要主动扩大。
+// 换节点不依赖这个超时：每条切换路径都显式关掉旧 dispatcher（见 switchAccountNode
+// 的 closeInBackground(previous) 和 dropAccountLaneRuntime）。
 async function buildProxyFetch({ port = MIXED_PORT } = {}) {
   const { ProxyAgent } = await import('undici');
-  const agent = new ProxyAgent({ uri: `http://127.0.0.1:${port}`, keepAliveTimeout: 10 });
+  const agent = new ProxyAgent({ uri: `http://127.0.0.1:${port}` });
   return {
     fetch: (url, init = {}) => fetch(url, { ...init, dispatcher: agent }),
     close: () => agent.close(),

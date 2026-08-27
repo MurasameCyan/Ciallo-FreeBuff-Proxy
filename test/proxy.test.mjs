@@ -1883,6 +1883,21 @@ test('透明转发使用 pipeline 传播背压与客户端断流', () => {
   );
 });
 
+// 曾经写的是 keepAliveTimeout: 10 —— 单位是毫秒，等于「空闲 10ms 就关连接」。
+// 上游（Cloudflare）不发 `Keep-Alive: timeout=N`，所以它全程生效，建会话那条链上
+// 5~8 个背靠背调用每个都白重建一次 TCP+TLS（实测每个约 79ms）。
+// 这里只拦「亚秒级的值」：不写（用默认 4000ms）或写个合理值都算过。
+test('出站 ProxyAgent 不得把 keepAliveTimeout 设成亚秒值', () => {
+  const source = readFileSync(new URL('../server/proxy.mjs', import.meta.url), 'utf8');
+  const found = [...source.matchAll(/keepAliveTimeout\s*:\s*(\d+)/g)].map((m) => Number(m[1]));
+  for (const value of found) {
+    assert.ok(
+      value >= 1000,
+      `keepAliveTimeout=${value} 是毫秒不是秒；亚秒值会让每个上游调用都重建 TCP+TLS`,
+    );
+  }
+});
+
 test('客户端在 worker Response 前断开会中止 Request.signal', async () => {
   const adapter = await import('../server/http-adapter.mjs').catch(() => ({}));
   assert.equal(typeof adapter.forwardWorkerRequest, 'function', '必须提供可测试的 HTTP 转发桥');
