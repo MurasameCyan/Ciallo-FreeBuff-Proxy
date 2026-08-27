@@ -1090,15 +1090,22 @@ details[open] > .calllog-summary { margin-bottom: 14px; }
   font-variant-numeric: tabular-nums; white-space: nowrap;
 }
 .calllog-row .num b { color: var(--fg); font-weight: 600; }
-/* 右对齐，贴在主行那串数字下面：主行右半是「发了什么、花了多少」，Token 明细属于右半 */
+/* 第二行把 User 与 Token 放在同一行：User 左侧，Token 右侧 */
 .calllog-row .sub {
-  margin: 5px 0 0; text-align: right;
+  display: flex; align-items: baseline; flex-wrap: nowrap; gap: 12px;
+  margin: 5px 0 0; text-align: initial;
   font-family: var(--mono); font-size: 11px; color: var(--fg-2);
   font-variant-numeric: tabular-nums;
 }
-/* User 行紧跟主行、在 Token 行上方；左对齐与时刻对齐，扫一眼就知道是谁发的 */
+/* User 过长时省略，不能把 Token 推出卡片 */
 .calllog-row .calllog-user {
-  margin: 4px 0 0; text-align: left;
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  margin: 0; margin-right: auto; text-align: left;
+}
+.calllog-row .calllog-token {
+  flex: 0 1 auto; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  margin-left: auto; text-align: right;
 }
 
 /* ── 概况（移植自 zen） ───────────────────────────────────

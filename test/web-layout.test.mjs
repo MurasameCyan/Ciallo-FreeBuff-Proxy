@@ -387,6 +387,8 @@ assert.ok(modelRefreshFlow.includes('S.models = models.data || []'),
   '模型列表刷新成功后必须更新前端模型状态');
 assert.ok(modelRefreshFlow.includes('renderModels()') && modelRefreshFlow.includes('renderKeys()'),
   '模型列表刷新成功后必须同步模型目录和 Key 模型选择');
+assert.ok(modelRefreshFlow.includes('syncColumnBottoms()'),
+  '模型数量变化后必须重算两列高度，不能保留旧布局上限');
 assert.ok(modelRefreshFlow.includes('models.refresh?.updated')
   && modelRefreshFlow.includes('未能获取最新模型，已保留当前列表'),
   '模型目录源全部失败时必须明确提示使用旧列表，不能误报刷新成功');
@@ -831,12 +833,16 @@ assert.ok(!app.includes('c.node') && !app.includes('r.node'),
   '详情里的“节点”必须改为调度的账号名，不应保留 node 字段');
 assert.ok(app.includes("tag('nm'"), '调用日志主行必须有 .nm 承载账号名');
 
-// 时间下方的 User 行：分享 Key 显示备注名，主 Key 固定写 Master Key（2026-08-26）
+// 时间下方的详情行：User 与 Token 同行；分享 Key 显示备注名，主 Key 固定写 Master Key。
 assert.match(app, /user\.textContent = `User: \$\{r\.key === S\.ownerName \? 'Master Key' : r\.key\}`/,
   'User 行必须把主 Key 显示成 Master Key，并把分享 Key 显示成其备注名');
 assert.ok(app.includes('calllog-user'), 'User 行必须用 .calllog-user 承载');
-assert.match(app, /li\.append\(main, user, sub\)/,
-  '调用日志明细顺序必须是时间主行 → User 行 → Token 行');
+assert.match(app, /sub\.append\(user, token\)/,
+  'User 与 Token 必须追加到同一个详情行');
+assert.match(app, /li\.append\(main, sub\)/,
+  '调用日志明细必须只有时间主行和 User\/Token 详情行');
+assert.ok(!app.includes('li.append(main, user, sub)'),
+  '调用日志不得继续渲染时间、User、Token 三行');
 assert.ok(!/sub\.textContent \+= ` · Key /.test(app),
   '行尾的「· Key xxx」必须并入 User 行，不得重复出现');
 
@@ -862,6 +868,14 @@ assert.match(css, /\.calllog\s*\{[^}]*scrollbar-width:\s*none/s,
   '调用日志列表必须隐藏滚动条');
 assert.match(css, /\.calllog-main\s*\{[^}]*flex-wrap:\s*wrap/s,
   '调用日志主行必须可折行，避免横向溢出');
+assert.match(css, /\.calllog-row \.sub\s*\{[^}]*display:\s*flex[^}]*flex-wrap:\s*nowrap/s,
+  'User 与 Token 详情必须使用不换行的同一 flex 行');
+assert.match(css, /\.calllog-row \.calllog-user\s*\{[^}]*margin-right:\s*auto/s,
+  'User 必须在详情行左侧，Token 保持右侧');
+assert.match(css, /\.calllog-row \.calllog-token\s*\{[^}]*min-width:\s*0[^}]*overflow:\s*hidden[^}]*text-overflow:\s*ellipsis/s,
+  '窄屏时 Token 必须可收缩并省略，不能水平溢出卡片');
+assert.match(app, /user\.title = user\.textContent[\s\S]*token\.title = token\.textContent/s,
+  'User 或 Token 被省略时必须通过 title 保留完整内容');
 
 // 展开标记：<details> 自带的三角形按要求隐藏（两套前缀都要关，否则旧版 Safari 还留着）
 assert.match(css, /\.calllog-summary\s*\{[^}]*list-style:\s*none/s,
