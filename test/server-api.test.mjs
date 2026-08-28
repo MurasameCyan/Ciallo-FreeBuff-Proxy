@@ -920,6 +920,31 @@ test('账号出站配置持久化且内部 lane 不暴露给管理 API', async (
   assert.equal((await missingManualNode.json()).error.type, 'invalid_egress_config');
 });
 
+// 终态号改出站模式（手动→自动最常见）必须说出真实原因。以前所有未识别的 code 都掉进
+// 兜底 503「请稍后重试」，而终态是永久的，用户只会反复点保存。没订阅时 PATCH 走不到
+// verify，端到端测不出这条路径，所以直接把错误映射函数抠出来打。
+test('终态账号的出站配置错误归成 409，不报成「稍后重试」', () => {
+  const source = readFileSync(new URL('../server.js', import.meta.url), 'utf8');
+  const start = source.indexOf('function accountEgressApiError(');
+  const end = source.indexOf('\nasync function readJsonObject(', start);
+  assert.ok(start >= 0 && end > start, '应能隔离账号出站错误映射');
+  const calls = [];
+  const accountEgressApiError = new Function(
+    'err',
+    `${source.slice(start, end)}; return accountEgressApiError;`,
+  )((res, status, message, type) => { calls.push({ status, message, type }); });
+
+  accountEgressApiError({}, Object.assign(new Error('账号已进入终态'), { code: 'ACCOUNT_EGRESS_TERMINAL' }));
+  assert.equal(calls[0].status, 409, '永久隔离不是 503 暂时不可用');
+  assert.equal(calls[0].type, 'account_terminal');
+  assert.doesNotMatch(calls[0].message, /稍后重试/, '终态账号重试永远不会成功，不能提示重试');
+
+  // 兜底本身仍要留给真正的抖动（建连失败、订阅刷新超时）。
+  accountEgressApiError({}, new Error('无法创建账号代理出站连接'));
+  assert.equal(calls[1].status, 503);
+  assert.equal(calls[1].type, 'egress_unavailable');
+});
+
 test('账号出站 lane 用尽时新增账号返回明确容量错误', async (t) => {
   const fake = await startFakeProbeUpstream(() => 'ok');
   const s = await startServer({ CODEBUFF_API: fake.url }, async (dir) => {

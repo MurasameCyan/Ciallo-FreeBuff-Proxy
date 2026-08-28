@@ -1155,6 +1155,12 @@ function accountEgressApiError(res, error) {
   if (code === 'ACCOUNT_CHANGED') return err(res, 409, '账号配置已变更，请刷新后重试', 'account_changed');
   if (code === 'ACCOUNT_LANE_EXHAUSTED') return err(res, 409, raw, 'egress_capacity');
   if (code === 'ACCOUNT_EGRESS_SUPERSEDED') return err(res, 409, '账号出站配置已被更新的操作取代', 'account_changed');
+  // 终态号（banned / token_invalid / manual_disabled）不是「暂时不可用」：configureAccountEgress
+  // 的 verify 会直接拒绝给它配出站，重试到上游解封之前永远不会成功。落到下面那条兜底
+  // 503「请稍后重试」等于把永久状态说成抖动，用户只会一直点保存（2026-08-29 手动改自动实测）。
+  if (code === 'ACCOUNT_EGRESS_TERMINAL') {
+    return err(res, 409, '账号已被上游永久隔离，出站模式改不动；等状态恢复后再改，或更换账号', 'account_terminal');
+  }
   if (code === 'ACCOUNT_EGRESS_UNAVAILABLE') return err(res, 503, raw, 'egress_unavailable');
   if (/mihomo 未运行|内核未运行/i.test(raw)) {
     return err(res, 409, 'mihomo 尚未运行，请先配置并刷新订阅', 'proxy_not_ready');
