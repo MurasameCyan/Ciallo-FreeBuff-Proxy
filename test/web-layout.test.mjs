@@ -279,11 +279,61 @@ assert.match(app, /accountEgressDialog[\s\S]*?addEventListener\('cancel',[\s\S]*
   '账号出站保存期间按 Esc 不得关闭弹窗并制造迟到结果竞态');
 assert.match(app, /accountEgressSaving\s*=\s*true[\s\S]*?finally\s*\{[\s\S]*?accountEgressSaving\s*=\s*false/s,
   '账号出站保存互斥必须在 finally 中释放');
-for (const state of ['ready', 'probing', 'unavailable', 'proxy_offline', 'rejected']) {
+for (const state of ['ready', 'probing', 'unavailable', 'proxy_offline', 'rejected', 'terminal']) {
   assert.ok(app.includes(`${state}:`), `账号出站状态必须明确处理 ${state}`);
 }
-assert.match(app, /const node = egress\.currentNode \|\| \(egress\.mode === 'manual' \? '未设置' : accountEgressStateLabel\(egress\.state\)\)/,
-  '自动模式没有实际节点时，行摘要必须显示真实运行态，不能把不可用误写成“选择中”');
+// 节点格用行为断言锁死：源码正则只能证明写法，证不出终态号那一格到底显示什么。
+// 状态取值走 S.accountEgress[key]，跟 GET /_api/accounts 顶层 egress 映射的线上形状一致。
+const egressVm = { globalThis: null };
+egressVm.globalThis = egressVm;
+vm.runInNewContext(
+  'const S = { readonly: false, accountEgress: {} };\n'
+  + 'const esc = (value) => String(value);\n'
+  + 'const iconSvg = () => "<svg/>";\n'
+  + `${app.slice(app.indexOf('function normalizeAccountEgress('), app.indexOf('function proxyNodesForAccount'))}\n`
+  + 'globalThis.__egressState = S;\n'
+  + 'globalThis.__egressUi = { accountEgressSummary, accountEgressStateLabel };',
+  egressVm,
+);
+const egressCell = (account, runtime = null) => {
+  egressVm.__egressState.accountEgress = runtime ? { [account.key]: runtime } : {};
+  const cell = egressVm.__egressUi.accountEgressSummary(account);
+  return {
+    node: cell.match(/account-egress-node mono">([^<]*)</)[1],
+    tone: cell.match(/account-egress-summary ([a-z]+)/)[1],
+  };
+};
+assert.deepEqual(
+  egressCell({ key: 'a', egressMode: 'auto' }, { state: 'unavailable', currentNode: null }),
+  { node: '暂无正常节点', tone: 'error' },
+  '自动模式没有实际节点时，行摘要必须显示真实运行态，不能把不可用误写成“选择中”',
+);
+assert.deepEqual(
+  egressCell({ key: 'a', egressMode: 'auto' }, { state: 'ready', currentNode: 'JP-02' }),
+  { node: 'JP-02', tone: 'ready' },
+  '自动模式选出节点后必须显示实际节点名',
+);
+// 终态号（封禁/凭据失效/停用）不会再选节点，这一格必须直说原因：自动模式以前落到兜底
+// 「等待选择」，用户只能看成一直卡在检查中；手动模式又会把存盘的固定节点显示出来，
+// 看着像还在正常出站。原因以前只藏在 title 里（2026-08-29 用户反馈）。
+assert.deepEqual(
+  egressCell({ key: 'a', egressMode: 'auto' }, {
+    state: 'terminal', currentNode: null, error: '已被封禁',
+    terminal: { state: 'banned', reason: 'upstream_banned' },
+  }),
+  { node: '已被封禁', tone: 'error' },
+  '终态账号的自动出站必须直说隔离原因，不能显示成“等待选择”这类进行中文案',
+);
+assert.deepEqual(
+  egressCell({ key: 'a', egressMode: 'manual', egressNode: 'HK-01' }, {
+    state: 'terminal', configuredNode: 'HK-01', error: '凭据已失效',
+    terminal: { state: 'token_invalid', reason: 'token_invalid' },
+  }),
+  { node: '凭据已失效', tone: 'error' },
+  '终态账号的手动出站不得用存盘节点名掩盖隔离状态',
+);
+assert.equal(egressVm.__egressUi.accountEgressStateLabel('terminal'), '账号已隔离',
+  'terminal 必须有专属标签，兜底“等待选择”会把永久隔离说成进行中');
 assert.match(app, /account\.egressMode[\s\S]*?account\.egressNode[\s\S]*?currentNode/s,
   '账号出站摘要必须展示配置模式，并优先呈现自动实际节点');
 assert.match(css, /\.account-egress-summary\s*\{[^}]*display:\s*grid/s,

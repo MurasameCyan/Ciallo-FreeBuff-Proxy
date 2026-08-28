@@ -601,7 +601,7 @@ function normalizeAccountEgress(account = {}) {
 const ACCOUNT_EGRESS_STATE_LABELS = {
   ready: '已就绪', probing: '验证中', pending: '选择中', starting: '选择中', configuring: '选择中',
   error: '异常', failed: '异常', unavailable: '暂无正常节点',
-  proxy_offline: '代理未就绪', rejected: '节点被拒绝',
+  proxy_offline: '代理未就绪', rejected: '节点被拒绝', terminal: '账号已隔离',
 };
 
 function accountEgressStateLabel(state) {
@@ -611,8 +611,13 @@ function accountEgressStateLabel(state) {
 function accountEgressSummary(account) {
   const egress = normalizeAccountEgress(account);
   const mode = egress.mode === 'manual' ? '手动' : '自动';
-  const node = egress.currentNode || (egress.mode === 'manual' ? '未设置' : accountEgressStateLabel(egress.state));
-  const failed = egress.error || ['error', 'failed', 'unavailable', 'proxy_offline', 'rejected'].includes(egress.state);
+  // 终态号（封禁/凭据失效/停用）不会再选节点，这一格必须直接说出隔离原因:自动模式没有
+  // currentNode,标签会掉到兜底「等待选择」,看着永远像在检查中;手动模式 currentNode 又会
+  // 回落到存盘的固定节点,看着像还在正常出站。两种都只在 title 里露原因(2026-08-29 反馈)。
+  const node = egress.state === 'terminal'
+    ? (egress.error || accountEgressStateLabel(egress.state))
+    : egress.currentNode || (egress.mode === 'manual' ? '未设置' : accountEgressStateLabel(egress.state));
+  const failed = egress.error || ['error', 'failed', 'unavailable', 'proxy_offline', 'rejected', 'terminal'].includes(egress.state);
   const title = [mode, egress.currentNode, egress.error || egress.reject?.state].filter(Boolean).join(' · ');
   // 「自动」右边的行内刷新：点一下走弹窗保存同款 PATCH（auto 服务端带 force 重选节点）。
   // 手动模式节点是固定的，没有可探测的东西；只读模式整列操作都已禁掉。
