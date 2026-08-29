@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, unlinkSync } from 'node:fs';
 import { dirname } from 'node:path';
 import crypto from 'node:crypto';
 
@@ -106,33 +106,73 @@ function normalizeStored(raw) {
   };
 }
 
+// 读一个候选文件；读不到或解析不出来返回 null（区别于「读到了但里面是空池」——
+// `{"keys":[]}` 是合法状态，必须原样采用，不能掉进回退去捡旧副本，否则删掉的
+// Key 会被旧副本复活）。
+function readKeysFile(path) {
+  if (!existsSync(path)) return null;
+  try {
+    const obj = JSON.parse(readFileSync(path, 'utf-8'));
+    const rows = Array.isArray(obj?.keys) ? obj.keys : [];
+    const seen = new Set();
+    const out = [];
+    for (const row of rows) {
+      const entry = normalizeStored(row);
+      if (!entry || seen.has(entry.key)) continue;
+      seen.add(entry.key);
+      out.push(entry);
+    }
+    return out;
+  } catch (e) {
+    console.error(`[server] load ${path} failed:`, e.message);
+    return null;
+  }
+}
+
 export function createApiKeyStore(file) {
   function load() {
-    if (!existsSync(file)) return [];
-    try {
-      const obj = JSON.parse(readFileSync(file, 'utf-8'));
-      const rows = Array.isArray(obj?.keys) ? obj.keys : [];
-      const seen = new Set();
-      const out = [];
-      for (const row of rows) {
-        const entry = normalizeStored(row);
-        if (!entry || seen.has(entry.key)) continue;
-        seen.add(entry.key);
-        out.push(entry);
-      }
-      return out;
-    } catch (e) {
-      // 文件损坏不能让整个面板打不开；当空池启动，用户重新发 key 即可。
-      console.error('[server] load api-keys.json failed:', e.message);
-      return [];
+    // 撕裂的正本不能当成「空池」——那会让所有已发出去的分享 Key 静默失效，
+    // 面板列表变空、别人手里的 Key 全部 401，看起来像从来没发过 Key。
+    // 完整的 .tmp/.bak 比一个截断的正本可信；正本有效时永远优先。
+    // 三级回退与 account-state.mjs 对齐。
+    const primary = readKeysFile(file);
+    if (primary) return primary;
+    const recovered = readKeysFile(file + '.tmp') || readKeysFile(file + '.bak');
+    if (recovered) {
+      console.error('[server] api-keys.json 正本不可用，已从副本恢复 '
+        + `${recovered.length} 条 Key`);
+      return recovered;
     }
+    // 三者都不可用才当空池启动：坏文件不该让整个面板打不开。
+    return [];
   }
 
   function save(keys) {
     mkdirSync(dirname(file), { recursive: true });
     const tmp = file + '.tmp';
+    const backup = file + '.bak';
     writeFileSync(tmp, JSON.stringify({ keys }, null, 2) + '\n', 'utf-8');
-    writeFileSync(file, readFileSync(tmp, 'utf-8'), 'utf-8');
+    // rename 是同分区上的原子替换：任何时刻正本要么是旧的完整内容、要么是新的。
+    // 先写 .tmp 再拿它的内容普通写覆盖正本，只是把暴露窗口翻倍，收益为零。
+    try {
+      renameSync(tmp, file);
+      try { unlinkSync(backup); } catch {}
+      return;
+    } catch {
+      // Windows 的 renameSync 不能覆盖已存在的文件：先把旧正本挪去 .bak，
+      // 再把完整的 .tmp 挪成正本。中途崩了 load() 能从 .tmp 或 .bak 捡回来。
+      try { unlinkSync(backup); } catch {}
+      if (existsSync(file)) renameSync(file, backup);
+      try {
+        renameSync(tmp, file);
+        try { unlinkSync(backup); } catch {}
+      } catch (error) {
+        if (!existsSync(file) && existsSync(backup)) {
+          try { renameSync(backup, file); } catch {}
+        }
+        throw error;
+      }
+    }
   }
 
   function assertNameFree(keys, name, exceptKey = null) {

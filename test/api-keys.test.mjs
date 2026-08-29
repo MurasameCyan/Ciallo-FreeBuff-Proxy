@@ -4,7 +4,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, rm, writeFile, readFile } from 'node:fs/promises';
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import vm from 'node:vm';
@@ -174,6 +174,62 @@ test('手改过/旧版本写的文件也能用：缺字段补默认值，坏 JSO
     assert.deepEqual(store.list(), [], '坏 JSON 必须当空池启动');
     assert.ok(store.add({ name: '新的' }), '坏文件之后还能正常发 key');
   }, '{ this is not json');
+});
+
+// 撕裂写入的正本不能当成「空池」——那会让所有已发出去的分享 Key 静默失效，
+// 面板 Key 列表变空、别人手里的 Key 全部 401，且看起来像从来没发过 Key。
+// 触发场景：进程在 save() 中途死掉（OOM / docker restart / 磁盘满）。
+test('正本被写坏时从完整副本恢复，不把已发出去的 Key 当成空池', async () => {
+  // 正本截断 + .tmp 完整：必须捡回 .tmp 那条，而不是回空池
+  await withStore(async (store, file) => {
+    await writeFile(file + '.tmp', JSON.stringify({
+      keys: [{ key: 'fbk-survivor', name: '幸存', concurrency: 2 }],
+    }));
+    const list = store.list();
+    assert.equal(list.length, 1, '.tmp 里有完整数据时不能回空池');
+    assert.equal(list[0].key, 'fbk-survivor');
+    assert.equal(list[0].concurrency, 2, '恢复的记录仍要走一遍字段归一化');
+  }, '{"keys":[{"key":"fbk-survivor","nam');
+
+  // .bak 是 Windows 回退路径留下的，同样要能捡
+  await withStore(async (store, file) => {
+    await writeFile(file + '.bak', JSON.stringify({ keys: [{ key: 'fbk-from-bak', name: '备份' }] }));
+    assert.equal(store.list()[0]?.key, 'fbk-from-bak', '.bak 也要作为恢复来源');
+  }, '{ torn');
+
+  // 正本有效时永远优先，副本再新也不许插队
+  await withStore(async (store, file) => {
+    await writeFile(file + '.tmp', JSON.stringify({ keys: [{ key: 'fbk-stale', name: '旧的' }] }));
+    assert.equal(store.list()[0]?.key, 'fbk-primary', '正本能解析就必须用正本');
+  }, JSON.stringify({ keys: [{ key: 'fbk-primary', name: '正本' }] }));
+
+  // 关键的反向用例：`{"keys":[]}` 是合法的「空池」状态（用户删光了 Key），
+  // 不是损坏。若把它也当失败去捡副本，删除操作就会被旧副本复活。
+  await withStore(async (store, file) => {
+    await writeFile(file + '.tmp', JSON.stringify({ keys: [{ key: 'fbk-deleted', name: '已删' }] }));
+    assert.deepEqual(store.list(), [], '合法空池不该触发回退，否则删掉的 Key 会复活');
+  }, JSON.stringify({ keys: [] }));
+
+  // 三者都没有才是真的空池（沿用既有语义：坏文件不能让面板打不开）
+  await withStore(async (store) => {
+    assert.deepEqual(store.list(), [], '没有任何可用副本时才回空池');
+  }, '{ this is not json');
+});
+
+test('落盘用 rename 原子替换：写完不留 .tmp 残留', async () => {
+  await withStore(async (store, file) => {
+    store.add({ name: '甲' });
+    assert.equal(existsSync(file + '.tmp'), false,
+      'rename 应该已经把 .tmp 消耗掉；残留说明又退回了「读 tmp 再普通写正本」那种非原子写法');
+    assert.equal(existsSync(file + '.bak'), false, '正常路径不该留 .bak');
+
+    // 连续写多次，正本始终可解析、无残留
+    store.add({ name: '乙' });
+    store.add({ name: '丙' });
+    assert.equal(existsSync(file + '.tmp'), false);
+    assert.equal(JSON.parse(readFileSync(file, 'utf8')).keys.length, 3);
+    assert.equal(store.list().length, 3);
+  });
 });
 
 test('喂给 worker 的鉴权表只带闸门要用的字段', async () => {
