@@ -16,6 +16,7 @@ import vm from 'node:vm';
 const workerSource = readFileSync(new URL('../worker.js', import.meta.url), 'utf8');
 const workerWrapper = workerSource.replace('export default {', 'const __workerDefault__ = {')
   + '\n\nglobalThis.__convApi__ = { guardStreamConvergence, normalizeMessages, '
+  + 'streamTruncationReason, logCall, callLogSnapshot, usageTotals, recordChatCall, '
   + 'STREAM_IDLE_TIMEOUT_MS, STREAM_MAX_DURATION_MS };\n';
 
 function loadApi() {
@@ -123,6 +124,84 @@ test('总时长超上限 → 关闭（空闲判据对持续输出的循环无效
   const out = await drain(api.guardStreamConvergence(body, 'test', { idleMs: 5000, maxMs: 100 }));
   assert.ok(out.length < 5, '应在上限处截断，实际收到 ' + JSON.stringify(out));
   assert.ok(out.startsWith('1'), '截断前的字节要保留');
+});
+
+// ── 截断信号：护栏掐断的流必须记 fail，不能记成 success ────────────────────
+//
+// 为什么要有这组（审查发现 2026-08-29）：护栏关流走的是「正常 close」，下游 pipe
+// 的 finally 分辨不出这是截断还是上游自己收尾，于是无条件 recordRequest(success)。
+// 后果是客户端拿到 200 + 不完整回答，而面板 fail 计数器不动、看着一切健康。
+// 这里锁三件事：截断有信号、正常收尾没有、信号在 onComplete 跑之前就已是终态。
+
+test('空闲截断留下 idle 信号，正常收尾不留信号', async () => {
+  const stalled = api.guardStreamConvergence(
+    fakeUpstream([{ text: 'partial' }, { text: 'never', delayMs: 5000 }]),
+    'trunc-idle', { idleMs: 80, maxMs: 60000 });
+  await drain(stalled);
+  assert.equal(api.streamTruncationReason(stalled), 'idle',
+    '空闲截断必须能被识别出来，否则空回答会被记成 success');
+
+  const normal = api.guardStreamConvergence(
+    fakeUpstream([{ text: 'a' }, { text: 'b' }]), 'trunc-none', { idleMs: 5000, maxMs: 60000 });
+  const out = await drain(normal);
+  assert.equal(out, 'ab', '正常路径一个字节都不能少');
+  assert.equal(api.streamTruncationReason(normal), null,
+    '正常收尾不许留截断信号 —— 否则成功的调用会被误记成失败');
+});
+
+test('时长上限截断留下 duration_cap 信号', async () => {
+  const capped = api.guardStreamConvergence(
+    fakeUpstream([{ text: '1' }, { text: '2', delayMs: 60 }, { text: '3', delayMs: 60 }]),
+    'trunc-cap', { idleMs: 5000, maxMs: 100 });
+  await drain(capped);
+  assert.equal(api.streamTruncationReason(capped), 'duration_cap',
+    '两种截断要能区分：空闲卡死与持续吐字节的自环，处置和排查方向都不同');
+});
+
+test('截断原因在流关闭时已是终态（onComplete 在 finally 里读得到）', async () => {
+  // pipe 的 finally 是在 reader 读到 done 之后才跑的。这条锁住「读到 done 的那一刻
+  // 信号就已经写好了」——否则 onDone 读到 null，fail 照样记不上。
+  const stream = api.guardStreamConvergence(
+    fakeUpstream([{ text: 'x' }, { text: 'y', delayMs: 5000 }]),
+    'trunc-order', { idleMs: 80, maxMs: 60000 });
+  const reader = stream.getReader();
+  let reasonAtDone = 'not-read';
+  while (true) {
+    const { done } = await reader.read();
+    if (done) { reasonAtDone = api.streamTruncationReason(stream); break; }
+  }
+  assert.equal(reasonAtDone, 'idle', 'done 到达时截断原因必须已经可读');
+});
+
+test('裸 body 不经护栏时没有信号，且信号字段不可枚举（不泄进 JSON）', async () => {
+  const bare = fakeUpstream([{ text: 'a' }]);
+  assert.equal(api.streamTruncationReason(bare), null, '没经过护栏的流不该被判成截断');
+  assert.equal(api.streamTruncationReason(null), null);
+
+  const guarded = api.guardStreamConvergence(fakeUpstream([{ text: 'a' }]), 'enum', { idleMs: 5000 });
+  assert.deepEqual(Object.keys(guarded), [], '挂在流上的内部字段不能可枚举');
+  await drain(guarded);
+});
+
+test('recordChatCall：截断记 fail，正常记 success，两者都留一行调用日志', () => {
+  const before = { requests: api.usageTotals.requests, success: api.usageTotals.success, fail: api.usageTotals.fail };
+  const mc = { id: 'test/model', session: 'test/model' };
+  const usage = { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 };
+
+  api.recordChatCall({}, 'tok-normal', mc, 'high', Date.now() - 1000, Date.now() - 900, usage, null, null);
+  assert.equal(api.usageTotals.success, before.success + 1, '正常收尾仍要记 success');
+  assert.equal(api.usageTotals.fail, before.fail, '正常收尾不许动 fail');
+
+  api.recordChatCall({}, 'tok-trunc', mc, 'high', Date.now() - 1000, Date.now() - 900, usage, null, 'idle');
+  assert.equal(api.usageTotals.fail, before.fail + 1,
+    '截断必须记 fail —— 这正是「面板全绿而用户拿到空回答」的根因');
+  assert.equal(api.usageTotals.success, before.success + 1, '截断不许再计入 success');
+  assert.equal(api.usageTotals.requests, before.requests + 2, '两次都算一次请求');
+
+  // 调用日志要能看出是哪一条被截断的，否则排查时只看到 fail 数字涨了
+  const calls = api.callLogSnapshot().calls;
+  assert.equal(calls[calls.length - 1].truncated, 'idle', '截断行要带原因');
+  assert.equal(calls[calls.length - 2].truncated, '', '正常行的 truncated 是空串');
 });
 
 // ── 边界：非流 body 原样返回 ──────────────────────────────────────────────

@@ -1229,6 +1229,28 @@ assert.match(css, /\.key-message\s*\{[^}]*margin:\s*0[^}]*flex:\s*1\s+1/s,
   '状态消息必须取消独立行外边距并吸收按钮右侧剩余空间');
 
 
+// ── 被收敛护栏截断的调用行必须一眼认得出 ──────────────────────────────────
+// worker 掐断流时会给这条调用日志标 truncated 并记入 fail。但主行的账号/模型/
+// 耗时和成功行长得一模一样，前端不标就只能靠猜 —— 用户拿到的是 200 + 不完整回答。
+assert.ok(app.includes("c.truncated"),
+  '调用日志聚合必须保留 truncated 字段，否则前端拿不到截断信息');
+assert.ok(app.includes('r.truncated'),
+  '调用日志主行必须根据 truncated 渲染标记');
+assert.match(app, /TRUNCATION_LABELS\s*=\s*\{[^}]*idle:[^}]*duration_cap:[^}]*\}/s,
+  '两种截断原因（idle / duration_cap）都必须有中文文案');
+assert.ok(!app.includes('只有成功的调用会进来'),
+  'callLog 的注释必须更新：截断行也会进逐条日志，旧注释已经不成立');
+
+// 类名一致性：JS 里 tag() 建的 class 必须真的有 CSS 规则。
+// 这条是实打实踩过的坑 —— JS 写 'trunc'、CSS 写 '.calllog-trunc'，
+// 徽标照样渲染但完全没有样式，跑测试和看截图都发现不了。
+const truncFlagClass = /const flag = tag\('([^']+)'/.exec(app)?.[1];
+assert.ok(truncFlagClass, '截断标记必须用 tag() 创建，便于校验类名');
+assert.ok(css.includes('.' + truncFlagClass),
+  `截断标记的类名 .${truncFlagClass} 在 style.css 里没有任何规则：JS 与 CSS 对不上，徽标会裸奔`);
+assert.match(css, new RegExp(`\\.${truncFlagClass}\\s*\\{[^}]*var\\(--amber\\)`, 's'),
+  '截断标记必须用项目既有的 --amber 警示色，不要引入不存在的变量');
+
 const ids = [...html.matchAll(/\bid=["']([^"']+)["']/g)].map((m) => m[1]);
 const duplicates = ids.filter((id, i) => ids.indexOf(id) !== i);
 assert.deepEqual([...new Set(duplicates)], [], `页面存在重复 id: ${[...new Set(duplicates)].join(', ')}`);

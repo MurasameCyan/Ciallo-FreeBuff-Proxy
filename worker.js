@@ -1047,18 +1047,37 @@ function maxWaitingRoomSwitches(env) {
   return raw !== "" && Number.isInteger(n) && n >= 0 ? n : MAX_WAITING_ROOM_SWITCHES;
 }
 
-// 单请求重试链的时间总预算。实测 2026-08-25 20:38 北京时间：整池排队时重试链烧了
+// 单请求重试链的**截止时刻**。实测 2026-08-25 20:38 北京时间：整池排队时重试链烧了
 // 74.7s 一无所获，而客户端（CC GUI）首字超时约 75s —— 差 1s 被 499 掐断，客户端
-// 既没拿到错误也没拿到 Retry-After。预算到顶就不再起新号的尝试，让循环后的兜底
-// 分支回干净的 503 waiting_room（带 Retry-After）—— 早失败早重试比吊到超时强。
+// 既没拿到错误也没拿到 Retry-After。到顶就不再起新号的尝试，让循环后的兜底分支回
+// 干净的 503 waiting_room（带 Retry-After）—— 早失败早重试比吊到超时强。
 // 只约束「再起一个新号的尝试」：正在跑的尝试不拦，第一个号永远试。
-// 0 是合法值 = 只试第一个号。空串陷阱同 maxAccountSwitches。
-const RETRY_CHAIN_BUDGET_MS = 45 * 1000;
+// 0 是合法值 = 只试第一个号（任何正成本都 > 0，新判据下天然成立）。
+// 空串陷阱同 maxAccountSwitches。
+//
+// ⚠️ 语义在此处变过一次：原先是「起跑闸门」，只比 elapsed >= 预算，**不看放行的
+// 这次要花多久**。那有个漏洞：多次快速失败累积到 44s 仍会放行一次可能跑满 45s 的
+// 非流式尝试，总计 89s，照样冲破客户端 75s —— 正是这条预算要防的 499。现在改成
+// 「elapsed + 本次最坏成本 > deadline 就不放行」，让上界真的成立。
+// 环境变量名保留 ..._BUDGET_MS 不改：改名会打断现有部署，不值得。
+const RETRY_CHAIN_DEADLINE_MS = 70 * 1000;
 
 function retryChainBudgetMs(env) {
   const raw = String((env && env.FREEBUFF_RETRY_CHAIN_BUDGET_MS) ?? "").trim();
   const n = Number(raw);
-  return raw !== "" && Number.isFinite(n) && n >= 0 ? n : RETRY_CHAIN_BUDGET_MS;
+  return raw !== "" && Number.isFinite(n) && n >= 0 ? n : RETRY_CHAIN_DEADLINE_MS;
+}
+
+// 再起一个号的尝试最坏要花多久。刻意从既有超时推导，不新造魔法数：
+//   · 非流式：AbortSignal.timeout(NONSTREAM_TIMEOUT_MS) 的作用域覆盖 body 读取
+//     （实测：在读 body 中途被 abort），所以它就是「发请求到聚合完成」的总上限。
+//   · 流式：与重试有关的窗口只到响应头返回（拿到头就把 Response 交给客户端了，
+//     之后的流时长由收敛护栏管），由 session + run + chat 建链的超时界定。
+// 取最坏值而不是均值 —— 用均值会让上界失效，那就退回起跑闸门的老问题了。
+function attemptCostMs(isStream) {
+  return isStream
+    ? SESSION_TIMEOUT_MS * 2 + UPSTREAM_TIMEOUT_MS
+    : NONSTREAM_TIMEOUT_MS;
 }
 
 // 这个号刚刚被上游放进 waiting room 吗？只看新鲜观测：过期的旧状态不该继续压它。
@@ -1459,6 +1478,8 @@ function logCall(entry) {
     in: entry.in ?? 0,
     out: entry.out ?? 0,
     reasoning: entry.reasoning ?? 0,
+    // "" = 正常收尾；"idle"/"duration_cap" = 被收敛护栏截断（这一行同时记入 fail）。
+    truncated: String(entry.truncated ?? "").trim(),
   });
   if (callLogBuf.length > CALL_LOG_LIMIT) {
     callLogBuf.splice(0, callLogBuf.length - CALL_LOG_LIMIT);
@@ -1630,7 +1651,9 @@ function restoreUsageSnapshot(src) {
 }
 
 // 记录一次成功调用。firstTokenAt 为空（非流式）时首字记 null。
-function recordChatCall(env, token, mc, effort, t0, firstTokenAt, usage, client = null) {
+// truncated 非空表示这条流是被收敛护栏掐断的（空闲超时 / 时长上限）：客户端拿到
+// 的是不完整回答，所以记 fail 而不是 success —— 否则面板全绿而用户手里是空回答。
+function recordChatCall(env, token, mc, effort, t0, firstTokenAt, usage, client = null, truncated = null) {
   const u = readCallUsage(usage);
   logCall({
     account: accountLabel(env, token),
@@ -1642,9 +1665,10 @@ function recordChatCall(env, token, mc, effort, t0, firstTokenAt, usage, client 
     in: u ? u.in : 0,
     out: u ? u.out : 0,
     reasoning: u ? u.reasoning : 0,
+    truncated: truncated || "",
   });
   // 成功调用 == 该客户端请求的成功终态，顺带记入概况累计（每次成功恰好一条）。
-  recordRequest(mc && mc.id ? mc.id : "", usage, true, client);
+  recordRequest(mc && mc.id ? mc.id : "", usage, !truncated, client);
 }
 
 // ---------------------------------------------------------------------------
@@ -3296,7 +3320,11 @@ function enqueue(fn) {
 }
 
 const UPSTREAM_TIMEOUT_MS = 20000; // 上游单请求超时，避免客户端干等
-const NONSTREAM_TIMEOUT_MS = 45000; // 非流式要聚合完整上游流（含推理），给更充裕时间
+// 非流式要聚合完整上游流（含推理）才能回，所以这是「发请求到聚合完成」的总上限。
+// 45s → 60s（实测依据）：GLM 5.3 大上下文首字 46s、luna 首字 57.8s，45s 连首字都
+// 等不到就 abort，非流式打慢思考模型基本必然失败。60s 仍压在客户端首字超时约 75s
+// 之下，也压在 RETRY_CHAIN_DEADLINE_MS(70s) 之下。
+const NONSTREAM_TIMEOUT_MS = 60000;
 const SESSION_TIMEOUT_MS = 10000;  // session/run 等短交互更快失败
 // 这不是流式请求的失败时间，只是首个数据迟迟未到时启动一次额度探测的观察窗口。
 // 额度仍在时不 abort、不切号，继续等待上游。
@@ -3315,13 +3343,28 @@ const STREAM_NO_DATA_PROBE_DELAY_MS = 20000;
 const STREAM_IDLE_TIMEOUT_MS = 60000;
 const STREAM_MAX_DURATION_MS = 600000;
 
+// 护栏关流走的是「正常 close」，下游 pipe 的 finally 分辨不出这是截断还是上游
+// 自己收尾 —— 于是空回答被记成 success，fail 计数器不动、面板全绿，而客户端拿到
+// 的是 200 + 空 SSE 体。用一个共享对象把截断原因带出护栏，调用点在 onComplete
+// 里据此记 fail。
+// ⚠️ 必须挂在流实例上，不能塞进 underlyingSource —— 实测 ReadableStream 不会把
+// source 上的额外字段搬到实例上（`prop visible on instance: false`）。
+const STREAM_TRUNCATION_KEY = "__guardTruncation";
+
+// 这条流被护栏截断了吗？返回原因字符串或 null。不经护栏的裸 body 返回 null。
+function streamTruncationReason(stream) {
+  const state = stream ? stream[STREAM_TRUNCATION_KEY] : null;
+  return state && state.reason ? state.reason : null;
+}
+
 function guardStreamConvergence(body, label = "", opts = {}) {
   if (!body || typeof body.getReader !== "function") return body;
   const idleMs = Number.isFinite(opts.idleMs) ? opts.idleMs : STREAM_IDLE_TIMEOUT_MS;
   const maxMs = Number.isFinite(opts.maxMs) ? opts.maxMs : STREAM_MAX_DURATION_MS;
   const reader = body.getReader();
   const startedAt = Date.now();
-  return new ReadableStream({
+  const truncation = { reason: null, at: null };
+  const guarded = new ReadableStream({
     async pull(controller) {
       let timer = null;
       const idle = new Promise((resolve) => {
@@ -3335,6 +3378,8 @@ function guardStreamConvergence(body, label = "", opts = {}) {
       }
       if (next && next.__guard === "idle") {
         console.warn(`[stream-guard] idle >${idleMs}ms, closing${label ? " " + label : ""}`);
+        truncation.reason = "idle";
+        truncation.at = Date.now();
         try { await reader.cancel(new Error("stream idle timeout")); } catch {}
         controller.close();
         return;
@@ -3342,6 +3387,8 @@ function guardStreamConvergence(body, label = "", opts = {}) {
       if (next.done) { controller.close(); return; }
       if (Date.now() - startedAt > maxMs) {
         console.warn(`[stream-guard] exceeded ${maxMs}ms, closing${label ? " " + label : ""}`);
+        truncation.reason = "duration_cap";
+        truncation.at = Date.now();
         try { await reader.cancel(new Error("stream duration cap")); } catch {}
         controller.close();
         return;
@@ -3352,6 +3399,10 @@ function guardStreamConvergence(body, label = "", opts = {}) {
       try { await reader.cancel(reason); } catch {}
     },
   });
+  Object.defineProperty(guarded, STREAM_TRUNCATION_KEY, {
+    value: truncation, enumerable: false, writable: false, configurable: false,
+  });
+  return guarded;
 }
 
 // ── 出站 header 清洗 + 请求抖动（轻量 stealth，v1.9.1）──────────────────
@@ -4387,14 +4438,17 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode, requestSig
   const waitingBudget = Math.min(maxWaitingRoomSwitches(env), pool.length);
   let accountSwitches = 0;
   let waitingRoomSwitches = 0;
-  const chainBudgetMs = retryChainBudgetMs(env);
+  const chainDeadlineMs = retryChainBudgetMs(env);
+  const attemptCost = attemptCostMs(isStream);
   const chainStart = Date.now();
   for (let acctTry = 0; acctTry < switchBudget + waitingBudget + SAME_ACCOUNT_TRANSIENT_RETRIES; acctTry++) {
     throwIfRequestAborted(requestSignal);
     // 时间总预算：只拦「再起一个新号的尝试」，正在跑的尝试不拦。第一个号
     // （acctTry === 0）永远试 —— 预算管的是换号链的长度，不是把请求直接拒掉。
-    if (acctTry > 0 && Date.now() - chainStart >= chainBudgetMs) {
-      if (debug) console.log(`[retry-chain] budget ${chainBudgetMs}ms exhausted after ${acctTry} attempts`);
+    // 判据看「已用 + 本次最坏成本」而不是只看已用：只看已用等于在起跑线放行，
+    // 一个刚好压线起跑的尝试还能再烧一整个 attemptCost，上界就不成立了。
+    if (acctTry > 0 && Date.now() - chainStart + attemptCost > chainDeadlineMs) {
+      if (debug) console.log(`[retry-chain] deadline ${chainDeadlineMs}ms would be blown by next attempt (elapsed ${Date.now() - chainStart}ms + cost ${attemptCost}ms) after ${acctTry} attempts`);
       break;
     }
     // 上游抖动过的号优先原地重试；拿不回来（被隔离/冷却/占用）才正常选号。
@@ -4521,14 +4575,17 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode, requestSig
 
       if (isStream) {
         const { readable, writable } = new TransformStream();
+        const guardedBody = guardStreamConvergence(resp.body, mc.id);
         const onDone = async (info) => {
           try {
             // 与普通 chat 同口径：成功一次记一行调用日志 + 概况/Key 累计。
-            recordChatCall(env, token, mc, effort, t0, info && info.firstTokenAt, info && info.usage, client);
+            // 护栏截断的流记 fail —— onDone 由 pipe 的 finally 调用，此时护栏
+            // 早已写好截断原因，读到的一定是终态。
+            recordChatCall(env, token, mc, effort, t0, info && info.firstTokenAt, info && info.usage, client,
+              streamTruncationReason(guardedBody));
             await finalize(info);
           } finally { releaseToken(token); }
         };
-        const guardedBody = guardStreamConvergence(resp.body, mc.id);
         if (mode === "responses") pipeUpstreamToResponsesStream(guardedBody, writable, mc, onDone);
         else pipeUpstreamToClient(guardedBody, writable, onDone, !!chatParams?.stream_options?.include_usage);
         leaseTransferred = true;
@@ -4659,14 +4716,17 @@ async function executeChatPooled(env, chatParams, mc, isStream, mode, requestSig
   const waitingBudget = Math.min(maxWaitingRoomSwitches(env), pool.length);
   let accountSwitches = 0;
   let waitingRoomSwitches = 0;
-  const chainBudgetMs = retryChainBudgetMs(env);
+  const chainDeadlineMs = retryChainBudgetMs(env);
+  const attemptCost = attemptCostMs(isStream);
   const chainStart = Date.now();
   for (let acctTry = 0; acctTry < switchBudget + waitingBudget + SAME_ACCOUNT_TRANSIENT_RETRIES; acctTry++) {
     throwIfRequestAborted(requestSignal);
     // 时间总预算：只拦「再起一个新号的尝试」，正在跑的尝试不拦。第一个号
     // （acctTry === 0）永远试 —— 预算管的是换号链的长度，不是把请求直接拒掉。
-    if (acctTry > 0 && Date.now() - chainStart >= chainBudgetMs) {
-      if (debug) console.log(`[retry-chain] budget ${chainBudgetMs}ms exhausted after ${acctTry} attempts`);
+    // 判据看「已用 + 本次最坏成本」而不是只看已用：只看已用等于在起跑线放行，
+    // 一个刚好压线起跑的尝试还能再烧一整个 attemptCost，上界就不成立了。
+    if (acctTry > 0 && Date.now() - chainStart + attemptCost > chainDeadlineMs) {
+      if (debug) console.log(`[retry-chain] deadline ${chainDeadlineMs}ms would be blown by next attempt (elapsed ${Date.now() - chainStart}ms + cost ${attemptCost}ms) after ${acctTry} attempts`);
       break;
     }
     // 上游抖动过的号优先原地重试；拿不回来（被隔离/冷却/占用）才正常选号。
@@ -4854,15 +4914,17 @@ async function executeChatPooled(env, chatParams, mc, isStream, mode, requestSig
 
       if (isStream) {
         const { readable, writable } = new TransformStream();
+        const guardedBody = guardStreamConvergence(resp.body, mc.id);
         // 流式：首字延迟与 usage 只有管道跑完才知道，用 onComplete 收尾记一行。
+        // 被护栏截断时记 fail（onDone 在 pipe 的 finally 里跑，截断原因已是终态）。
         const onDone = async (info) => {
           try {
-            recordChatCall(env, token, mc, effort, t0, info && info.firstTokenAt, info && info.usage, client);
+            recordChatCall(env, token, mc, effort, t0, info && info.firstTokenAt, info && info.usage, client,
+              streamTruncationReason(guardedBody));
           } finally {
             releaseToken(token);
           }
         };
-        const guardedBody = guardStreamConvergence(resp.body, mc.id);
         if (mode === "responses") pipeUpstreamToResponsesStream(guardedBody, writable, mc, onDone);
         else pipeUpstreamToClient(guardedBody, writable, onDone, !!chatParams?.stream_options?.include_usage);
         leaseTransferred = true;

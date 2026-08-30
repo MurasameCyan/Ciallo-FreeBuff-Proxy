@@ -134,6 +134,11 @@ function tag(cls, text) {
   return s;
 }
 
+// 收敛护栏掐断流时 worker 会在这条调用日志上标 truncated（同时记入 fail）。
+// 客户端拿到的是 200 + 不完整回答，所以行上必须看得出来 —— 否则界面上它和
+// 正常成功行长得一模一样，只有累计计数器悄悄多了一个 fail。
+const TRUNCATION_LABELS = { idle: '首字超时截断', duration_cap: '超时长上限截断' };
+
 // ── 调用日志格式化（与 zen core.js 同口径） ──────────────
 const grouped = new Intl.NumberFormat('en-US');
 const compact = new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 });
@@ -167,7 +172,9 @@ function fmtDelay(ms) {
 
 /**
  * calls -> 可直接渲染的行 + 汇总。最近的排最前。
- * 只有成功的调用会进来（见 worker.js 的 logCall），失败只累计到 totals。
+ * 绝大多数是成功的调用（见 worker.js 的 logCall），失败只累计到 totals；
+ * 例外是被收敛护栏截断的流（truncated 非空）—— 它也留一行，因为「客户端拿到了
+ * 200 但内容不完整」这件事只有逐条看才发现得了，只进 totals 等于没人看得见。
  */
 function callLog(calls) {
   const rows = [];
@@ -189,6 +196,8 @@ function callLog(calls) {
       // null 和 0 要分开：测不到首字节和「零延迟」不是一回事
       ttfb: Number.isFinite(Number(c.ttfb)) && Number(c.ttfb) > 0 ? Number(c.ttfb) : null,
       ms: Number.isFinite(Number(c.ms)) ? Number(c.ms) : null,
+      // '' = 正常收尾；'idle'/'duration_cap' = 被护栏截断，这一行同时记入 fail
+      truncated: String(c.truncated ?? '').trim(),
     };
     row.total = row.in + row.out;
     tokens += row.total;
@@ -1288,6 +1297,15 @@ function renderCallLog() {
       num('首字', fmtDelay(r.ttfb)),
       num('耗时', fmtDelay(r.ms)),
     );
+    // 截断的行必须一眼能认出来：它在 totals 里记的是 fail，但主行的账号/模型/
+    // 耗时和成功行长得一模一样，不标就只能靠猜。
+    if (r.truncated) {
+      li.classList.add('calllog-truncated');
+      const why = TRUNCATION_LABELS[r.truncated] || r.truncated;
+      const flag = tag('calllog-trunc', why);
+      flag.title = '这次回答被网关的收敛护栏掐断，客户端拿到的内容不完整（已记为失败）';
+      main.append(flag);
+    }
 
     const sub = document.createElement('p');
     sub.className = 'sub';

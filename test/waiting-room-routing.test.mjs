@@ -22,7 +22,7 @@ const workerWrapper = workerSource.replace('export default {', 'const __workerDe
   + '\n\nglobalThis.__workerDefault__ = __workerDefault__;\n'
   + 'globalThis.__waitingRoomTestApi__ = { pickToken, releaseToken, executeChat, '
   + 'recentlyWaitingRoom, maxWaitingRoomSwitches, waitingRoomDeprioritizeMs, '
-  + 'retryChainBudgetMs, recordAccountObservation, acctHealth };\n';
+  + 'retryChainBudgetMs, attemptCostMs, recordAccountObservation, acctHealth };\n';
 
 // 主体必须是未被官方 paused 的模型：paused 闸门在排队/换号逻辑之前就返回。
 const MODEL = 'deepseek/deepseek-v4-flash';
@@ -254,15 +254,66 @@ test('预算 0 也不拦第一个号：单号可用时请求照常成功', async
   assert.equal(upstream.created, 1);
 });
 
+// 判据本身的行为用例（不是只测 helper）：预算是正数但装不下一次尝试时必须停手。
+// 沙箱时钟钉死 → elapsed 恒为 0，正好把两种判据分开：
+//   · 旧式 `elapsed >= budget`：0 >= 1000 为假 → 放行，然后烧掉一整个 60s 尝试，
+//     等于在 1s 的预算下花 60s，上界形同虚设（这就是原来的 bug）。
+//   · 新式 `elapsed + cost > deadline`：0 + 60000 > 1000 为真 → 停手。
+test('预算装不下一次尝试就停手：起跑线放行的漏洞被堵住', async () => {
+  const start = Date.UTC(2030, 0, 1);
+  const log = [];
+  const upstream = createQueueingUpstream({ start, queuedTokens: new Set(POOL), log });
+  const workerVm = createWorkerVm({ now: start, fetchImpl: upstream.fetch });
+  // 1s：远小于非流式单次成本 60s，但明确大于 0（0 走的是另一条已有用例）。
+  const env = envFor(POOL, { FREEBUFF_ACCOUNT_SWITCH_JITTER_MS: '0', FREEBUFF_RETRY_CHAIN_BUDGET_MS: '1000' });
+
+  const response = await workerVm.api.executeChat(
+    env, chatParams(MODEL), modelCfg(MODEL, 'base2-free-deepseek'), false, 'chat',
+  );
+
+  assert.equal(response.status, 503);
+  const posts = log.filter((e) => e.path === '/api/v1/freebuff/session' && e.method === 'POST');
+  assert.equal(posts.length, 1,
+    `1s 预算装不下 60s 的尝试，只该试第一个号，实际 POST /session ${posts.length} 次`);
+});
+
 test('retryChainBudgetMs 的空串陷阱与显式覆盖', async () => {
   const workerVm = createWorkerVm({ now: Date.UTC(2030, 0, 1) });
   const { api } = workerVm;
-  assert.equal(api.retryChainBudgetMs({ FREEBUFF_RETRY_CHAIN_BUDGET_MS: '' }), 45 * 1000,
+  // 默认值从 45s 提到 70s：常量语义从「起新尝试的预算」变成「整链截止」。
+  // 45s 那个数是按「已用时长」判的，压线起跑还能再烧一整个尝试，上界不成立。
+  assert.equal(api.retryChainBudgetMs({ FREEBUFF_RETRY_CHAIN_BUDGET_MS: '' }), 70 * 1000,
     '空串必须当「没设」处理，不能静默变成 0');
-  assert.equal(api.retryChainBudgetMs({}), 45 * 1000);
+  assert.equal(api.retryChainBudgetMs({}), 70 * 1000);
   assert.equal(api.retryChainBudgetMs({ FREEBUFF_RETRY_CHAIN_BUDGET_MS: '0' }), 0,
     '显式 0 = 只试第一个号，是合法意图');
   assert.equal(api.retryChainBudgetMs({ FREEBUFF_RETRY_CHAIN_BUDGET_MS: '30000' }), 30000);
-  assert.equal(api.retryChainBudgetMs({ FREEBUFF_RETRY_CHAIN_BUDGET_MS: 'abc' }), 45 * 1000,
+  assert.equal(api.retryChainBudgetMs({ FREEBUFF_RETRY_CHAIN_BUDGET_MS: 'abc' }), 70 * 1000,
     '非数字同样当「没设」');
+  // 截止仍压在客户端 75s 首字超时之下 —— 这是整条判据存在的理由。
+  assert.ok(api.retryChainBudgetMs({}) < 75 * 1000);
+});
+
+// 判据改成「已用 + 本次最坏成本 > 截止」后，成本必须来自既有超时常量，
+// 不能是拍脑袋的魔法数：换了超时值，判据要跟着自动对。
+test('attemptCostMs 取最坏值且流式/非流式分开', async () => {
+  const workerVm = createWorkerVm({ now: Date.UTC(2030, 0, 1) });
+  const { api } = workerVm;
+  // 非流式 = NONSTREAM_TIMEOUT_MS(60s)：AbortSignal.timeout 覆盖 body 读取，
+  // 所以它就是「发请求到聚合完成」的总上限。
+  assert.equal(api.attemptCostMs(false), 60 * 1000);
+  // 流式 = session + run + chat 建链（10s*2 + 20s）：拿到响应头就交给客户端了，
+  // 之后的流时长由收敛护栏管，与换号无关。
+  assert.equal(api.attemptCostMs(true), 40 * 1000);
+  assert.ok(api.attemptCostMs(true) < api.attemptCostMs(false),
+    '流式只等到响应头，必然比非流式聚合完便宜');
+  // 任何正成本都 > 0，所以显式预算 0 的「只试第一个号」语义天然保住。
+  assert.ok(api.attemptCostMs(true) > 0 && api.attemptCostMs(false) > 0);
+  // 诚实的边界：非流式两次尝试装不进 70s（60+60>70），新判据下几乎必然只试一次。
+  // 这是算术结论不是 bug —— 两次非流式本来也装不进客户端 75s。
+  assert.ok(api.attemptCostMs(false) * 2 > api.retryChainBudgetMs({}));
+  // 流式反过来必须还能换号：一次用掉 40s，第二次起跑时 40+40=80 > 70 会被拦，
+  // 但真实建链远快于最坏值，所以这里钉住的是「单次成本装得进截止」。
+  assert.ok(api.attemptCostMs(true) < api.retryChainBudgetMs({}),
+    '流式单次最坏成本必须装得进整链截止，否则第一个号之后永远换不了号');
 });

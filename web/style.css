@@ -1104,6 +1104,15 @@ details[open] > .calllog-summary { margin-bottom: 14px; }
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   margin-left: auto; text-align: right;
 }
+/* 被收敛护栏掐断的那一行：客户端拿到的是 200 + 不完整回答，行上必须看得出来。
+   用警示色徽标而不是整行变红 —— 这不是网关错误，正常字节仍然发出去了。 */
+.calllog-row .calllog-trunc {
+  flex: 0 0 auto;
+  padding: 1px 6px; border-radius: var(--r-sm);
+  border: 1px solid color-mix(in oklab, var(--amber) 35%, var(--line));
+  color: var(--amber);
+  font-size: 11px; font-weight: 600; white-space: nowrap;
+}
 
 /* ── 概况（移植自 zen） ───────────────────────────────────
    通栏卡内 2×2 四格。刻意用 .usage-* 私有类，不复用账号池概况的 .stats/.stat
