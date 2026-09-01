@@ -842,7 +842,7 @@ test('账号自动节点验证缓存过期后重新以该账号探测', async ()
     '明确被上游拒绝后，历史验证必须立刻失效，不能再走 stale 节点');
 });
 
-test('免费授权验证缓存恰好十五分钟', async () => {
+test('优先未用时免费授权验证缓存恰好十五分钟', async () => {
   let clock = 20_000;
   let verified = 0;
   const nodes = ['US-A'];
@@ -861,6 +861,9 @@ test('免费授权验证缓存恰好十五分钟', async () => {
     },
   });
   await service.setSubscription('https://sub.example.com/list');
+  // Free 是「优先未用」下的正常终态，15 分钟长缓存只对这个优先级成立；
+  // 「优先高级」下的 Free 只是兜底，另有更短 TTL（见下方回切用例）。
+  await service.setAccountSelectionPriority('unused');
   const verify = async () => {
     verified++;
     return { tier: 'free', model: 'mimo/mimo-v2.5' };
@@ -1967,6 +1970,100 @@ test('正常透明响应不会误触发 Request.signal abort', async () => {
   assert.equal(body, 'ok');
   assert.equal(workerSignal.aborted, false);
   await new Promise((resolve) => server.close(resolve));
+});
+
+test('优先高级下的 Free 兜底缓存必须短于 advanced，高级节点恢复后能回切', async () => {
+  const nodes = ['US-a', 'SG-b'];
+  let clock = 1000;
+  let sgAdvanced = false;
+  const { service } = fakeService({
+    controller: {
+      async request(path) {
+        if (path === '/proxies/freebuff-pool') return { all: nodes, now: nodes[0] };
+        if (path === '/proxies/freebuff-auto') return { now: nodes[0], all: nodes };
+        if (path.startsWith('/group/freebuff-pool/delay')) return { 'US-a': 10, 'SG-b': 20 };
+        return {};
+      },
+    },
+    service: {
+      now: () => clock,
+      buildFetch: async () => ({ fetch: async () => new Response('ok'), close: async () => {} }),
+    },
+  });
+  await service.setSubscription('https://sub.example.com/list');
+  await service.setAccountSelectionPriority('advanced');
+
+  const verify = async ({ node }) => (node === 'SG-b' && sgAdvanced
+    ? { tier: 'advanced', model: 'openai/gpt-5.6-luna' }
+    : { tier: 'free', model: 'mimo/mimo-v2.5' });
+
+  const first = await service.selectAccountNodeAuto({ lane: 0, identity: 'acct', verify });
+  assert.equal(first.node, 'US-a', '一轮扫描没有高级节点时必须兜底提交 Free 节点');
+  assert.equal(first.tier, 'free');
+
+  // 旧实现给 Free 记 15 分钟（比 advanced 的 10 分钟还长），3 分钟后仍会命中缓存。
+  sgAdvanced = true;
+  clock += 3 * 60 * 1000;
+  const second = await service.selectAccountNodeAuto({ lane: 0, identity: 'acct', verify });
+  assert.equal(second.cached, false, 'Free 兜底缓存必须已过期并重新探测');
+  assert.equal(second.node, 'SG-b', '高级节点恢复后必须回切');
+  assert.equal(second.tier, 'advanced');
+});
+
+test('优先级切换不能让在途 Free 探测沿用旧 TTL', async () => {
+  let clock = 1000;
+  let releaseVerify;
+  let signalVerify;
+  const started = new Promise((resolve) => { signalVerify = resolve; });
+  const gate = new Promise((resolve) => { releaseVerify = resolve; });
+  const nodes = ['US-a', 'SG-b'];
+  const { service } = fakeService({
+    controller: {
+      async request(path) {
+        if (path === '/proxies/freebuff-pool') return { all: nodes, now: nodes[0] };
+        if (path === '/proxies/freebuff-auto') return { all: nodes, now: nodes[0] };
+        if (path.startsWith('/group/freebuff-pool/delay')) return { 'US-a': 10, 'SG-b': 20 };
+        return {};
+      },
+    },
+    service: {
+      now: () => clock,
+      buildFetch: async () => ({ fetch: async () => new Response('ok'), close: async () => {} }),
+    },
+  });
+  await service.setSubscription('https://sub.example.com/list');
+  await service.setAccountSelectionPriority('unused');
+
+  const selecting = service.selectAccountNodeAuto({
+    lane: 0,
+    identity: 'acct',
+    verify: async () => {
+      signalVerify();
+      await gate;
+      return { tier: 'free', model: 'mimo/mimo-v2.5' };
+    },
+  });
+  await started;
+  await service.setAccountSelectionPriority('advanced');
+  releaseVerify();
+  const first = await selecting.then(
+    (value) => ({ value }),
+    (error) => ({ error }),
+  );
+  assert.equal(first.error?.code, 'ACCOUNT_EGRESS_SUPERSEDED',
+    '切换优先级必须明确废弃按旧策略启动的在途探测');
+
+  clock += 3 * 60 * 1000;
+  const second = await service.selectAccountNodeAuto({
+    lane: 0,
+    identity: 'acct',
+    verify: async ({ node }) => (node === 'SG-b'
+      ? { tier: 'advanced', model: 'openai/gpt-5.6-luna' }
+      : { tier: 'free', model: 'mimo/mimo-v2.5' }),
+  });
+  assert.equal(second.cached, false, '切换优先级后不得命中旧策略写下的 Free 缓存');
+  assert.equal(second.node, 'SG-b');
+  assert.equal(second.tier, 'advanced');
 });
 
 for (const { name, fn } of tests) {

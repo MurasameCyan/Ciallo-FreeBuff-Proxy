@@ -833,6 +833,8 @@ await tAsync('模型目录携带官方动态 pool 元数据', async () => {
       id: 'z-ai/glm-5.3-flash', session: 'z-ai/glm-5.3-flash',
       agent: 'base3-free-glm', root_agent: 'base3-free-glm',
       pool: 'glm_v53_flash',
+      sharedPool: 'premium',
+      perModelCap: { limit: 2, pool: 'glm_v53_flash', poolLabel: 'GLM 5.3 Flash' },
     },
     {
       id: 'anthropic/claude-fable-5', session: 'anthropic/claude-fable-5',
@@ -842,7 +844,8 @@ await tAsync('模型目录携带官方动态 pool 元数据', async () => {
   ]);
   const body = await (await handleModels()).json();
   const glm = body.data.find((model) => model.id === 'z-ai/glm-5.3-flash');
-  if (!glm || glm.pool !== 'glm_v53_flash' || glm.tier !== 'limited') {
+  if (!glm || glm.pool !== 'glm_v53_flash' || glm.sharedPool !== 'premium'
+    || glm.perModelCap?.limit !== 2 || glm.tier !== 'limited') {
     throw new Error('GLM 5.3 独立 cap 池分组错误: ' + JSON.stringify(glm));
   }
   const luna = body.data.find((entry) => entry.id === 'openai/gpt-5.6-luna');

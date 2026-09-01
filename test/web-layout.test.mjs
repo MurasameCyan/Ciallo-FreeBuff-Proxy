@@ -197,8 +197,14 @@ assert.ok(app.includes('renderQuotaHead()'), 'renderAccounts 必须刷新额度�
 assert.ok(!app.includes('quota-reset'), '重置时间已上移列标题，行内不应再有 quota-reset');
 assert.ok(!app.includes('tokenShort'),
   '账号面板不得展示或依赖 token 短哈希');
-assert.match(app, /function accountQuotaSummary\(probe\)[\s\S]*?glm_v53_flash[\s\S]*?premium/s,
+assert.match(app, /const POOL_BADGE_LABELS = \{[\s\S]*?glm_v53_flash: 'G'[\s\S]*?premium: 'P'/s,
   '账号额度必须把 GLM 5.3 Flash 独立池与 Premium 分开聚合');
+// 官方 FreebuffSessionRateLimit 对 pool 的要求是「clients must GROUP by it and
+// never match on its value, or the next pool needs a release」。之前这里按
+// ['glm_v53_flash','premium','limited'] 白名单过滤，任何没登记的池整行被丢掉，
+// 账号行只剩 ( P5 )，看起来像独立额度探测失败。
+assert.doesNotMatch(app, /\[[^\]]*'glm_v53_flash'[^\]]*\]\.includes\(pool\)/,
+  '额度聚合不得用池白名单过滤，未登记的上游池会整行丢失');
 assert.match(app, /`\( \$\{parts\.join\(' '\)\} \)`/,
   '账号名后必须紧凑呈现 ( G2 P3 ) 形式的剩余可开会话数');
 assert.doesNotMatch(app, /parts\.push\([^)]*\/\$\{row\.limit\}/,
@@ -511,11 +517,20 @@ assert.match(app, /function selectedKeyModels\(\)[\s\S]*?\.filter\(Boolean\)/s,
   '编辑旧 Key 时必须保留已暂停模型白名单，不能静默丢失');
 assert.match(css, /\.pill\.tier-glm_v53_flash\s*\{[^}]*color:/s,
   'GLM 5.3 Flash 独立 tag 必须有专用样式');
+assert.match(css, /\.pill\.cap\s*\{[^}]*color:/s,
+  '独立 cap 注记必须有专用样式');
+// 上游 rateLimitsByModel 每个模型只给一行（「下一次准入记到哪个池」），cap 未触顶时
+// 那行就是共享池，独立 cap 的已用次数根本不在 wire 上。所以注记只能陈述上限；
+// 一旦这里开始算剩余，就是代理自己数的估算值，跨实例/面板外调用都会偏。
+assert.match(app, /function perModelCapNote[\s\S]*?上限 \$\{esc\(String\(limit\)\)\}\/日/s,
+  '独立 cap 注记必须直接给出上限次数');
+assert.doesNotMatch(app, /function perModelCapNote[\s\S]*?limit\s*-\s*(?:used|row\.used|recentCount)/s,
+  '独立 cap 注记不得推算剩余次数：上游不下发这一层的已用计数');
 
 const helperSource = `const S = { models: [], health: {} };\nconst esc = (value) => String(value);\n${app.match(/const MODEL_TIER_LABELS = \{[^\n]+/)[0]}\n`
-  + `${app.slice(app.indexOf('const MODEL_DISPLAY ='), app.indexOf('function modelsCellHtml'))}\n`
+  + `${app.slice(app.indexOf('const MODEL_DISPLAY ='), app.indexOf('function poolResetAt'))}\n`
   + 'globalThis.__modelState = S;\n'
-  + 'globalThis.__modelUi = { accountQuotaSummary, modelName, modelDisplay, modelListHtml };';
+  + 'globalThis.__modelUi = { accountQuotaSummary, modelName, modelDisplay, modelListHtml, perModelCapNote, modelsCellHtml };';
 const helperVm = { globalThis: null };
 helperVm.globalThis = helperVm;
 vm.runInNewContext(helperSource, helperVm);
@@ -632,6 +647,123 @@ assert.match(
   /tier-glm_v53_flash">GLM<\/span>/,
   '账号行缺少 pool 时必须回退模型目录的 GLM 标签',
 );
+
+// ── 独立额度不得因为池名不在白名单里被整行丢掉 ─────────────────────
+// 现网实测：账号行显示 ( P5 )，GLM 5.3 Flash 的 2 次/日独立额度完全不出现。
+// 原因不在 worker（目录解析出的 pool 就是 glm_v53_flash），而在面板：
+// accountQuotaSummary 曾用 ['glm_v53_flash','premium','limited'] 白名单过滤，
+// 池名一旦落在名单外（目录把 5.3 归进 GLM 集合 → pool='glm'）整行被 continue 掉。
+// 官方 FreebuffSessionRateLimit 明确要求 pool 按不透明 token 分组、不得按值匹配。
+helperVm.__modelState.models = [{ id: 'z-ai/glm-5.3-flash', pool: 'glm' }];
+assert.deepEqual(
+  JSON.parse(JSON.stringify(helperVm.__modelUi.accountQuotaSummary({ quota: [
+    { model: 'z-ai/glm-5.3-flash', used: 0, limit: 2 },
+    { model: 'deepseek/deepseek-v4-flash', used: 0, limit: 5, pool: 'premium' },
+  ] }))),
+  {
+    text: '( P5 G52:2 )',
+    title: '额度 P 剩 5 / 已用 0 / 上限 5 · G52 剩 2 / 已用 0 / 上限 2',
+  },
+  '池名不在已知短名表里也必须出徽标，不能只剩 ( P5 ) 让独立额度看起来没探到',
+);
+// 不透明 token：上游改名/新增池都不该需要发面板版本。
+assert.deepEqual(
+  JSON.parse(JSON.stringify(helperVm.__modelUi.accountQuotaSummary({ quota: [
+    { model: 'deepseek/deepseek-v4-flash', used: 0, limit: 5, pool: 'premium' },
+    {
+      model: 'z-ai/glm-5.3-flash',
+      used: 0.5,
+      limit: 2,
+      pool: 'glm_v53_flash_v2',
+      poolLabel: 'GLM 5.3 Flash',
+    },
+  ] }))),
+  {
+    text: '( P5 glmv53:1.5 )',
+    title: '额度 P 剩 5 / 已用 0 / 上限 5 · glmv53(GLM 5.3 Flash) 剩 1.5 / 已用 0.5 / 上限 2',
+  },
+  '全新池 token 必须照样显示，并把上游 poolLabel 带进 title',
+);
+assert.deepEqual(
+  JSON.parse(JSON.stringify(helperVm.__modelUi.accountQuotaSummary({ quota: [
+    { model: 'vendor/a', used: 1, limit: 5, pool: 'Pool-A' },
+    { model: 'vendor/b', used: 0, limit: 8, pool: 'pool-a' },
+  ] }))),
+  {
+    text: '( PoolA4 poola8 )',
+    title: '额度 PoolA 剩 4 / 已用 1 / 上限 5 · poola 剩 8 / 已用 0 / 上限 8',
+  },
+  'opaque pool token 必须按精确值分组，大小写不同的 token 不能合并',
+);
+// 多字符短名和数字之间必须有分隔：G52 + 2 不能连成看不懂的 G522。
+helperVm.__modelState.models = [];
+assert.deepEqual(
+  JSON.parse(JSON.stringify(helperVm.__modelUi.accountQuotaSummary({ quota: [
+    { model: 'z-ai/glm-5.2', used: 1, limit: 3, pool: 'glm', poolLabel: 'GLM 5.2' },
+  ] }))),
+  { text: '( G52:2 )', title: '额度 G52(GLM 5.2) 剩 2 / 已用 1 / 上限 3' },
+  '多字符池短名必须与数字分隔，否则 G52 剩 2 会显示成 G522',
+);
+// 0/0 = 该池未解锁（没拿到 referral 的 glm-5.2），与「解锁了但打满」不同：
+// 前者不出徽标，后者必须显示成 0。
+assert.deepEqual(
+  JSON.parse(JSON.stringify(helperVm.__modelUi.accountQuotaSummary({ quota: [
+    { model: 'deepseek/deepseek-v4-flash', used: 0, limit: 5, pool: 'premium' },
+    { model: 'z-ai/glm-5.2', used: 0, limit: 0, pool: 'glm' },
+  ] }))),
+  { text: '( P5 )', title: '额度 P 剩 5 / 已用 0 / 上限 5' },
+  '整池 0/0 的未解锁池不得多出一个永远是 0 的徽标',
+);
+
+// ── 独立 cap 注记：只陈述上限，不推算剩余 ────────────────────────
+// 上游 rateLimitsByModel 每个模型只给一行，报的是「下一次准入会记到哪个池」：
+// GLM 5.3 Flash 的 cap 没触顶时那行就是共享池 premium 5 次，独立 cap 的已用次数
+// 根本不在 wire 上。所以面板显示的是 worker 从官方 FREEBUFF_PER_MODEL_SESSION_CAPS
+// 解析出的上限，不是估算的剩余——估算跨实例必偏，宁可不给数字。
+helperVm.__modelState.models = [{
+  id: 'z-ai/glm-5.3-flash',
+  pool: 'glm_v53_flash',
+  perModelCap: { limit: 2, poolLabel: 'GLM 5.3 Flash' },
+}];
+const capNote = helperVm.__modelUi.perModelCapNote('z-ai/glm-5.3-flash');
+assert.match(capNote, /上限 2\/日/, '有独立 cap 的模型必须显示上限');
+assert.match(capNote, /GLM 5\.3 Flash/, 'title 必须带上游 poolLabel');
+// 徽标可见文字里不得出现推算的剩余次数：上游不给这一层计数，估算跨实例必偏。
+// 只检徽标本体，不检 title —— title 里那句「只给上限、不估剩余」正是在说明这件事，
+// 连 title 一起禁「剩」会把解释文案本身判成违规。
+assert.doesNotMatch(capNote.replace(/title="[^"]*"/g, ''), /剩/,
+  'cap 徽标不得显示推算的剩余次数：上游不给这一层计数，估算的数字会骗人');
+assert.equal(helperVm.__modelUi.perModelCapNote('openai/gpt-5.6-luna'), '',
+  '没有独立 cap 的模型不得凭空多出上限注记');
+assert.equal(helperVm.__modelUi.perModelCapNote('vendor/unknown'), '',
+  '目录里没有的模型不得生成 cap 注记');
+helperVm.__modelState.models = [
+  {
+    id: 'z-ai/glm-5.3-flash',
+    pool: 'glm_v53_flash',
+    sharedPool: 'premium',
+    perModelCap: { limit: 2, poolLabel: 'GLM 5.3 Flash' },
+  },
+  { id: 'openai/gpt-5.6-luna', pool: 'premium' },
+];
+assert.match(
+  helperVm.__modelUi.modelsCellHtml({ quota: [
+    { model: 'openai/gpt-5.6-luna', used: 0, limit: 5, pool: 'premium' },
+  ] }),
+  /glm-5\.3-flash[\s\S]*?上限 2\/日/,
+  '上游没有 GLM quota 行时，也必须用共享 Premium 行显示目录中的独立 cap',
+);
+assert.doesNotMatch(
+  helperVm.__modelUi.modelsCellHtml({ quota: [
+    { model: 'z-ai/glm-5.3-flash', used: 0, limit: 0, pool: 'glm_v53_flash' },
+    { model: 'openai/gpt-5.6-luna', used: 0, limit: 5, pool: 'premium' },
+  ] }),
+  /glm-5\.3-flash/,
+  '上游明确返回 GLM 0/0 时表示未解锁，不得按缺行重新补出独立 cap',
+);
+helperVm.__modelState.models = [{ id: 'z-ai/glm-5.3-flash', perModelCap: { limit: 0 } }];
+assert.equal(helperVm.__modelUi.perModelCapNote('z-ai/glm-5.3-flash'), '',
+  'limit<=0 的畸形 cap 不得渲染成「上限 0/日」');
 helperVm.__modelState.models = [];
 assert.deepEqual(
   JSON.parse(JSON.stringify(helperVm.__modelUi.modelDisplay('minimax/minimax-m3'))),

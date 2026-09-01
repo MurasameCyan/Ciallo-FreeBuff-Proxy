@@ -438,7 +438,7 @@ function modelListHtml(modelIds = [], models = null) {
 }
 
 function normalizeQuotaPool(pool) {
-  const value = String(pool || '').trim().toLowerCase();
+  const value = String(pool || '').trim();
   return value === 'luna' ? 'premium' : value;
 }
 
@@ -466,47 +466,109 @@ function usableQuota(probe) {
   return quotaRows(probe).filter((q) => Number(q.limit) > 0);
 }
 
+// 徽标短标签。官方 FreebuffSessionRateLimit 明确写了 pool 是不透明 token：
+// 「clients must GROUP by it and never match on its value, or the next pool
+// needs a release」。所以这里只是给已知 token 配一个好看的短名，不做准入判断——
+// 早先版本用 ['glm_v53_flash','premium','limited'] 白名单过滤，结果上游任何
+// 没登记的池（GLM 5.2 的 glm、以及 GLM 5.3 Flash 换名后的 cap 池）整行被丢掉，
+// 账号行只剩 ( P5 )，看起来像「独立额度没探到」。
+const POOL_BADGE_LABELS = {
+  glm_v53_flash: 'G',
+  premium: 'P',
+  // accessTier=limited 的号只有这一个池（上游 poolLabel "Daily"，只覆盖 flash/mimo）。
+  // 不列出来的话这类账号整行没有任何剩余数字，看起来像探测失败。
+  limited: 'Ltd',
+  // GLM 5.2 referral 独立池，和上面的 5.3 Flash cap 池是两回事。
+  glm: 'G52',
+  standard: 'Std',
+};
+// 已知池固定在前保证顺序稳定；未知 token 按首次出现顺序追加，不被丢弃。
+const POOL_BADGE_ORDER = ['glm_v53_flash', 'premium', 'limited', 'glm', 'standard'];
+
+function poolBadgeLabel(pool) {
+  const known = POOL_BADGE_LABELS[pool];
+  if (known) return known;
+  // 未知池不猜含义：截一段 token 当徽标，完整 token 和上游 poolLabel 放 title。
+  const compact = String(pool).replace(/[^a-z0-9]+/gi, '');
+  return (compact || String(pool)).slice(0, 6);
+}
+
+// 徽标是 label 紧接剩余数（P5）。label 末尾是数字时必须插一个分隔符，
+// 否则 G52 池剩 2 会渲染成「G522」，读起来像剩 522 次。已知的字母结尾 label
+// （G/P/Ltd/Std）保持原来的紧凑写法不变。
+function poolBadgeText(pool, value) {
+  const label = poolBadgeLabel(pool);
+  return /[0-9]$/.test(label) ? `${label}:${value}` : `${label}${value}`;
+}
+
 function accountQuotaSummary(probe) {
   const pools = new Map();
+  // 这里读全部 limit>=0 的行（不是只读 limit>0）：同池快照不一致时要能看到那个 0，
+  // 否则会把「其实已经没额度」显示成还有剩余。是否出徽标另由 hasUsable 决定。
   for (const row of quotaRows(probe)) {
     const pool = quotaPoolForRow(row);
-    if (!['glm_v53_flash', 'premium', 'limited'].includes(pool)) continue;
+    if (!pool) continue;
     const limit = Number(row.limit);
     const usedValue = row.used ?? row.recentCount;
     const used = Number.isFinite(Number(usedValue)) ? Number(usedValue) : null;
+    // poolLabel 是上游给的展示串，专门用来让新池不必发客户端版本。
+    const poolLabel = String(row.poolLabel || '').trim();
     const previous = pools.get(pool);
-    if (!previous) pools.set(pool, { limit, used });
+    if (!previous) pools.set(pool, { limit, used, poolLabel, hasUsable: limit > 0 });
     else {
       // 同一共享池的各模型行正常应完全一致。若上游短暂返回不一致快照，
       // 用较小上限避免 UI 高估可用额度；已用量取较大值同样保持保守。
       pools.set(pool, {
         limit: Math.min(previous.limit, limit),
         used: previous.used == null ? used : used == null ? previous.used : Math.max(previous.used, used),
+        poolLabel: previous.poolLabel || poolLabel,
+        hasUsable: previous.hasUsable || limit > 0,
       });
     }
   }
-  const poolOrder = [
-    ['glm_v53_flash', 'G'],
-    ['premium', 'P'],
-    // accessTier=limited 的号只有这一个池（上游 poolLabel "Daily"，只覆盖 flash/mimo）。
-    // 不列出来的话这类账号整行没有任何剩余数字，看起来像探测失败。
-    ['limited', 'Ltd'],
+  // 整池所有行都是 0/0 = 该池未解锁（未拿到 referral 的 glm-5.2 就是这样），
+  // 和「解锁了但这一刻打满」不是一回事：前者不出徽标，后者要显示成 0。
+  for (const [pool, row] of [...pools]) if (!row.hasUsable) pools.delete(pool);
+  const ordered = [
+    ...POOL_BADGE_ORDER.filter((pool) => pools.has(pool)),
+    ...[...pools.keys()].filter((pool) => !POOL_BADGE_ORDER.includes(pool)),
   ];
   const parts = [];
   const details = [];
-  for (const [pool, label] of poolOrder) {
+  for (const pool of ordered) {
     const row = pools.get(pool);
-    if (!row) continue;
+    const label = poolBadgeLabel(pool);
     // 上游 rateLimitsByModel 只给 recentCount，remaining 一直是 null，所以剩余现算。
     // recentCount 是 0.1 粒度的小数，直接相减会冒出 5-3.7=1.2999999999999998 这种浮点渣，
     // 所以按 0.1 归整。ponytail: 已用未知就显示 ?，不猜成满额；上游哪天真给 remaining 再优先读它。
     const round1 = (v) => Math.round(v * 10) / 10;
     const left = row.used == null ? null : Math.max(0, round1(row.limit - row.used));
-    parts.push(`${label}${left == null ? '?' : left}`);
-    details.push(`${label} 剩 ${left == null ? '—' : left} / 已用 ${row.used == null ? '—' : round1(row.used)} / 上限 ${row.limit}`);
+    parts.push(poolBadgeText(pool, left == null ? '?' : left));
+    details.push(`${label}${row.poolLabel ? `(${row.poolLabel})` : ''} 剩 ${left == null ? '—' : left} / 已用 ${row.used == null ? '—' : round1(row.used)} / 上限 ${row.limit}`);
   }
   if (!parts.length) return null;
   return { text: `( ${parts.join(' ')} )`, title: `额度 ${details.join(' · ')}` };
+}
+
+// 独立 cap 注记。官方 FREEBUFF_PER_MODEL_SESSION_CAPS 给某些模型加了一层
+// 「共享池之外的每日上限」（当前只有 GLM 5.3 Flash，2 次/日），worker 把它
+// 解析好后经 /v1/models 的 perModelCap 下发。
+//
+// ⚠️ 这里只陈述上限，不推算剩余。原因是上游 rateLimitsByModel 每个模型只给一行，
+// 报的是「下一次准入会记到哪个池」：cap 没触发时那行就是共享池（premium 5 次），
+// 独立 cap 的已用次数根本不在 wire 上。想显示「还剩几次」只能由代理自己数，
+// 跨实例/面板外调用都会偏，宁可不给数字也不给一个会骗人的数字。
+function perModelCapNote(model) {
+  const entry = Array.isArray(S.models)
+    ? S.models.find((m) => m?.id === model)
+    : null;
+  const cap = entry?.perModelCap;
+  const limit = Number(cap?.limit);
+  if (!cap || !Number.isFinite(limit) || limit <= 0) return '';
+  const label = String(cap.poolLabel || '').trim();
+  const title = `${label ? label + '：' : ''}独立上限 ${limit} 次/日，与共享池分开计算。`
+    + '上游只在这一层触顶时才单独下发计数，因此这里只给上限、不估剩余。';
+  return ` <span class="pill cap" title="${esc(title)}">上限 ${esc(String(limit))}/日</span>`;
 }
 
 // 可用模型列：只列真正有额度（limit>0）的模型，每个模型独占一行；0/0 未解锁模型
@@ -526,7 +588,21 @@ function modelsCellHtml(probe) {
     }
     return '<span class="quota">—</span>';
   }
-  const items = rows.map((q) => `<li>${modelListHtml([q.model], [q])}</li>`).join('');
+  // 是否缺行必须看完整 quotaRows：显式 0/0 是“已返回但未解锁”，不能当成缺行。
+  const observedModels = new Set(quotaRows(probe).map((row) => row?.model).filter(Boolean));
+  const usablePools = new Set(rows.map(quotaPoolForRow).filter(Boolean));
+  // 独立 cap 没触发时上游只回共享池行。目录用 sharedPool 说明适用范围，
+  // 账号确实有该共享池时补出模型行；limited 等不具备共享池的账号不会误显示。
+  const capModels = (Array.isArray(S.models) ? S.models : []).filter((model) => {
+    const id = String(model?.id || '').trim();
+    const sharedPool = normalizeQuotaPool(model?.sharedPool);
+    return id && !observedModels.has(id) && !isPausedModelId(id) && !isHiddenModelId(id)
+      && sharedPool && usablePools.has(sharedPool) && perModelCapNote(id);
+  });
+  const items = [
+    ...rows.map((q) => `<li>${modelListHtml([q.model], [q])}${perModelCapNote(q.model)}</li>`),
+    ...capModels.map((model) => `<li>${modelListHtml([model.id], [model])}${perModelCapNote(model.id)}</li>`),
+  ].join('');
   return `<ul class="quota quota-models">${items}</ul>`;
 }
 

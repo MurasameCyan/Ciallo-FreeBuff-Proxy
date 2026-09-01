@@ -514,6 +514,14 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
 .pill.tier-glm     { color: var(--amber);  border-color: color-mix(in oklab, var(--amber) 30%, transparent); }
 .pill.tier-paused  { color: var(--fg-2);  border-color: color-mix(in oklab, var(--fg-2) 45%, transparent); }
 .pill.tier-pool-other { color: var(--fg-2); border-color: color-mix(in oklab, var(--fg-2) 35%, transparent); }
+/* 独立 cap 注记（官方 FREEBUFF_PER_MODEL_SESSION_CAPS，当前只有 GLM 5.3 Flash）。
+   它陈述的是上限而不是剩余，所以刻意做成弱化的次要信息：比 tier tag 更淡，
+   不抢账号行里真实剩余数字的注意力。 */
+.pill.cap {
+  color: var(--fg-2);
+  border-color: color-mix(in oklab, var(--fg-2) 30%, transparent);
+  font-size: 9px; padding: 0 4px; letter-spacing: 0;
+}
 /* 模型列表：纯文本清单，不再给每个模型名套卡片(边框+底色)——一屏九行卡片噪音大过信息，
    去掉包裹后行距收紧到 3px、字号降到 10px，列表宽度也跟着按最长模型名收窄。 */
 .models {

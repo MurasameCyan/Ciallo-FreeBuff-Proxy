@@ -5919,15 +5919,37 @@ async function handleModels(client = null, { forceRefresh = false } = {}) {
       // 分组键与排序都取自 MODEL_TIERS：免费 → US/SG → 限定 → 未分组。
       const declaredPool = safePoolName(m.pool);
       const pool = declaredPool || modelPoolCategory(m.id, null, snapshotCache) || "";
+      const sharedPool = safePoolName(m.sharedPool);
       const tier = modelCatalogTier(m.id, pool);
       const rank = tier ? MODEL_TIERS.findIndex(([key]) => key === tier) : -1;
+      // 独立 cap（官方 FREEBUFF_PER_MODEL_SESSION_CAPS，目前只有 GLM 5.3 Flash 一条）。
+      // 必须单独发出来，因为它在 rateLimitsByModel 里查不到：上游每个模型只给一行，
+      // 报的是「下一次准入记到哪个池」，cap 未触发时那行报共享池 premium，独立
+      // cap 的计数完全不在 wire 上。面板因此无法从额度快照推出这个上限，只能由
+      // 目录侧告诉它。这里只发 limit/pool/poolLabel —— 都是官方常量的原值；
+      // 「还剩几次」不发，代理没有可靠计数（跨实例、面板外调用都数不到），
+      // 猜一个数字比不显示更糟。
+      const cap = m.perModelCap && Number.isFinite(Number(m.perModelCap.limit))
+        && safePoolName(m.perModelCap.pool)
+        ? {
+          limit: Number(m.perModelCap.limit),
+          pool: safePoolName(m.perModelCap.pool),
+          ...(String(m.perModelCap.poolLabel || "").trim()
+            ? { poolLabel: String(m.perModelCap.poolLabel).slice(0, 64) }
+            : {}),
+        }
+        : null;
       return {
         id: m.id,
         object: "model",
         created: Math.floor(Date.now() / 1000),
         owned_by: "freebuff",
         ...(pool ? { pool } : {}),
+        ...(sharedPool ? { sharedPool } : {}),
         ...(tier ? { tier } : {}),
+        // camelCase 跟随同族字段：poolLabel 就嵌在这个对象里，
+        // recentCount/resetAt/retryAfterMs 也都是 camel。面板按 perModelCap 读。
+        ...(cap ? { perModelCap: cap } : {}),
         _sort: rank < 0 ? MODEL_TIERS.length : rank,
       };
     })

@@ -51,6 +51,10 @@ for (const [name, port] of [['MIHOMO_MIXED_PORT', MIXED_PORT], ['MIHOMO_CTRL_POR
 }
 const ACCOUNT_AUTO_CACHE_TTL_MS = 10 * 60 * 1000;
 const ACCOUNT_FREE_AUTO_CACHE_TTL_MS = 15 * 60 * 1000;
+// 优先高级时命中的 Free 只是「这一轮没扫到高级节点」的兜底，不是稳定终态：
+// 缓存必须短于 advanced，否则降级结果反而被记更久，高级节点空出来也不会回切。
+// ponytail: 固定 2 分钟，不做自适应。上限是重探频率，要更快只能缩短这个值。
+const ACCOUNT_FREE_DOWNGRADE_CACHE_TTL_MS = 2 * 60 * 1000;
 const ACCOUNT_AUTO_RETRY_TTL_MS = 60 * 1000;
 const MIHOMO_BIN = process.env.MIHOMO_BIN || '/usr/local/bin/mihomo';
 // mihomo 数据（订阅缓存、配置）放到数据目录。默认跟随 server.js 的 DATA_DIR
@@ -1301,10 +1305,19 @@ export function createProxyService({
         if (cfg.accountSelectionPriority === priority) return snapshot();
         cfg.accountSelectionPriority = priority;
         save();
-        for (const [lane, validation] of accountAutoValidations) {
+        // 策略切换必须废弃所有已启动的自动选择，不只是已有 validation 的 lane。
+        // 否则尚在 verify 的旧策略操作仍能提交 Free，并写入旧策略对应的长 TTL。
+        const lanes = new Set([
+          ...accountOperationVersions.keys(),
+          ...accountAutoValidations.keys(),
+        ]);
+        for (const lane of lanes) {
           bumpAccountOperation(lane);
           invalidateAccountProbeLane(lane);
-          accountAutoValidations.set(lane, { ...validation, stale: true, expiresAt: 0 });
+          const validation = accountAutoValidations.get(lane);
+          if (validation) {
+            accountAutoValidations.set(lane, { ...validation, stale: true, expiresAt: 0 });
+          }
         }
         try { onAutoRefresh?.({ force: true }); } catch (error) {
           serviceLogger('warn', `[proxy] 账号出站优先级切换后重验调度失败: ${cleanError(error)}`);
@@ -1389,6 +1402,11 @@ export function createProxyService({
       const selectionPriority = cfg.accountSelectionPriority;
       const attemptedNodes = new Set();
       let freeFallback = null;
+      // Free 在「优先未用」下是正常终态，在「优先高级」下只是兜底，按语义分别给 TTL。
+      const freeAwareCacheTtl = (tier) => (tier === 'free'
+        ? (selectionPriority === 'advanced'
+          ? ACCOUNT_FREE_DOWNGRADE_CACHE_TTL_MS : ACCOUNT_FREE_AUTO_CACHE_TTL_MS)
+        : ACCOUNT_AUTO_CACHE_TTL_MS);
 
       // 只在 serial 队列内调用：reservation 已经属于当前 operation 时，
       // 把验证通过的节点切到业务 lane 并写入授权缓存。
@@ -1414,8 +1432,7 @@ export function createProxyService({
           generation: accountGenerations.get(lane),
           tier: authorization?.tier || null,
           model: authorization?.model || null,
-          expiresAt: now() + (authorization?.tier === 'free'
-            ? ACCOUNT_FREE_AUTO_CACHE_TTL_MS : ACCOUNT_AUTO_CACHE_TTL_MS),
+          expiresAt: now() + freeAwareCacheTtl(authorization?.tier),
         });
         return {
           lane,
