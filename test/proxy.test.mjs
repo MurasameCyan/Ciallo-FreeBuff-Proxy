@@ -724,6 +724,92 @@ test('优先高级找不到未占用高级节点时才复用已占用高级节�
   assert.deepEqual(verified, ['US-advanced', 'SG-free', 'US-advanced']);
 });
 
+test('force 重扫先回到自己已知的高级节点，不再从 Free 节点重新爬一遍', async () => {
+  const nodes = ['US-F1', 'US-F2', 'US-adv'];
+  const verified = [];
+  const { service } = fakeService({
+    controller: {
+      async request(path) {
+        if (path === '/proxies/freebuff-pool') return { all: nodes, now: nodes[0] };
+        if (path === '/proxies/freebuff-auto') return { now: nodes[0], all: nodes };
+        if (path.startsWith('/group/freebuff-pool/delay')) {
+          return { 'US-F1': 10, 'US-F2': 20, 'US-adv': 30 };
+        }
+        return {};
+      },
+    },
+    service: {
+      buildFetch: async () => ({ fetch: async () => new Response('ok'), close: async () => {} }),
+    },
+  });
+  await service.setSubscription('https://sub.example.com/list');
+  const verify = async ({ node }) => {
+    verified.push(node);
+    return node === 'US-adv'
+      ? { tier: 'advanced', model: 'openai/gpt-5.6-luna' }
+      : { tier: 'free', model: 'mimo/mimo-v2.5' };
+  };
+
+  const first = await service.selectAccountNodeAuto({ lane: 0, identity: 'acct', verify });
+  assert.equal(first.node, 'US-adv');
+  assert.deepEqual(verified, nodes, '首轮没有记忆，Free 节点在前就得按延迟顺序挨个探');
+
+  // 面板「刷新出站」走 force：跳过缓存重新验证。此时必须先回头验自己刚才那个高级节点，
+  // 否则会按延迟顺序把 Free 节点重爬一遍（线上 117 个候选 ≈ 10 分钟都在 Free 上）。
+  const refreshed = await service.selectAccountNodeAuto({
+    lane: 0, identity: 'acct', force: true, verify,
+  });
+  assert.equal(refreshed.node, 'US-adv', 'force 重扫不该把账号刷成 Free');
+  assert.equal(refreshed.tier, 'advanced');
+  assert.deepEqual(verified.slice(nodes.length), ['US-adv'],
+    'force 重扫只需确认已知的高级节点还在，不必重探已知是 Free 的节点');
+});
+
+test('优先高级复用高级节点后，被复用的账号不丢缓存', async () => {
+  const nodes = ['US-F1', 'US-F2', 'US-F3', 'US-adv'];
+  const verified = [];
+  const { service } = fakeService({
+    controller: {
+      async request(path) {
+        if (path === '/proxies/freebuff-pool') return { all: nodes, now: nodes[0] };
+        if (path === '/proxies/freebuff-auto') return { now: nodes[0], all: nodes };
+        if (path.startsWith('/group/freebuff-pool/delay')) {
+          return { 'US-F1': 10, 'US-F2': 20, 'US-F3': 30, 'US-adv': 40 };
+        }
+        return {};
+      },
+    },
+    service: {
+      buildFetch: async () => ({ fetch: async () => new Response('ok'), close: async () => {} }),
+    },
+  });
+  await service.setSubscription('https://sub.example.com/list');
+  const verify = async ({ node }) => {
+    verified.push(node);
+    return node === 'US-adv'
+      ? { tier: 'advanced', model: 'openai/gpt-5.6-luna' }
+      : { tier: 'free', model: 'mimo/mimo-v2.5' };
+  };
+
+  const first = await service.selectAccountNodeAuto({ lane: 0, identity: 'first', verify });
+  assert.equal(first.node, 'US-adv');
+  assert.deepEqual(verified, nodes);
+
+  const second = await service.selectAccountNodeAuto({ lane: 1, identity: 'second', verify });
+  assert.equal(second.node, 'US-adv', '唯一的高级节点已被占用时应复用它，而不是留在 Free 节点上');
+  assert.deepEqual(verified.slice(nodes.length), ['US-F1', 'US-adv'],
+    '已知 Free 的节点不必重探：拿到一个 Free 兜底后就该直接去复用高级节点');
+
+  // 复用是「优先高级」允许的，所以被复用的一方不能因此判定缓存失效——否则两个账号会
+  // 围着同一个高级节点来回抢：谁被复用谁重扫，重扫完又把节点让出去。
+  const verifiedBeforeCacheHit = verified.length;
+  const held = await service.selectAccountNodeAuto({ lane: 0, identity: 'first', verify });
+  assert.equal(held.node, 'US-adv');
+  assert.equal(held.cached, true, '高级节点被别的账号复用后，原账号仍应命中缓存');
+  assert.equal(held.tier, 'advanced');
+  assert.equal(verified.length, verifiedBeforeCacheHit, '被复用不该触发重新探测模型目录');
+});
+
 test('账号进入终态后立即停止自动节点验证，不继续携带 Bearer 遍历候选', async () => {
   const nodes = ['US-A', 'SG-B'];
   const verified = [];

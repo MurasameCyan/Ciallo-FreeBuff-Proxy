@@ -56,6 +56,14 @@ const ACCOUNT_FREE_AUTO_CACHE_TTL_MS = 15 * 60 * 1000;
 // ponytail: 固定 2 分钟，不做自适应。上限是重探频率，要更快只能缩短这个值。
 const ACCOUNT_FREE_DOWNGRADE_CACHE_TTL_MS = 2 * 60 * 1000;
 const ACCOUNT_AUTO_RETRY_TTL_MS = 60 * 1000;
+// 节点授权层级的记忆。没有它，每一轮「优先高级」都要把上百个候选重新探一遍：
+// 实测 117 个 US/SG 候选、单次探测上限 5s、Free 兜底缓存只有 2 分钟，等于每个账号
+// 永远在扫节点，面板上看就是「节点一直在换」，而 10 个账号扫的是同一批节点。
+// ponytail: 按节点名做全局记忆，不按账号拆。accessTier 由出口 IP 决定，同一 IP 对
+// 不同免费账号给的层级一致（accountAutoCandidates 原本就在跨 lane 复用这个假设）。
+// 上限：真出现「同一节点对 A 免费对 B 高级」时会来回改写记忆，但每次提交仍以本次
+// 探测结果为准，只多花一次探测。要更严就把 key 改成 `${identity}\n${node}`。
+const ACCOUNT_NODE_TIER_TTL_MS = 30 * 60 * 1000;
 const MIHOMO_BIN = process.env.MIHOMO_BIN || '/usr/local/bin/mihomo';
 // mihomo 数据（订阅缓存、配置）放到数据目录。默认跟随 server.js 的 DATA_DIR
 // （Docker 里是 /data 卷，node 用户可写；本地开发回退到 ./data/.mihomo）。
@@ -457,6 +465,8 @@ export function createProxyService({
   // 先占位再验证，避免多个账号都拿到同一个最低延迟节点。
   const accountAutoReservations = new Map();
   const accountRejectedNodes = new Map();
+  // 节点名 -> { tier, expiresAt }：任一账号探到过的授权层级，供选点排序复用。
+  const accountNodeTiers = new Map();
   const accountProbeDispatchers = new Map();
   let nextAccountGeneration = 1;
   let healthTimer = null;
@@ -579,6 +589,10 @@ export function createProxyService({
 
   function advanceAccountTopology(nextNodeNames) {
     accountTopologyVersion++;
+    // 节点名里带着速率/负载百分比，订阅刷新后同一台机器也可能换名字：只留还在池里的键。
+    for (const node of accountNodeTiers.keys()) {
+      if (!nextNodeNames.includes(node)) accountNodeTiers.delete(node);
+    }
     const lanes = new Set([
       ...accountFetches.keys(),
       ...accountNodes.keys(),
@@ -616,6 +630,7 @@ export function createProxyService({
     accountAutoValidations.clear();
     accountAutoReservations.clear();
     accountRejectedNodes.clear();
+    accountNodeTiers.clear();
     if (close) {
       try { await close(); } catch {}
     }
@@ -871,6 +886,21 @@ export function createProxyService({
     return new Set(rejected.keys());
   }
 
+  function noteAccountNodeTier(node, tier) {
+    if (!node || (tier !== 'advanced' && tier !== 'free')) return;
+    accountNodeTiers.set(node, { tier, expiresAt: now() + ACCOUNT_NODE_TIER_TTL_MS });
+  }
+
+  function knownAccountNodeTier(node) {
+    const entry = accountNodeTiers.get(node);
+    if (!entry) return null;
+    if (entry.expiresAt <= now()) {
+      accountNodeTiers.delete(node);
+      return null;
+    }
+    return entry.tier;
+  }
+
   function accountAutoCandidates(lane = null) {
     const rejected = lane == null ? new Set() : liveRejectedNodes(lane);
     const usage = new Map();
@@ -897,7 +927,13 @@ export function createProxyService({
     const seen = new Map();
     const withRank = accountCandidateSnapshot
       .filter((entry) => nodeNames.includes(entry.name))
-      .map((entry) => ({ ...entry, load: usage.get(entry.name) || 0, knownTier: tierByNode.get(entry.name) || null }))
+      .map((entry) => ({
+        ...entry,
+        load: usage.get(entry.name) || 0,
+        // 其它 lane 当前的验证结果最新鲜，其次才用节点层级记忆（含本 lane 自己上一轮
+        // 的结果：force 重扫时靠它把「我原来那个高级节点」重新排到最前面）。
+        knownTier: tierByNode.get(entry.name) || knownAccountNodeTier(entry.name) || null,
+      }))
       .filter((entry) => !rejected.has(entry.name))
       .sort((a, b) => a.delay - b.delay || order.get(a.name) - order.get(b.name))
       .map((entry) => {
@@ -925,11 +961,21 @@ export function createProxyService({
 
   function reserveNextAccountAutoCandidate({
     lane, identity, operationVersion, topologyVersion, excludedNodes = new Set(),
+    skipKnownFree = false,
   }) {
     assertAccountOperation(lane, operationVersion, identity, topologyVersion);
     const candidates = accountAutoCandidates(lane);
+    // 本轮已经攥着 Free 兜底、而且还有已知高级节点可以复用时，再探已知是 Free 的节点
+    // 纯属浪费：结果不会更好，只会把这一轮拖到上百次探测（线上 117 个候选 × 5s）。
+    // 反过来，池里一个已知高级节点都没有时绝不能跳——遍历 Free 节点是发现「某个节点
+    // 变成高级了」的唯一途径，跳了就永远回不到高级。
+    const reusableAdvanced = candidates.some((candidate) => (
+      candidate.knownTier === 'advanced' && !excludedNodes.has(candidate.name)
+    ));
+    const worth = (candidate) => !excludedNodes.has(candidate.name)
+      && !(skipKnownFree && reusableAdvanced && candidate.knownTier === 'free');
     for (const candidate of candidates) {
-      if (excludedNodes.has(candidate.name)) continue;
+      if (!worth(candidate)) continue;
       if (isAccountNodeOccupied(candidate.name, lane)) continue;
       accountAutoReservations.set(lane, {
         lane,
@@ -942,7 +988,7 @@ export function createProxyService({
     }
 
     // 节点不足时允许复用，但仍按当前负载最小、延迟最低的顺序取一个。
-    const fallback = candidates.find((candidate) => !excludedNodes.has(candidate.name)) || null;
+    const fallback = candidates.find(worth) || null;
     if (fallback) {
       accountAutoReservations.set(lane, {
         lane,
@@ -1378,10 +1424,17 @@ export function createProxyService({
         const hasUnoccupiedCandidate = availableCandidates.some((entry) => (
           !isAccountNodeOccupied(entry.name, lane)
         ));
+        // 「优先高级」下被别的账号复用不是放弃高级节点的理由：复用本来就是这个优先级
+        // 允许的（节点不够时靠它保证每个账号都是高级权限），而让出高级节点去赌一个未知
+        // 节点，多半赌成 Free。以前这条判据把已占用一律当作缓存失效，两个账号会围着
+        // 同一个高级节点来回抢：谁被复用谁重扫，重扫完又把节点让给对方。
+        const cachedAdvancedShared = cfg.accountSelectionPriority === 'advanced'
+          && cached?.tier === 'advanced';
         if (!force && cached && cached.identity === normalizedIdentity
           && cached.topologyVersion === topologyVersion
           && cached.generation === accountGenerations.get(lane)
-          && cached.expiresAt > now() && (!cachedOccupied || !hasUnoccupiedCandidate)
+          && cached.expiresAt > now()
+          && (cachedAdvancedShared || !cachedOccupied || !hasUnoccupiedCandidate)
           && availableCandidates.some((entry) => entry.name === cached.node)) {
           await ensureAccountDispatcher(lane);
           if (accountNodes.get(lane) !== cached.node) await switchAccountNode(lane, cached.node);
@@ -1483,6 +1536,7 @@ export function createProxyService({
             if (!reservation || reservation.operationVersion !== operationVersion
               || reservation.node !== candidate.name) return null;
             const authorization = typeof verification === 'object' ? verification : null;
+            noteAccountNodeTier(candidate.name, authorization?.tier);
             // 验证请求在途时，业务流量可能已经明确收到 country_blocked/ip_capped。
             // 后到的“模型目录正常”不能覆盖更新鲜的出口拒绝观测。
             if (verification && nodeNames.includes(candidate.name) && !liveRejectedNodes(lane).has(candidate.name)) {
@@ -1512,6 +1566,7 @@ export function createProxyService({
                 operationVersion,
                 topologyVersion,
                 excludedNodes: attemptedNodes,
+                skipKnownFree: true,
               });
             });
             if (!candidate && freeFallback) {
@@ -1542,6 +1597,7 @@ export function createProxyService({
               operationVersion,
               topologyVersion,
               excludedNodes: attemptedNodes,
+              skipKnownFree: Boolean(freeFallback),
             });
           });
         }
