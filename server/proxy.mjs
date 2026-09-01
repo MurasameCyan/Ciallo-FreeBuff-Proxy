@@ -888,17 +888,31 @@ export function createProxyService({
     }
     const order = new Map(accountCandidateSnapshot.map((entry, index) => [entry.name, index]));
     const tierRank = (tier) => tier === 'advanced' ? 0 : tier === 'free' ? 2 : 1;
-    return accountCandidateSnapshot
+    // 优先高级时按地区轮转，让每个地区的头部节点都排在任一地区的尾部节点之前。
+    // 出口 IP 决定 accessTier，而同一地区的节点常常整段是 limited：纯延迟排序会让
+    // 上百个 US 节点全部排在第一个 SG 节点之前，而每次探测串行、单次上限 5s，
+    // 扫到 SG 要好几分钟 —— 比 Free 兜底缓存的 2 分钟还长，于是永远轮不到 SG。
+    // ponytail: 只按「地区内第几个」交错，不做加权。上限是地区数，够用。
+    const regionOf = (name) => inferNodeRegion(name) || 'other';
+    const seen = new Map();
+    const withRank = accountCandidateSnapshot
       .filter((entry) => nodeNames.includes(entry.name))
       .map((entry) => ({ ...entry, load: usage.get(entry.name) || 0, knownTier: tierByNode.get(entry.name) || null }))
       .filter((entry) => !rejected.has(entry.name))
-      .sort((a, b) => (
-        (cfg.accountSelectionPriority === 'advanced'
-          ? tierRank(a.knownTier) - tierRank(b.knownTier) : 0)
-        || a.load - b.load
-        || a.delay - b.delay
-        || order.get(a.name) - order.get(b.name)
-      ));
+      .sort((a, b) => a.delay - b.delay || order.get(a.name) - order.get(b.name))
+      .map((entry) => {
+        const region = regionOf(entry.name);
+        const regionIndex = seen.get(region) || 0;
+        seen.set(region, regionIndex + 1);
+        return { ...entry, regionIndex };
+      });
+    return withRank.sort((a, b) => (
+      (cfg.accountSelectionPriority === 'advanced'
+        ? (tierRank(a.knownTier) - tierRank(b.knownTier)) || (a.regionIndex - b.regionIndex) : 0)
+      || a.load - b.load
+      || a.delay - b.delay
+      || order.get(a.name) - order.get(b.name)
+    ));
   }
 
   function isAccountNodeOccupied(node, lane) {

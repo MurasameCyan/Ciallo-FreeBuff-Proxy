@@ -2010,6 +2010,47 @@ test('优先高级下的 Free 兜底缓存必须短于 advanced，高级节点�
   assert.equal(second.tier, 'advanced');
 });
 
+test('优先高级时候选按地区交错，SG 头部节点不排在整段 US 之后', async () => {
+  // 实测：359 个健康节点里 106 个 US 全排在 19 个 SG 之前（US 中位 159ms、SG 最快 247ms），
+  // 第一个 SG 落在第 79 位。探测串行、单次上限 5s，扫到 SG 要 7 分钟，
+  // 比 Free 兜底缓存的 2 分钟更长，于是 SG 的高级节点永远轮不到。
+  const nodes = [...Array.from({ length: 40 }, (_, i) => `🇺🇸US²_${i}`), '🇸🇬SG²_12', '🇸🇬SG²_20'];
+  const delay = Object.fromEntries(nodes.map((n) => [n, n.startsWith('🇸🇬') ? 250 : 110 + nodes.indexOf(n)]));
+  let clock = 1000;
+  const probed = [];
+  const { service } = fakeService({
+    controller: {
+      async request(path) {
+        if (path === '/proxies/freebuff-pool') return { all: nodes, now: nodes[0] };
+        if (path === '/proxies/freebuff-auto') return { now: nodes[0], all: nodes };
+        if (path.startsWith('/group/freebuff-pool/delay')) return delay;
+        return {};
+      },
+    },
+    service: {
+      now: () => clock,
+      buildFetch: async () => ({ fetch: async () => new Response('ok'), close: async () => {} }),
+    },
+  });
+  await service.setSubscription('https://sub.example.com/list');
+  await service.setAccountSelectionPriority('advanced');
+
+  // 只有 SG²_12 给高级权限，US 整段都是 limited —— 与容器内实测一致。
+  const verify = async ({ node }) => {
+    probed.push(node);
+    return node === '🇸🇬SG²_12'
+      ? { tier: 'advanced', model: 'openai/gpt-5.6-luna' }
+      : { tier: 'free', model: 'mimo/mimo-v2.5' };
+  };
+
+  const picked = await service.selectAccountNodeAuto({ lane: 0, identity: 'acct', verify });
+  assert.equal(picked.node, '🇸🇬SG²_12', '必须选到唯一的高级节点');
+  assert.equal(picked.tier, 'advanced');
+  const rank = probed.indexOf('🇸🇬SG²_12');
+  assert.ok(rank >= 0, 'SG 节点必须被探测到');
+  assert.ok(rank < 5, `SG 头部节点应在前几次探测内被扫到，实际第 ${rank + 1} 次`);
+});
+
 test('优先级切换不能让在途 Free 探测沿用旧 TTL', async () => {
   let clock = 1000;
   let releaseVerify;
