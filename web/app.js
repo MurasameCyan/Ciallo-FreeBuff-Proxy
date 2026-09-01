@@ -550,25 +550,23 @@ function accountQuotaSummary(probe) {
   return { text: `( ${parts.join(' ')} )`, title: `额度 ${details.join(' · ')}` };
 }
 
-// 独立 cap 注记。官方 FREEBUFF_PER_MODEL_SESSION_CAPS 给某些模型加了一层
+// 独立 cap。官方 FREEBUFF_PER_MODEL_SESSION_CAPS 给某些模型加了一层
 // 「共享池之外的每日上限」（当前只有 GLM 5.3 Flash，2 次/日），worker 把它
 // 解析好后经 /v1/models 的 perModelCap 下发。
 //
-// ⚠️ 这里只陈述上限，不推算剩余。原因是上游 rateLimitsByModel 每个模型只给一行，
-// 报的是「下一次准入会记到哪个池」：cap 没触发时那行就是共享池（premium 5 次），
-// 独立 cap 的已用次数根本不在 wire 上。想显示「还剩几次」只能由代理自己数，
-// 跨实例/面板外调用都会偏，宁可不给数字也不给一个会骗人的数字。
-function perModelCapNote(model) {
+// 只返回上限数字，不渲染任何文字：账号名后的额度徽标已经把数字给过了，模型行
+// 再挂一个「上限 N/日」是同一件事说两遍。cap 在面板里的唯一用处是让
+// modelsCellHtml 判断该不该补出缺失的模型行。
+//
+// ⚠️ 别在这一层推算剩余。上游 rateLimitsByModel 每个模型只给一行，报的是
+// 「下一次准入会记到哪个池」：cap 没触发时那行就是共享池（premium 5 次），
+// 独立 cap 的已用次数根本不在 wire 上，只能由代理自己数，跨实例/面板外调用都会偏。
+function perModelCapLimit(model) {
   const entry = Array.isArray(S.models)
     ? S.models.find((m) => m?.id === model)
     : null;
-  const cap = entry?.perModelCap;
-  const limit = Number(cap?.limit);
-  if (!cap || !Number.isFinite(limit) || limit <= 0) return '';
-  const label = String(cap.poolLabel || '').trim();
-  const title = `${label ? label + '：' : ''}独立上限 ${limit} 次/日，与共享池分开计算。`
-    + '上游只在这一层触顶时才单独下发计数，因此这里只给上限、不估剩余。';
-  return ` <span class="pill cap" title="${esc(title)}">上限 ${esc(String(limit))}/日</span>`;
+  const limit = Number(entry?.perModelCap?.limit);
+  return Number.isFinite(limit) && limit > 0 ? limit : 0;
 }
 
 // 可用模型列：只列真正有额度（limit>0）的模型，每个模型独占一行；0/0 未解锁模型
@@ -597,11 +595,11 @@ function modelsCellHtml(probe) {
     const id = String(model?.id || '').trim();
     const sharedPool = normalizeQuotaPool(model?.sharedPool);
     return id && !observedModels.has(id) && !isPausedModelId(id) && !isHiddenModelId(id)
-      && sharedPool && usablePools.has(sharedPool) && perModelCapNote(id);
+      && sharedPool && usablePools.has(sharedPool) && perModelCapLimit(id) > 0;
   });
   const items = [
-    ...rows.map((q) => `<li>${modelListHtml([q.model], [q])}${perModelCapNote(q.model)}</li>`),
-    ...capModels.map((model) => `<li>${modelListHtml([model.id], [model])}${perModelCapNote(model.id)}</li>`),
+    ...rows.map((q) => `<li>${modelListHtml([q.model], [q])}</li>`),
+    ...capModels.map((model) => `<li>${modelListHtml([model.id], [model])}</li>`),
   ].join('');
   return `<ul class="quota quota-models">${items}</ul>`;
 }
