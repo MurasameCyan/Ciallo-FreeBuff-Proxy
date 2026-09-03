@@ -332,6 +332,16 @@ const HIDDEN_MODEL_IDS = new Set([
   // 官方 FREEBUFF_WEB_GOD_ONLY_MODELS（0766319c）：god 账号专属，且不在 CLI 目录里。
   'crof/kimi-k3-eco',
 ]);
+// 服务专用模型（官方 FREEBUFF_SERVICE_ONLY_MODEL_IDS）由 worker 经 /_api/config 下发：
+// 这些行照样出现在账号额度快照里（muse-spark 就是 pool=premium limit=4），但代理调不通，
+// 不能混进可用模型列和 Key 白名单。名单是动态的，撤门后会自动恢复显示。
+let SERVICE_ONLY_MODEL_IDS = new Set();
+
+function setServiceOnlyModels(ids) {
+  SERVICE_ONLY_MODEL_IDS = new Set((Array.isArray(ids) ? ids : [])
+    .map((id) => String(id || '').trim().toLowerCase())
+    .filter(Boolean));
+}
 
 function isPausedModelId(modelId) {
   const value = String(modelId || '').trim().toLowerCase();
@@ -347,9 +357,15 @@ function isPausedModelId(modelId) {
 
 function isHiddenModelId(modelId) {
   const value = String(modelId || '').trim().toLowerCase();
-  return HIDDEN_MODEL_IDS.has(value)
+  if (HIDDEN_MODEL_IDS.has(value)
     || value.startsWith('openai/gpt-5.6-luna-es')
-    || value.startsWith('crof/kimi-k3-eco');
+    || value.startsWith('crof/kimi-k3-eco')) return true;
+  // 与 worker 的 isHiddenModelId 同口径：命中 id 本身或 <id>-YYYYMMDD 日期变体。
+  for (const base of SERVICE_ONLY_MODEL_IDS) {
+    if (value === base) return true;
+    if (value.startsWith(`${base}-`) && /^\d{6,8}(?:$|[-:])/.test(value.slice(base.length + 1))) return true;
+  }
+  return false;
 }
 
 function catalogModelIds() {
@@ -1491,6 +1507,7 @@ async function refresh() {
     const keys = await api('/keys').catch(() => null);
     if (cfg) {
       S.aliases = cfg.aliases || {};
+      setServiceOnlyModels(cfg.serviceOnlyModels);
       S.apiKey = cfg.apiKey || 'freebuff-default-key';
       S.keyRotatable = cfg.keyRotatable !== false;
       S.build = cfg.build || ''; S.buildUrl = cfg.buildUrl || ''; S.repoUrl = cfg.repoUrl || '';

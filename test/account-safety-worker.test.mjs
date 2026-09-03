@@ -491,10 +491,16 @@ test('quota 冷却按 D4P、Luna 独立池和当前 Premium 共池传播', () =>
     retryAfterMs: 60 * 1000,
     model: 'deepseek/deepseek-v4-flash',
   });
-  for (const model of ['meta/muse-spark-1.2-contributor']) {
+  // Luna 的独立池 2026-08-25 已被官方删除，它现在吃共享 Premium 池，所以 DS4F 的池冷却
+  // 必须传播到它。这里以前拿 muse-spark 1.2 当被试：它 2026-09-02 进了官方
+  // FREEBUFF_SERVICE_ONLY_MODEL_IDS，现在被 isHiddenModelId 挡在所有池之外，pickToken
+  // 会因为「隐藏」而不是「池冷却」返回 null —— 断言仍然绿，但什么都没测到。
+  for (const model of ['openai/gpt-5.6-luna']) {
     assert.equal(workerVm.api.pickToken(env, model, new Set()), null,
       `DS4F 与 ${model} 必须共享 Premium quota 冷却`);
   }
+  assert.equal(workerVm.api.pickToken(env, 'meta/muse-spark-1.2-contributor', new Set()), null,
+    '服务专用模型（普通 token 一定 403）不得进入正常账号调度');
   assert.equal(workerVm.api.pickToken(env, 'minimax/minimax-m3', new Set()), null,
     'M3 当前已暂停，不得进入正常账号调度');
 });
@@ -541,7 +547,12 @@ test('typed 429 按上游状态选择正确作用域', () => {
   }), 'pool:glm_v53_flash', 'GLM 5.3 Flash 必须使用官方独立池');
   assert.equal(workerVm.api.quotaScopeForModel('deepseek/deepseek-v4-flash'), 'pool:premium',
     'DS4F 当前属于共享 Premium 池');
-  assert.equal(workerVm.api.quotaScopeForModel('meta/muse-spark-1.2-contributor'), 'pool:premium');
+  // 服务专用（官方 FREEBUFF_SERVICE_ONLY_MODEL_IDS，2026-09-02 起装着两个 muse
+  // Contributor）与 god-only 同理：也被 isHiddenModelId 挡在池外。它仍留在
+  // PREMIUM_QUOTA_MODELS 里是故意的 —— 官方哪天撤了门，池归属立刻还是对的。
+  assert.equal(workerVm.api.quotaScopeForModel('meta/muse-spark-1.2-contributor'),
+    'model:meta/muse-spark-1.2-contributor',
+    '服务专用 muse 必须按模型隔离，不得污染 Premium 池冷却');
   // god-only（官方 FREEBUFF_WEB_GOD_ONLY_MODELS）已被 HIDDEN_MODEL_IDS 挡住，
   // 不再归入任何共享池：普通 token 一定调不通它，让它写 pool:premium 冷却
   // 只会因为一个永远失败的模型把整池真实 Premium 模型一起停掉。
@@ -684,8 +695,10 @@ test('额度快照按上游 pool 选择，不再取任意 Premium 模型行', as
     workerVm.api.freshQuotaProbe(token, 'z-ai/glm-5.3-flash'),
     (error) => error?.name === 'QuotaExhaustedError' && error.scope === 'pool:glm_v53_flash',
   );
+  // 没有自己那一行的共享池模型（Luna：官方独立池已删，静态归属 premium）必须继承
+  // 同一个共享池结论。以前这里用 muse 1.2，它现在被服务专用名单隐藏，不再归任何池。
   await assert.rejects(
-    workerVm.api.freshQuotaProbe(token, 'meta/muse-spark-1.2-contributor'),
+    workerVm.api.freshQuotaProbe(token, 'openai/gpt-5.6-luna'),
     (error) => error?.name === 'QuotaExhaustedError' && error.scope === 'pool:premium',
   );
   await assert.doesNotReject(workerVm.api.freshQuotaProbe(token, 'mimo/mimo-v2.5'));
@@ -760,10 +773,10 @@ test('Premium 快照异常不一致时各模型使用同一保守池结论并忽
     },
   });
 
+  // muse-spark 不在这里：它已被 service-only 闸门隐藏，请求在取池结论前就被拒。
   for (const model of [
     'deepseek/deepseek-v4-flash',
     'openai/gpt-5.6-luna',
-    'meta/muse-spark-1.2-contributor',
   ]) {
     await assert.rejects(
       workerVm.api.freshQuotaProbe(token, model),
@@ -773,8 +786,8 @@ test('Premium 快照异常不一致时各模型使用同一保守池结论并忽
   }
 });
 
-// 反向锁：暂停（M3 / D4P）与 god-only 的行不参与聚合，所以它们的计数不能把真实
-// Premium 池判成耗尽。这三行如果漏进 pooled 聚合，recentCount 会取到 99 而误报耗尽。
+// 反向锁：暂停（M3 / D4P）、god-only 与 service-only 的行不参与聚合，所以它们的计数不能把
+// 真实 Premium 池判成耗尽。这四行如果漏进 pooled 聚合，recentCount 会取到 99 而误报耗尽。
 test('暂停与 god-only 额度行不得把真实 Premium 池算成耗尽', async () => {
   const workerVm = createWorkerVm();
   const token = 'premium-ghost-rows-account-1234567890';
@@ -784,6 +797,9 @@ test('暂停与 god-only 额度行不得把真实 Premium 池算成耗尽', asyn
     'minimax/minimax-m3': { recentCount: 99, limit: 6, pool: 'premium' },
     'deepseek/deepseek-v4-pro': { recentCount: 99, limit: 6, pool: 'premium' },
     'crof/kimi-k3-eco': { recentCount: 99, limit: 6, pool: 'premium' },
+    // 上游快照仍然会带 service-only 的行（PREMIUM_QUOTA_MODELS 里也还留着 1.2），
+    // 但它调不通、也不该拉低真实池。
+    'meta/muse-spark-1.2-contributor': { recentCount: 99, limit: 6, pool: 'premium' },
   };
   workerVm.api.recordAccountObservation(token, 200, { status: 'ok' }, { quota });
 
@@ -800,6 +816,10 @@ test('暂停与 god-only 额度行不得把真实 Premium 池算成耗尽', asyn
     '带日期后缀的变体同样要挡住');
   assert.equal(workerVm.api.findModelConfig('crof/kimi-k3-eco'), null);
   assert.equal(workerVm.api.quotaEntryForModel(quota, 'crof/kimi-k3-eco'), null);
+  // service-only 同理：官方名单读不到时落静态兜底，仍然 fail closed。
+  assert.equal(workerVm.api.isHiddenModelId('meta/muse-spark-1.2-contributor'), true);
+  assert.equal(workerVm.api.findModelConfig('meta/muse-spark-1.2-contributor'), null);
+  assert.equal(workerVm.api.quotaEntryForModel(quota, 'meta/muse-spark-1.2-contributor'), null);
 });
 
 // 429 额度冷却的写入与读取必须用同一个池口径。写入侧（cooldownScopeFor）以前不带

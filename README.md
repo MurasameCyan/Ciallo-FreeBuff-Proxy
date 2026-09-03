@@ -4,7 +4,7 @@
 
 Freebuff 免费模型 → OpenAI / Anthropic / Responses 兼容 API，带 Web 管理面板与账号池管理。
 
-- 9 个免费模型，只有 2 个不限地区，另 6 个**必须走美国出口**才解锁（见「[模型一览](#模型一览)」）
+- 免费模型随上游目录变动，当前 `/v1/models` 暴露 6 个（官方暂停与服务专用的自动摘掉）：只有 2 个不限地区，其余**必须走美国出口**才解锁（见「[模型一览](#模型一览)」）
 - 支持 OpenAI `/v1/chat/completions`、Anthropic `/v1/messages`、Responses `/v1/responses`
 - Web 面板：账号池管理（添加/删除/探测/额度）、API Key 管理、模型别名映射
 - 出口代理：可选接机场订阅（mihomo 内核），上游流量经节点出站换 IP
@@ -129,12 +129,21 @@ Freebuff 把免费账号分成两个**访问层**（`accessTier`）：出口 IP 
 | `deepseek/deepseek-v4-pro` | DeepSeek V4 Pro 08/13 | **是** | `low` `high` `max` | ✅ full 层实测可用 |
 | `openai/gpt-5.6-luna` | GPT-5.6 Luna | **是** | 服务端钉死 `high`（见下） | ✅ full 层实测可用 |
 | `crof/kimi-k3-eco` | Kimi K3（Eco 量化版） | **是** | 路由忽略 `reasoning_effort` | ✅ full 层实测可用 |
-| `meta/muse-spark-1.2-contributor` | Muse Spark 1.2 | **是** | `minimal`→`xhigh`（**不吃 `max`**） | ❌ 上游回 `invalid_api_key`，调不通 |
+| `meta/muse-spark-1.2-contributor` | Muse Spark 1.2 | **是** | `minimal`→`xhigh`（**不吃 `max`**，未实测） | 🚫 服务专用，403 `free_mode_model_surface_denied`，代理自动隐藏 |
+| `meta/muse-spark-1.3-contributor` | Muse Spark 1.3 | **是** | 同上（目录值，未实测） | 🚫 服务专用，同上 |
 | `anthropic/claude-fable-5` | Claude Fable 5 | **是** | `low` `medium` `high` `xhigh` `max` | ❌ 409 `session_model_mismatch`，账号未授权 |
 
 「无档位」「路由忽略」的模型不代表不思考 —— 官方 `efforts` 字段缺省的含义是「不提供档位选择」，
 MiMo 照样会思考，只是没有深浅可调。M3 的旧兼容 ID 仍可能出现在官方动态源码中，
 但当前已暂停，代理只在管理面板标记状态，不把它作为正常可调用模型。
+
+**服务专用模型会被自动隐藏**：官方 `FREEBUFF_SERVICE_ONLY_MODEL_IDS` 里的模型只对 Freebuff Web /
+Cloud 的 runner 开放（服务端持有的 API key 才算数），任何代理身份调用 chat 一定拿到 403
+`free_mode_model_surface_denied`，而会话本身能建起来 —— 也就是每试一次白扣一次 premium 额度。
+所以代理每次刷新动态目录时都会解析这张表，把命中的模型（含 `-YYYYMMDD` 日期变体）从
+`/v1/models`、模型解析和额度聚合里一并摘掉，请求在扣额度之前就返回 `unsupported_model`。
+名单是动态的：官方哪天把某个模型移出这张表（2026-08-24 的 `stealth/ox-alpha` 就是这样上 CLI 的），
+它会自动重新出现，不需要改代码。拉不到官方源码时落静态兜底名单，仍然按「隐藏」处理（fail closed）。
 
 **Luna 的档位是假的**：官方目录里 Luna 写着 `EFFORTS_THROUGH_MAX`（`low`…`max`），那是 OpenRouter
 广告的元数据。实际链路上 Freebuff 的 `applyFreebuffReasoningDefaults` 会给这条 OpenRouter 路由注入

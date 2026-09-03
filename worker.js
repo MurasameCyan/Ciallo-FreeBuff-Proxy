@@ -70,7 +70,10 @@ const DYNAMIC_MODELS_FETCH_TIMEOUT_MS = 10000;
 let dynamicModelsCache = {
   fetchedAt: 0,
   models: null, // 动态模型表（含分类）
-  pool: null, // { premium: Set, standard: Set, glm: Set, perModelCaps: Object, paused: Set }
+  // { premium: Set, standard: Set, glm: Set, perModelCaps: Object, paused: Set,
+  //   serviceOnly: Set|null }。serviceOnly 为 null = 没读到官方名单（兜底路径/解析失败），
+  // 与「读到了但是空」不同，前者由 isHiddenModelId 落静态兜底 fail closed。
+  pool: null,
 };
 let dynamicModelsRefreshFlight = null;
 const dynamicEndpointRefreshFlights = new Map();
@@ -135,15 +138,63 @@ function parseAgentMapping(source, modelIdConstants) {
   return parseAgentMappings(source, modelIdConstants).root;
 }
 
+// 注释挖空（长度不变，换行保留），供下面的括号配平使用。
+// 官方这些常量表的注释比条目长十倍，且大量出现撇号（"the tier's default"）与方括号，
+// 不先挖空的话：撇号会被当成字符串字面量的开头，把两个撇号之间的整段散文吃成一个
+// 假 id —— **连中间真正的条目一起吃掉**；注释里的 ALL_CAPS 常量名（官方常写
+// "NOT withdrawn with it: FREEBUFF_DEEPSEEK_V4_PRO_MAX_MODEL_ID"）会被认成条目，
+// 把一个明确没被停用的模型加进停用名单。2026-09-04 实测线上 paused 解析同时踩中
+// 这两种：丢了 M3 与 V4 Pro，反而多出 v4-pro-max 和两段散文。
+function stripSourceComments(text) {
+  return String(text || "")
+    .replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, " "))
+    // (?<!:) 放过 `https://`，别把字符串里的 URL 半截挖掉（会连同后面的 `]` 一起没）。
+    .replace(/(?<!:)\/\/[^\n]*/g, (m) => " ".repeat(m.length));
+}
+
+// 取 `export const NAME ... = [ ... ]` 的数组体（已挖空注释），找不到返回 null。
+// 用括号配平而不是惰性 `[\s\S]*?\]`：官方注释里出现方括号（引用
+// `readonly string[]`、`FREE_MODE_AGENT_MODELS[...]`）时，惰性匹配会在注释里的第一个
+// `]` 提前收尾，只解析出名单的前几行。
+function extractArrayBody(source, name) {
+  const decl = new RegExp(`export\\s+const\\s+${name}\\b[^=]*=`).exec(source);
+  if (!decl) return null;
+  const cleaned = stripSourceComments(source);
+  const open = cleaned.indexOf("[", decl.index + decl[0].length - 1);
+  if (open < 0) return null;
+  let depth = 0;
+  for (let i = open; i < cleaned.length; i++) {
+    if (cleaned[i] === "[") depth++;
+    else if (cleaned[i] === "]" && --depth === 0) return cleaned.slice(open + 1, i);
+  }
+  return null;
+}
+
+// 扫描数组体里的模型 id 条目：字面量、能在常量表里查到值的 id 常量、以及
+// `...OTHER_LIST` spread（只回常量名，由调用方决定展开策略）。
+// 传进来的 body 必须已经挖空注释（extractArrayBody 会做）。
+function parseIdListItems(body, modelIdConstants) {
+  const items = [];
+  const itemRe = /\.\.\.([A-Z0-9_]+)|'([^']*)'|"([^"]*)"|([A-Za-z0-9_]+)/g;
+  let im;
+  while ((im = itemRe.exec(String(body || ""))) !== null) {
+    const spread = im[1];
+    const lit = im[2] ?? im[3];
+    const expr = im[4];
+    if (spread) items.push(["spread", spread]);
+    else if (lit) items.push(["lit", lit]);
+    else if (expr && modelIdConstants[expr]) items.push(["lit", modelIdConstants[expr]]);
+  }
+  return items;
+}
+
+// 只认字面量与 id 常量的扁平解析；spread 需要跨常量展开，见 parseModelPools。
 function parseConstArray(source, name, modelIdConstants) {
-  const match = new RegExp(`export\\s+const\\s+${name}[^=]*=\\s*\\[([\\s\\S]*?)\\]`).exec(source);
-  if (!match) return [];
+  const body = extractArrayBody(source, name);
+  if (body === null) return [];
   const out = [];
-  const itemRe = /'([^']*)'|"([^"]*)"|([A-Z][A-Z0-9_]+)/g;
-  let item;
-  while ((item = itemRe.exec(match[1])) !== null) {
-    const id = item[1] ?? item[2] ?? modelIdConstants[item[3]];
-    if (id && !out.includes(id)) out.push(id);
+  for (const [kind, value] of parseIdListItems(body, modelIdConstants)) {
+    if (kind === "lit" && !out.includes(value)) out.push(value);
   }
   return out;
 }
@@ -175,57 +226,46 @@ function parsePerModelSessionCaps(source, modelIdConstants) {
   return caps;
 }
 
-// 解析 freebuff-models.ts 的共享池、单模型 cap 与暂停清单。
+// 解析 freebuff-models.ts 的共享池、单模型 cap、暂停清单与服务专用清单。
 // STANDARD 仍由 non-premium/non-GLM 推导；独立 cap 只覆盖展示/作用域，不会抹掉
 // GLM 5.3 Flash 同时属于共享 Premium 池的事实。
 function parseModelPools(source, modelIdConstants) {
   const premium = new Set();
   const glm = new Set();
   const used = new Set();
+  // 先挖空注释再扫（理由见 stripSourceComments），否则注释里的撇号/常量名会混进池子。
+  const cleaned = stripSourceComments(source);
   // 展开 spread: ...FOO → FOO 里的条目（常量名 → 值）
   const constValues = new Map();
   const constListRe = /export\s+const\s+([A-Z0-9_]+)\s*=\s*\[([^\]]*)\]\s*as\s*const/g;
   let cm;
-  while ((cm = constListRe.exec(source)) !== null) {
-    const name = cm[1];
-    const items = [];
-    const itemRe = /\.\.\.([A-Z0-9_]+)|'([^']*)'|"([^"]*)"|([A-Za-z0-9_]+)/g;
-    let im;
-    while ((im = itemRe.exec(cm[2])) !== null) {
-      const spread = im[1];
-      const lit = im[2] ?? im[3];
-      const expr = im[4];
-      if (spread) items.push(["spread", spread]);
-      else if (lit) items.push(["lit", lit]);
-      else if (expr && modelIdConstants[expr]) items.push(["lit", modelIdConstants[expr]]);
-    }
-    constValues.set(name, items);
+  while ((cm = constListRe.exec(cleaned)) !== null) {
+    constValues.set(cm[1], parseIdListItems(cm[2], modelIdConstants));
   }
+  // 递归展开 spread 常量；带环保护，上游写出互相 spread 的两张表也不能把刷新打爆。
+  const expandConst = (name, out = [], seen = new Set()) => {
+    if (seen.has(name)) return out;
+    seen.add(name);
+    for (const [kind, value] of constValues.get(name) || []) {
+      if (kind === "spread") expandConst(value, out, seen);
+      else out.push(value);
+    }
+    return out;
+  };
+  const expandItems = (items) => {
+    const out = [];
+    for (const [kind, value] of items) {
+      if (kind === "spread") out.push(...expandConst(value));
+      else out.push(value);
+    }
+    return out;
+  };
   // 解析池
   const poolRe = /export\s+const\s+(FREEBUFF_WEB_PREMIUM_MODEL_IDS|FREEBUFF_GLM_V52_MODEL_IDS|FREEBUFF_PREMIUM_MODEL_IDS)\s*=\s*\[([^\]]*)\]/g;
   let pm;
-  while ((pm = poolRe.exec(source)) !== null) {
+  while ((pm = poolRe.exec(cleaned)) !== null) {
     const poolName = pm[1];
-    const items = [];
-    const itemRe = /\.\.\.([A-Z0-9_]+)|'([^']*)'|"([^"]*)"|([A-Za-z0-9_]+)/g;
-    let im;
-    while ((im = itemRe.exec(pm[2])) !== null) {
-      const spread = im[1];
-      const lit = im[2] ?? im[3];
-      const expr = im[4];
-      if (spread) {
-        // 递归展开 spread 常量
-        const expand = (n) => {
-          const entries = constValues.get(n) || [];
-          for (const [kind, val] of entries) {
-            if (kind === "spread") expand(val);
-            else items.push(val);
-          }
-        };
-        expand(spread);
-      } else if (lit) items.push(lit);
-      else if (expr && modelIdConstants[expr]) items.push(modelIdConstants[expr]);
-    }
+    const items = expandItems(parseIdListItems(pm[2], modelIdConstants));
     if (poolName === "FREEBUFF_GLM_V52_MODEL_IDS") {
       for (const id of items) glm.add(id);
     } else {
@@ -233,9 +273,28 @@ function parseModelPools(source, modelIdConstants) {
     }
   }
   const perModelCaps = parsePerModelSessionCaps(source, modelIdConstants);
-  const paused = parseConstArray(source, "FREEBUFF_PAUSED_FREE_MODEL_IDS", modelIdConstants);
+  const pausedBody = extractArrayBody(source, "FREEBUFF_PAUSED_FREE_MODEL_IDS");
+  const paused = pausedBody === null
+    ? []
+    : [...new Set(expandItems(parseIdListItems(pausedBody, modelIdConstants)))];
+  // 服务专用名单 = 官方唯一有牙的 surface 门：执法点在 Web 的
+  // /api/v1/chat/completions，按服务端持有的 runner API key 判定，surface 头 / agent id /
+  // model id 都是调用方能自己写的文本，绕不过。
+  // 必须动态解析的原因：我们的目录是从 root agent 映射反推出来的
+  // （buildDynamicModelTable ← FREEBUFF_ROOT_AGENT_ID_BY_MODEL），Web runner 要跑这些模型
+  // 就必须有 root agent，于是它们会自动出现在 /v1/models 里。客户端选中即 403
+  // free_mode_model_surface_denied，且每次白扣一个 premium admission。
+  // 写法是 `[...FREEBUFF_MUSE_SPARK_MODEL_IDS] as const satisfies readonly string[]`：
+  // 数组常量不会进 modelIdConstants，只认字面量的扁平解析会静默返回 []，只能靠上面
+  // constValues 的 spread 展开。
+  // 名单为空是合法状态（2026-09-02 之前一直是空的），所以「源里没有这张表」必须与
+  // 「读到了但是空」分开：没有 → null，让调用层落静态兜底。
+  const serviceOnlyBody = extractArrayBody(source, "FREEBUFF_SERVICE_ONLY_MODEL_IDS");
+  const serviceOnly = serviceOnlyBody === null
+    ? null
+    : [...new Set(expandItems(parseIdListItems(serviceOnlyBody, modelIdConstants)))];
   // FREEBUFF_PREMIUM_MODEL_IDS 与 FREEBUFF_WEB_PREMIUM_MODEL_IDS 都算 premium。
-  return { premium: [...premium], glm: [...glm], perModelCaps, paused };
+  return { premium: [...premium], glm: [...glm], perModelCaps, paused, serviceOnly };
 }
 
 // 上游把这些模型的 base2 root agent 在服务端下线了：session 200、agent-runs 200，
@@ -503,6 +562,8 @@ async function performDynamicModelsRefresh() {
         glm: new Set(pools.glm),
         perModelCaps: pools.perModelCaps || {},
         paused: new Set(pools.paused || []),
+        // null 与空集合含义不同：null = 官方源里读不到这张表 → 隐藏落静态兜底。
+        serviceOnly: pools.serviceOnly ? new Set(pools.serviceOnly) : null,
       };
       nextCache = {
         fetchedAt: Date.now(),
@@ -584,6 +645,10 @@ async function tryReleaseFallback() {
               perModelCaps: json.upstream?.perModelCaps && typeof json.upstream.perModelCaps === "object"
                 ? json.upstream.perModelCaps : {},
               paused: new Set(Array.isArray(json.upstream?.paused) ? json.upstream.paused : []),
+              // 兜底 JSON 里没有这块（旧 Releases 资产就没有）时保持 null，
+              // 让隐藏落静态兜底，而不是当成「官方名单是空的」。
+              serviceOnly: Array.isArray(json.upstream?.serviceOnly)
+                ? new Set(json.upstream.serviceOnly) : null,
             };
             return {
               fetchedAt: Date.now(),
@@ -645,7 +710,7 @@ function dynamicModelForId(modelId, cache = dynamicModelsCache) {
 // 未知 pool 返回 null，调用层按模型隔离，不能猜测为共享池。
 function modelPoolCategory(modelId, quota = null, cache = dynamicModelsCache) {
   const id = String(modelId || "").trim();
-  if (!id || isPausedModelId(id, cache) || isHiddenModelId(id)) return null;
+  if (!id || isPausedModelId(id, cache) || isHiddenModelId(id, cache)) return null;
 
   const quotaRow = quotaRowForModel(quota, id);
   if (quotaRow && String(quotaRow.pool || "").trim()) {
@@ -767,6 +832,10 @@ function isPausedModelId(modelId, cache = dynamicModelsCache) {
   return false;
 }
 // God-only / 服务专用模型。普通 token 一定调不通，动态源即使返回也必须 fail closed。
+// 两类来源：
+//   1) 下面这张手写表 —— 官方 FREEBUFF_WEB_GOD_ONLY_MODELS。它在官方源里是**模型对象**
+//      数组（id 由 .map(m => m.id) 派生），静态解析不出 id，只能手写。
+//   2) 官方 FREEBUFF_SERVICE_ONLY_MODEL_IDS —— 动态解析，见 serviceOnlyModelIds()。
 // stealth/ox-alpha 曾在此列（当时官方 FREEBUFF_SERVICE_ONLY_MODEL_IDS 非空）；2026-08-24
 // 官方把它放进了 CLI/Desktop 目录并清空该名单（d534205ad39d），隐藏前提失效，已开放。
 const HIDDEN_MODEL_IDS = new Set([
@@ -777,17 +846,53 @@ const HIDDEN_MODEL_IDS = new Set([
   // 旧 08-16 观测里它曾经能调通，之后被划成 god-only —— 按 fail closed 处理。
   "crof/kimi-k3-eco",
 ]);
-function isHiddenModelId(modelId) {
+// 官方 FREEBUFF_SERVICE_ONLY_MODEL_IDS 的静态兜底：动态源拉不到 / Releases 兜底 /
+// 冷缓存时用它 fail closed。**只是兜底**——动态名单一旦读到就完全以它为准，所以
+// 官方哪天把 muse 移出该表（= 同时给 CLI/Desktop 放行，ox-alpha 2026-08-24 就是这么
+// 出去的），这里一个字都不用改，模型会自动重新出现在 /v1/models 里。
+// 2026-09-04 实测两个 Contributor 版本都是 403 free_mode_model_surface_denied。
+const SERVICE_ONLY_FALLBACK_MODEL_IDS = new Set([
+  "meta/muse-spark-1.3-contributor",
+  "meta/muse-spark-1.2-contributor",
+]);
+function serviceOnlyModelIds(cache = dynamicModelsCache) {
+  const dynamic = cache?.pool?.serviceOnly;
+  // 空集合是合法的官方状态，必须与 null（没读到）区分：只有后者才用兜底。
+  const ids = dynamic && typeof dynamic[Symbol.iterator] === "function"
+    ? dynamic
+    : SERVICE_ONLY_FALLBACK_MODEL_IDS;
+  const out = new Set();
+  for (const id of ids) {
+    const normalized = String(id || "").trim().toLowerCase();
+    if (normalized) out.add(normalized);
+  }
+  return out;
+}
+function isHiddenModelId(modelId, cache = dynamicModelsCache) {
   const value = String(modelId || "").trim().toLowerCase();
-  return HIDDEN_MODEL_IDS.has(value)
-    || value.startsWith("openai/gpt-5.6-luna-es")
-    // 官方模型判定都是 suffix/前缀容错的，免得带日期的 provider 快照绕过分类。
-    || value.startsWith("crof/kimi-k3-eco");
+  if (!value) return false;
+  if (HIDDEN_MODEL_IDS.has(value)) return true;
+  // 官方模型判定都是 suffix/前缀容错的，免得带日期的 provider 快照绕过分类。
+  if (value.startsWith("openai/gpt-5.6-luna-es")) return true;
+  if (value.startsWith("crof/kimi-k3-eco")) return true;
+  // 服务专用名单按官方同样的规则匹配带日期的变体：官方
+  // isFreebuffServiceOnlyModelId 走 freebuffModelIdMatches，注释写明
+  // 「滑过这个判定的变体就是同一个模型、只是门关着」。
+  for (const base of serviceOnlyModelIds(cache)) {
+    if (value === base) return true;
+    if (!value.startsWith(base + "-")) continue;
+    if (/^\d{6,8}(?:$|[-:])/.test(value.slice(base.length + 1))) return true;
+  }
+  return false;
 }
 const PREMIUM_QUOTA_MODELS = new Set([
   "deepseek/deepseek-v4-flash",
   "openai/gpt-5.6-luna",
   "z-ai/glm-5.3-flash",
+  // muse 当前被 FREEBUFF_SERVICE_ONLY_MODEL_IDS 隐藏，两个读这张表的地方
+  // （modelPoolCategory / premiumQuotaEntry）都先过 isHiddenModelId，所以它现在
+  // 取不到 premium 归属、也写不了 premium 冷却。这一行**故意留着**：官方确实按
+  // premium 池给它计量，哪天门撤了自动解隐藏后，池归属立刻还是对的。
   "meta/muse-spark-1.2-contributor",
 ]);
 const STANDARD_MODELS = new Set([
@@ -814,6 +919,9 @@ const DESKTOP_INCLUDE_RATE_LIMITS = { "x-freebuff-include-unused-rate-limits": "
 export default {
   // 面板调用日志快照（server.js 的 GET /_api/usage 直接吐出）。
   getCallLog() { return callLogSnapshot(); },
+  // 服务专用模型名单（官方 FREEBUFF_SERVICE_ONLY_MODEL_IDS）。账号额度快照里仍然带这些行，
+  // 而面板不解析官方源码，只能由 worker 下发（server.js 的 GET /_api/config 顺路带出去）。
+  serviceOnlyModels() { return [...serviceOnlyModelIds()]; },
   // 概况统计持久化适配器（server.js 启动时注入）。
   configureUsagePersistence,
   restoreUsageSnapshot,
@@ -5910,7 +6018,7 @@ async function handleModels(client = null, { forceRefresh = false } = {}) {
   const snapshotAvailability = refreshResult.availability;
   modelList = modelList.filter((m) =>
     !isPausedModelId(m.id, snapshotCache)
-      && !isHiddenModelId(m.id)
+      && !isHiddenModelId(m.id, snapshotCache)
       && modelIsAvailable(m.id, snapshotAvailability));
   const data = modelList
     .map((m) => {

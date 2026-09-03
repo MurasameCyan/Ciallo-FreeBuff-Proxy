@@ -530,7 +530,7 @@ assert.doesNotMatch(app, /function perModelCapLimit[\s\S]*?limit\s*-\s*(?:used|r
 const helperSource = `const S = { models: [], health: {} };\nconst esc = (value) => String(value);\n${app.match(/const MODEL_TIER_LABELS = \{[^\n]+/)[0]}\n`
   + `${app.slice(app.indexOf('const MODEL_DISPLAY ='), app.indexOf('function poolResetAt'))}\n`
   + 'globalThis.__modelState = S;\n'
-  + 'globalThis.__modelUi = { accountQuotaSummary, modelName, modelDisplay, modelListHtml, perModelCapLimit, modelsCellHtml };';
+  + 'globalThis.__modelUi = { accountQuotaSummary, modelName, modelDisplay, modelListHtml, perModelCapLimit, modelsCellHtml, setServiceOnlyModels, isHiddenModelId };';
 const helperVm = { globalThis: null };
 helperVm.globalThis = helperVm;
 vm.runInNewContext(helperSource, helperVm);
@@ -755,6 +755,27 @@ assert.doesNotMatch(
   /glm-5\.3-flash/,
   '上游明确返回 GLM 0/0 时表示未解锁，不得按缺行重新补出独立 cap',
 );
+// 面板不解析官方源码，服务专用名单只能由 worker 经 /_api/config 下发；账号额度快照照样
+// 会带 muse 这种行（pool=premium limit=4），名单没接上「可用模型」列就会列出调不通的模型。
+helperVm.__modelUi.setServiceOnlyModels(['meta/muse-spark-1.2-contributor']);
+const gatedCell = helperVm.__modelUi.modelsCellHtml({ quota: [
+  { model: 'openai/gpt-5.6-luna', used: 0, limit: 5, pool: 'premium' },
+  { model: 'meta/muse-spark-1.2-contributor', used: 0, limit: 4, pool: 'premium' },
+  { model: 'meta/muse-spark-1.2-contributor-20260902', used: 0, limit: 4, pool: 'premium' },
+] });
+assert.doesNotMatch(gatedCell, /muse-spark/,
+  '服务专用模型（含 -YYYYMMDD 日期变体）不得出现在账号可用模型列');
+assert.match(gatedCell, /gpt-5\.6-luna/,
+  '同池的可用模型不能被服务专用过滤连带摘掉');
+assert.equal(helperVm.__modelUi.isHiddenModelId('meta/muse-spark-1.2-contributor-20260902'), true,
+  '日期变体必须与 worker 的 isHiddenModelId 同口径命中');
+helperVm.__modelUi.setServiceOnlyModels([]);
+assert.match(helperVm.__modelUi.modelsCellHtml({ quota: [
+  { model: 'meta/muse-spark-1.2-contributor', used: 0, limit: 4, pool: 'premium' },
+] }), /muse-spark-1\.2-contributor/,
+  '官方撤门后名单变空，账号可用模型列必须自动恢复显示');
+assert.match(app, /S\.aliases = cfg\.aliases[\s\S]{0,200}?setServiceOnlyModels\(cfg\.serviceOnlyModels\)/s,
+  '面板必须从 /_api/config 拿服务专用名单，不能在前端硬编码');
 helperVm.__modelState.models = [{ id: 'z-ai/glm-5.3-flash', perModelCap: { limit: 0 } }];
 assert.equal(helperVm.__modelUi.perModelCapLimit('z-ai/glm-5.3-flash'), 0,
   'limit<=0 的畸形 cap 必须当作没有 cap，不能拿去补行');

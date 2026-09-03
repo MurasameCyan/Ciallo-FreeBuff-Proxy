@@ -1652,6 +1652,8 @@ async function handleWebApi(req, res, url) {
       // 自定义模型映射（只读展示；编辑走 aliases.json / env）
       aliases: Object.fromEntries(loadModelAliases()),
       aliasesFile: CFG.aliasFile,
+      // 服务专用模型：面板拿它过滤账号额度行（快照里仍会返回这些调不通的模型）
+      serviceOnlyModels: typeof handler.serviceOnlyModels === 'function' ? handler.serviceOnlyModels() : [],
       // build / buildUrl / repoUrl / trackRef：面板右上角那个 hash 徽标。
       // 搭 config 轮询的车带过去，不另开一个路由 —— 它是常量，不值得再来一次请求
       ...buildInfo(),
