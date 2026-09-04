@@ -689,9 +689,6 @@ select:disabled { opacity: .5; cursor: not-allowed; }
   color: var(--mint); border-color: color-mix(in oklab, var(--mint) 45%, var(--line-2));
   background: color-mix(in oklab, var(--mint) 10%, transparent);
 }
-.key-model-option.is-paused {
-  color: var(--fg-2); border-color: var(--line); opacity: .7; cursor: not-allowed;
-}
 .key-form-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .key-form-actions .btn { margin: 0; }
 .key-message { margin: 0; flex: 1 1 240px; min-width: 0; }

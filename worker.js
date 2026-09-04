@@ -35,10 +35,11 @@ function parseModelAliases(raw) {
 // 真源: https://github.com/CodebuffAI/freebuff (freebuff-private 的 public 镜像)
 // 与 Freebuff Desktop 0.0.51 orchestrator.js 的 FREEBUFF_ROOT_AGENT_ID_BY_MODEL 同源
 // （镜像常量 = 桌面版同源源码，安装包只是编译产物）
-// 需要 3 个源（常量分散定义）：
+// 需要 4 个源（常量分散定义）：
 //   1. free-agents.ts       → FREEBUFF_ROOT_AGENT_ID_BY_MODEL（模型→agent 映射）
 //   2. freebuff-models.ts   → 大部分模型 ID 常量 + 池定义（PREMIUM/GLM）
 //   3. freebuff-model-ids.ts→ deepseek/m3 等 ID 常量（被 models.ts re-export）
+//   4. freebuff-model-entitlements.ts → solar-pro4 的 ID（只在这里声明，models.ts 只 re-export）
 // 每源都有 raw 主源 + jsDelivr 备用
 const DYNAMIC_MODELS_SOURCES = [
   "https://raw.githubusercontent.com/CodebuffAI/freebuff/main/common/src/constants/free-agents.ts",
@@ -51,6 +52,10 @@ const DYNAMIC_MODELS_MODEL_IDS_SOURCES = [
 const DYNAMIC_MODELS_STABLE_IDS_SOURCES = [
   "https://raw.githubusercontent.com/CodebuffAI/freebuff/main/common/src/constants/freebuff-model-ids.ts",
   "https://cdn.jsdelivr.net/gh/CodebuffAI/freebuff@main/common/src/constants/freebuff-model-ids.ts",
+];
+const DYNAMIC_MODELS_ENTITLEMENT_SOURCES = [
+  "https://raw.githubusercontent.com/CodebuffAI/freebuff/main/common/src/constants/freebuff-model-entitlements.ts",
+  "https://cdn.jsdelivr.net/gh/CodebuffAI/freebuff@main/common/src/constants/freebuff-model-entitlements.ts",
 ];
 // Releases 兜底源：GitHub Actions 每天生成的解析好的 JSON（无需解析，直接可用）
 // 当官方 3 个源全部失败/解析失败时使用。比 raw.githubusercontent 更稳（GitHub CDN）。
@@ -70,9 +75,10 @@ const DYNAMIC_MODELS_FETCH_TIMEOUT_MS = 10000;
 let dynamicModelsCache = {
   fetchedAt: 0,
   models: null, // 动态模型表（含分类）
-  // { premium: Set, standard: Set, glm: Set, perModelCaps: Object, paused: Set,
-  //   serviceOnly: Set|null }。serviceOnly 为 null = 没读到官方名单（兜底路径/解析失败），
-  // 与「读到了但是空」不同，前者由 isHiddenModelId 落静态兜底 fail closed。
+  // { premium: Set, standard: Set, glm: Set, perModelCaps: Object, paused: Set|null,
+  //   serviceOnly: Set|null }。paused / serviceOnly 为 null = 没读到官方名单（兜底路径/
+  // 解析失败），与「读到了但是空」不同：前者由 isPausedModelId / isHiddenModelId 落静态
+  // 兜底 fail closed，后者才代表官方确实全部恢复了。
   pool: null,
 };
 let dynamicModelsRefreshFlight = null;
@@ -85,12 +91,23 @@ let dynamicModelAvailability = new Map(); // modelId -> { available, checkedAt }
 // 形如:
 //   export const FREEBUFF_MIMO_V25_MODEL_ID = mimoModels.mimoV25
 //   export const FREEBUFF_MINIMAX_M3_MODEL_ID = 'minimax/minimax-m3'
-// 兼容: 'string' | 标识符.成员（取成员名查 knownDefaults）| 标识符
+// 兼容: 'string' | 标识符.成员（先查同文件对象常量，再查 knownDefaults）| 标识符
 function parseModelIdConstants(source) {
   const table = {};
   const knownDefaults = {
     mimoV25: "mimo/mimo-v2.5",
   };
+  // 先记下对象常量的字符串成员（键为 NAME.成员），供
+  //   export const FREEBUFF_SOLAR_PRO_4_MODEL_ID = FREEBUFF_SOLAR_PRO_4_ENTITLEMENT.modelId
+  // 这类同文件别名解析。只吃顶格 `}` 收尾的块，嵌套的 `  },` 不会提前截断。
+  const members = {};
+  const objRe = /export\s+const\s+([A-Za-z0-9_]+)\s*=\s*\{([\s\S]*?)\n\}/g;
+  let obj;
+  while ((obj = objRe.exec(source)) !== null) {
+    const memberRe = /([A-Za-z0-9_]+)\s*:\s*(?:'([^']*)'|"([^"]*)")/g;
+    let mem;
+    while ((mem = memberRe.exec(obj[2])) !== null) members[`${obj[1]}.${mem[1]}`] = mem[2] ?? mem[3];
+  }
   // 匹配 export const NAME = 'value' 或 export const NAME = expr
   const re = /export\s+const\s+([A-Z0-9_]+)\s*=\s*(?:'([^']*)'|"([^"]*)"|([A-Za-z0-9_.]+))/g;
   let m;
@@ -102,7 +119,8 @@ function parseModelIdConstants(source) {
     else if (expr) {
       // 标识符.成员 → 取成员名（mimoModels.mimoV25 → mimoV25）
       const member = expr.includes(".") ? expr.split(".").pop() : expr;
-      if (knownDefaults[member]) table[name] = knownDefaults[member];
+      if (members[expr]) table[name] = members[expr];
+      else if (knownDefaults[member]) table[name] = knownDefaults[member];
       else if (/^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.:/-]+$/.test(expr)) table[name] = expr;
     }
   }
@@ -273,9 +291,11 @@ function parseModelPools(source, modelIdConstants) {
     }
   }
   const perModelCaps = parsePerModelSessionCaps(source, modelIdConstants);
+  // 与 serviceOnly 同样是三态：没有这张表 → null（落静态兜底），读到空数组 → []
+  // （官方把所有模型都恢复了，不该再由我们继续停用）。
   const pausedBody = extractArrayBody(source, "FREEBUFF_PAUSED_FREE_MODEL_IDS");
   const paused = pausedBody === null
-    ? []
+    ? null
     : [...new Set(expandItems(parseIdListItems(pausedBody, modelIdConstants)))];
   // 服务专用名单 = 官方唯一有牙的 surface 门：执法点在 Web 的
   // /api/v1/chat/completions，按服务端持有的 runner API key 判定，surface 头 / agent id /
@@ -528,11 +548,12 @@ async function performDynamicModelsRefresh() {
   let nextCache = dynamicModelsCache;
   let refreshed = false;
   let source = "cache";
-  // 并行拉 3 个源（每源主 raw + 备 jsDelivr）
-  const [agentsSrc, modelsSrc, stableIdsSrc] = await Promise.all([
+  // 并行拉 4 个源（每源主 raw + 备 jsDelivr）
+  const [agentsSrc, modelsSrc, stableIdsSrc, entitlementSrc] = await Promise.all([
     fetchSourceList(DYNAMIC_MODELS_SOURCES),
     fetchSourceList(DYNAMIC_MODELS_MODEL_IDS_SOURCES),
     fetchSourceList(DYNAMIC_MODELS_STABLE_IDS_SOURCES),
+    fetchSourceList(DYNAMIC_MODELS_ENTITLEMENT_SOURCES),
   ]);
   if (!agentsSrc || !modelsSrc) {
     // 官方源拉取失败：尝试 Releases JSON 兜底
@@ -543,8 +564,12 @@ async function performDynamicModelsRefresh() {
       source = "release";
     }
   } else try {
-    // 合并常量表：models.ts 优先（完整），stableIds.ts 补充 deepseek/m3
-    const modelIdConstants = { ...parseModelIdConstants(stableIdsSrc || ""), ...parseModelIdConstants(modelsSrc) };
+    // 合并常量表：models.ts 优先（完整），stableIds.ts 补 deepseek/m3，entitlements.ts 补 solar-pro4
+    const modelIdConstants = {
+      ...parseModelIdConstants(entitlementSrc || ""),
+      ...parseModelIdConstants(stableIdsSrc || ""),
+      ...parseModelIdConstants(modelsSrc),
+    };
     const agentMappings = parseAgentMappings(agentsSrc, modelIdConstants);
     if (Object.keys(agentMappings.root).length === 0) {
       // 解析失败：尝试 Releases 兜底
@@ -561,7 +586,7 @@ async function performDynamicModelsRefresh() {
         standard: null,
         glm: new Set(pools.glm),
         perModelCaps: pools.perModelCaps || {},
-        paused: new Set(pools.paused || []),
+        paused: pools.paused ? new Set(pools.paused) : null,
         // null 与空集合含义不同：null = 官方源里读不到这张表 → 隐藏落静态兜底。
         serviceOnly: pools.serviceOnly ? new Set(pools.serviceOnly) : null,
       };
@@ -644,7 +669,7 @@ async function tryReleaseFallback() {
               glm: new Set(json.pools?.glm ?? []),
               perModelCaps: json.upstream?.perModelCaps && typeof json.upstream.perModelCaps === "object"
                 ? json.upstream.perModelCaps : {},
-              paused: new Set(Array.isArray(json.upstream?.paused) ? json.upstream.paused : []),
+              paused: Array.isArray(json.upstream?.paused) ? new Set(json.upstream.paused) : null,
               // 兜底 JSON 里没有这块（旧 Releases 资产就没有）时保持 null，
               // 让隐藏落静态兜底，而不是当成「官方名单是空的」。
               serviceOnly: Array.isArray(json.upstream?.serviceOnly)
@@ -803,6 +828,10 @@ function modelCatalogTier(modelId, pool) {
 // M3 虽曾出现在旧 Premium 快照里，但已于 2026-08-20 暂停，不得再据旧表
 // 认定为当前可运行额度池。额度只用于本地调度/错误作用域，不改变调用方模型。
 // ---------------------------------------------------------------------------
+// 官方 FREEBUFF_PAUSED_FREE_MODEL_IDS 的静态兜底：动态源拉不到 / 旧 Releases 兜底 /
+// 冷缓存时用它 fail closed。**只是兜底**——动态名单一旦读到就完全以它为准，所以官方
+// 哪天把某个模型从该表里移出去（= 重新启用），这里一个字都不用改，它会自动重新出现在
+// /v1/models 和面板模型列表里；反之官方新停一个（如 z-ai/glm-5.2）也自动跟上。
 const PAUSED_QUOTA_MODELS = new Set([
   "minimax/minimax-m3",
   // 官方 2026-08-26 已从免费目录和所有额度池撤下；仅保留 wire id 供旧客户端
@@ -810,23 +839,26 @@ const PAUSED_QUOTA_MODELS = new Set([
   "deepseek/deepseek-v4-pro",
   "stealth/ox-alpha",
 ]);
+function pausedModelIds(cache = dynamicModelsCache) {
+  const dynamic = cache?.pool?.paused;
+  // 空集合是合法的官方状态（全部恢复），必须与 null（没读到）区分：只有后者才用兜底。
+  const ids = dynamic && typeof dynamic[Symbol.iterator] === "function"
+    ? dynamic
+    : PAUSED_QUOTA_MODELS;
+  const out = new Set();
+  for (const id of ids) {
+    const normalized = String(id || "").trim().toLowerCase();
+    if (normalized) out.add(normalized);
+  }
+  return out;
+}
 function isPausedModelId(modelId, cache = dynamicModelsCache) {
   const value = String(modelId || "").trim().toLowerCase();
   if (!value) return false;
-  const paused = new Set(PAUSED_QUOTA_MODELS);
-  const dynamicPaused = cache?.pool?.paused;
-  if (dynamicPaused && typeof dynamicPaused[Symbol.iterator] === "function") {
-    for (const id of dynamicPaused) {
-      const normalized = String(id || "").trim().toLowerCase();
-      if (normalized) paused.add(normalized);
-    }
-  }
-  for (const base of paused) {
-    const normalizedBase = String(base || "").trim().toLowerCase();
-    if (!normalizedBase) continue;
-    if (value === normalizedBase) return true;
-    if (!value.startsWith(normalizedBase + "-")) continue;
-    const suffix = value.slice(normalizedBase.length + 1);
+  for (const base of pausedModelIds(cache)) {
+    if (value === base) return true;
+    if (!value.startsWith(base + "-")) continue;
+    const suffix = value.slice(base.length + 1);
     if (/^\d{6,8}(?:$|[-:])/.test(suffix)) return true;
   }
   return false;
@@ -922,6 +954,9 @@ export default {
   // 服务专用模型名单（官方 FREEBUFF_SERVICE_ONLY_MODEL_IDS）。账号额度快照里仍然带这些行，
   // 而面板不解析官方源码，只能由 worker 下发（server.js 的 GET /_api/config 顺路带出去）。
   serviceOnlyModels() { return [...serviceOnlyModelIds()]; },
+  // 官方暂停名单（FREEBUFF_PAUSED_FREE_MODEL_IDS）。同理：面板要靠它把停用模型藏起来，
+  // 并且在官方重新启用后自动恢复显示，不能在前端写死。
+  pausedModels() { return [...pausedModelIds()]; },
   // 概况统计持久化适配器（server.js 启动时注入）。
   configureUsagePersistence,
   restoreUsageSnapshot,

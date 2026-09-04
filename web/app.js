@@ -306,12 +306,11 @@ function stateDot(s, detail = '') {
 // tag 表达访问/供给层：免费 / 高级 / GLM / 限定 / 停用。
 // GLM 5.3 Flash 有独立额度池；Luna 只属于 Premium 共享池。
 // Fable 虽沿用 standard 兼容池，访问层仍是限定，不能被错标为免费。
+// 停用不写在这张表里：它是动态的（见 PAUSED_MODEL_IDS），写死会让官方重新启用后的模型
+// 一直挂着「停用」标签。
 const MODEL_DISPLAY = {
   'openai/gpt-5.6-luna': { label: '高级', tier: 'premium' },
-  'deepseek/deepseek-v4-pro': { label: '停用', tier: 'paused' },
-  'stealth/ox-alpha': { label: '停用', tier: 'paused' },
   'deepseek/deepseek-v4-flash': { label: '免费', tier: 'free' },
-  'minimax/minimax-m3': { label: '停用', tier: 'paused' },
   'crof/kimi-k3-eco': { label: '高级', tier: 'us_sg' },
   'meta/muse-spark-1.2-contributor': { label: '高级', tier: 'us_sg' },
   'mimo/mimo-v2.5': { label: '免费', tier: 'free' },
@@ -320,13 +319,24 @@ const MODEL_DISPLAY = {
   'anthropic/claude-fable-5': { label: '限定', tier: 'limited' },
 };
 
-// 官方已撤回但动态目录可能不再返回的模型，保留在管理面板用于说明历史配置，
-// 不代表它仍可调用；worker /v1/models 和请求入口都会将其排除。
-const PAUSED_MODEL_IDS = new Set([
+// 官方暂停名单（FREEBUFF_PAUSED_FREE_MODEL_IDS）由 worker 经 /_api/config 下发。停用模型
+// 直接从模型列表、账号可用模型和 Key 白名单按钮里隐藏 —— 它们调不通（上游 409），列出来
+// 只会被选中一次再报错。名单是动态的：官方重新启用后名单变短，模型自动重新显示。
+// 下面这张表只是拿到 /_api/config 之前（或 worker 读不到官方源时）的兜底。
+const PAUSED_FALLBACK_MODEL_IDS = new Set([
   'minimax/minimax-m3',
   'deepseek/deepseek-v4-pro',
   'stealth/ox-alpha',
 ]);
+let PAUSED_MODEL_IDS = PAUSED_FALLBACK_MODEL_IDS;
+
+function setPausedModels(ids) {
+  // 与 worker 的三态同口径：不是数组 = 没拿到名单，继续兜底；空数组 = 官方全部恢复了。
+  PAUSED_MODEL_IDS = Array.isArray(ids)
+    ? new Set(ids.map((id) => String(id || '').trim().toLowerCase()).filter(Boolean))
+    : PAUSED_FALLBACK_MODEL_IDS;
+}
+
 const HIDDEN_MODEL_IDS = new Set([
   'openai/gpt-5.6-luna-es',
   // 官方 FREEBUFF_WEB_GOD_ONLY_MODELS（0766319c）：god 账号专属，且不在 CLI 目录里。
@@ -346,13 +356,13 @@ function setServiceOnlyModels(ids) {
 function isPausedModelId(modelId) {
   const value = String(modelId || '').trim().toLowerCase();
   if (!value) return false;
-  if (PAUSED_MODEL_IDS.has(value)) return true;
-  if (value === 'minimax-m3' || value === 'deepseek-v4-pro' || value === 'ox-alpha') return true;
-  return [
-    'minimax/minimax-m3',
-    'deepseek/deepseek-v4-pro',
-    'stealth/ox-alpha',
-  ].some((base) => new RegExp(`^${base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}-\\d{6,8}(?:[-/:].*)?$`).test(value));
+  // 与 worker 的 isPausedModelId 同口径：命中 id 本身、去掉 provider 前缀的裸名，
+  // 或 <id>-YYYYMMDD 日期变体。
+  for (const base of PAUSED_MODEL_IDS) {
+    if (value === base || value === base.slice(base.indexOf('/') + 1)) return true;
+    if (value.startsWith(`${base}-`) && /^\d{6,8}(?:$|[-:])/.test(value.slice(base.length + 1))) return true;
+  }
+  return false;
 }
 
 function isHiddenModelId(modelId) {
@@ -369,10 +379,8 @@ function isHiddenModelId(modelId) {
 }
 
 function catalogModelIds() {
-  const ids = Array.isArray(S.models) ? S.models.map((m) => m.id)
-    .filter((id) => id && !isHiddenModelId(id)) : [];
-  for (const id of PAUSED_MODEL_IDS) if (!ids.includes(id)) ids.push(id);
-  return ids;
+  return Array.isArray(S.models) ? S.models.map((m) => m.id)
+    .filter((id) => id && !isPausedModelId(id) && !isHiddenModelId(id)) : [];
 }
 
 const MODEL_QUOTA_POOLS = {
@@ -975,15 +983,18 @@ function setKeyModelSelection(selected = []) {
 function fillKeyModelButtons(selected = []) {
   const chosen = [...new Set(selected.filter(Boolean))];
   const ids = catalogModelIds();
-  for (const id of chosen) if (!ids.includes(id) && !isHiddenModelId(id)) ids.push(id);
+  // 停用/隐藏模型不出按钮：它们调不通，选中只会换来一次 409/403。已存的白名单值
+  // 由 keyEditingPausedModels / keyEditingHiddenModels 原样保留，不会因为看不见而丢。
+  for (const id of chosen) {
+    if (!ids.includes(id) && !isPausedModelId(id) && !isHiddenModelId(id)) ids.push(id);
+  }
   const root = $('newKeyModels');
   root.innerHTML = [
     `<button type="button" class="key-model-option" data-key-model="" aria-pressed="${chosen.length === 0}" title="不限模型">All</button>`,
     ...ids.map((id) => {
       const model = (Array.isArray(S.models) ? S.models : []).find((entry) => entry?.id === id);
       const { name, tier } = modelDisplay(id, model);
-      const paused = isPausedModelId(id);
-      return `<button type="button" class="key-model-option${paused ? ' is-paused' : ''}" data-key-model="${esc(id)}" aria-pressed="${chosen.includes(id)}"${paused ? ' disabled aria-disabled="true"' : ''} title="${esc(id)}">${esc(name)}${tier ? ` · ${esc(tier)}` : ''}</button>`;
+      return `<button type="button" class="key-model-option" data-key-model="${esc(id)}" aria-pressed="${chosen.includes(id)}" title="${esc(id)}">${esc(name)}${tier ? ` · ${esc(tier)}` : ''}</button>`;
     }),
   ].join('');
   root.querySelectorAll('[data-key-model]').forEach((button) => button.addEventListener('click', () => {
@@ -1161,10 +1172,10 @@ const MODEL_TIER_LABELS = { free: '免费', us_sg: '高级', limited: '限定' }
 
 function renderModels() {
   const ul = $('models');
-  const known = new Map((Array.isArray(S.models) ? S.models : []).map((m) => [m.id, m]));
-  for (const id of PAUSED_MODEL_IDS) if (!known.has(id)) known.set(id, { id, tier: 'paused' });
-  const list = [...known.values()].filter((m) => {
-    return m?.id && !isHiddenModelId(m.id);
+  // 停用模型不进列表：官方把它从 FREEBUFF_PAUSED_FREE_MODEL_IDS 里移出去（重新启用）
+  // 之后，/v1/models 会重新带上它，这里自动恢复显示。
+  const list = (Array.isArray(S.models) ? S.models : []).filter((m) => {
+    return m?.id && !isPausedModelId(m.id) && !isHiddenModelId(m.id);
   });
   const modelCount = $('modelCount');
   if (modelCount) modelCount.textContent = `${list.length} 个`;
@@ -1508,6 +1519,7 @@ async function refresh() {
     if (cfg) {
       S.aliases = cfg.aliases || {};
       setServiceOnlyModels(cfg.serviceOnlyModels);
+      setPausedModels(cfg.pausedModels);
       S.apiKey = cfg.apiKey || 'freebuff-default-key';
       S.keyRotatable = cfg.keyRotatable !== false;
       S.build = cfg.build || ''; S.buildUrl = cfg.buildUrl || ''; S.repoUrl = cfg.repoUrl || '';

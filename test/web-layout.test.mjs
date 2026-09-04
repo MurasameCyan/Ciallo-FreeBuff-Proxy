@@ -179,14 +179,14 @@ assert.match(css, /\.account-priority-toggle\s*\{[^}]*white-space:\s*nowrap/s,
 assert.match(css, /\.account-egress-refresh\s*\{[^}]*white-space:\s*nowrap/s,
   '刷新出站按钮必须保持紧凑单行');
 assert.match(app,
-  /const PAUSED_MODEL_IDS = new Set\(\[[\s\S]*?'minimax\/minimax-m3'[\s\S]*?'deepseek\/deepseek-v4-pro'[\s\S]*?'stealth\/ox-alpha'[\s\S]*?\]\)/,
-  '暂停模型集合必须包含 M3、D4P 与 Ox Alpha');
+  /const PAUSED_FALLBACK_MODEL_IDS = new Set\(\[[\s\S]*?'minimax\/minimax-m3'[\s\S]*?'deepseek\/deepseek-v4-pro'[\s\S]*?'stealth\/ox-alpha'[\s\S]*?\]\)/,
+  '暂停名单的静态兜底必须包含 M3、D4P 与 Ox Alpha（/_api/config 到位前用它 fail closed）');
 assert.match(app, /const HIDDEN_MODEL_IDS = new Set\(\[[\s\S]*?'openai\/gpt-5\.6-luna-es'[\s\S]*?'crof\/kimi-k3-eco'[\s\S]*?\]\)/,
   '面板仍必须过滤 god-only luna-es / K3 Eco，避免旧缓存或 Key 白名单重新显示');
 assert.match(app, /function isHiddenModelId\(modelId\)[\s\S]*?value\.startsWith\('crof\/kimi-k3-eco'\)/,
   'god-only K3 Eco 的日期/变体后缀同样要挡住，与 worker.js 保持一致');
-assert.match(app, /for \(const id of chosen\) if \(!ids\.includes\(id\) && !isHiddenModelId\(id\)\) ids\.push\(id\)/,
-  '旧 Key 白名单里目录已撤下的模型仍必须保留为历史按钮');
+assert.match(app, /for \(const id of chosen\) \{\s*\n\s*if \(!ids\.includes\(id\) && !isPausedModelId\(id\) && !isHiddenModelId\(id\)\) ids\.push\(id\);/,
+  '旧 Key 白名单里目录已撤下的模型仍必须保留为历史按钮（停用/隐藏的除外，值另有保留路径）');
 assert.match(app, /function quotaRows\(probe\)[\s\S]*?!isPausedModelId\(q\?\.model\)[\s\S]*?!isHiddenModelId\(q\?\.model\)/,
   '账号可用模型列表必须在生成行之前排除暂停模型与 god-only 模型');
 assert.ok(app.includes('function poolResetAt') && app.includes('function renderQuotaHead'),
@@ -482,10 +482,7 @@ assert.match(app, /MODEL_TIER_LABELS = \{ free: '免费', us_sg: '高级', limit
   '模型列表的通用分组 tag 文案必须是 免费 / 高级 / 限定');
 for (const [id, label] of [
   ['openai/gpt-5.6-luna', '高级'],
-  ['deepseek/deepseek-v4-pro', '停用'],
-  ['stealth/ox-alpha', '停用'],
   ['deepseek/deepseek-v4-flash', '免费'],
-  ['minimax/minimax-m3', '停用'],
   ['crof/kimi-k3-eco', '高级'],
   ['meta/muse-spark-1.2-contributor', '高级'],
   ['mimo/mimo-v2.5', '免费'],
@@ -507,10 +504,18 @@ assert.match(app, /function renderModels\(\)[\s\S]*?li\.textContent = name/s,
   '模型列表条目必须只显示模型名（去掉 provider 前缀）');
 assert.match(app, /fillKeyModelButtons[\s\S]*?title="\$\{esc\(id\)\}">\$\{esc\(name\)\}/s,
   'Key 模型按钮必须只显示模型名，完整 id 留在 title');
-assert.match(app, /PAUSED_MODEL_IDS[\s\S]*?fillKeyModelButtons[\s\S]*?disabled aria-disabled="true"/s,
-  'Key 模型列表必须展示暂停模型，但不得允许新 Key 选择它们');
-assert.match(app, /function fillKeyModelButtons[\s\S]*?const paused = isPausedModelId\(id\)/s,
-  'Key 模型按钮必须用统一暂停判定，日期快照变体也要禁用');
+assert.doesNotMatch(app, /PAUSED_MODEL_IDS[\s\S]*?fillKeyModelButtons[\s\S]*?disabled aria-disabled="true"/s,
+  '停用模型不再进 Key 按钮列表，禁用态渲染必须一起删掉');
+assert.match(app, /function catalogModelIds\(\)[\s\S]*?!isPausedModelId\(id\) && !isHiddenModelId\(id\)/s,
+  'Key 白名单候选必须排除停用模型：选中只会换来一次上游 409');
+assert.match(app, /function renderModels\(\)[\s\S]*?!isPausedModelId\(m\.id\) && !isHiddenModelId\(m\.id\)/s,
+  '模型列表必须隐藏停用模型');
+const modelDisplayBlock = app.slice(app.indexOf('const MODEL_DISPLAY = {'),
+  app.indexOf('\n};', app.indexOf('const MODEL_DISPLAY = {')));
+assert.doesNotMatch(modelDisplayBlock, /停用/,
+  '停用标签只能来自动态名单：写进 MODEL_DISPLAY 会让重新启用的模型一直挂着停用');
+assert.match(app, /function fillKeyModelButtons[\s\S]*?!isPausedModelId\(id\)/s,
+  'Key 模型按钮必须用统一暂停判定，日期快照变体也要一起挡掉');
 assert.match(app, /keyEditingPausedModels = Array\.isArray\(k\.models\)[\s\S]*?isPausedModelId\(model\)/s,
   '编辑旧 Key 时日期快照变体必须进入暂停白名单保留路径');
 assert.match(app, /function selectedKeyModels\(\)[\s\S]*?\.filter\(Boolean\)/s,
@@ -530,7 +535,7 @@ assert.doesNotMatch(app, /function perModelCapLimit[\s\S]*?limit\s*-\s*(?:used|r
 const helperSource = `const S = { models: [], health: {} };\nconst esc = (value) => String(value);\n${app.match(/const MODEL_TIER_LABELS = \{[^\n]+/)[0]}\n`
   + `${app.slice(app.indexOf('const MODEL_DISPLAY ='), app.indexOf('function poolResetAt'))}\n`
   + 'globalThis.__modelState = S;\n'
-  + 'globalThis.__modelUi = { accountQuotaSummary, modelName, modelDisplay, modelListHtml, perModelCapLimit, modelsCellHtml, setServiceOnlyModels, isHiddenModelId };';
+  + 'globalThis.__modelUi = { accountQuotaSummary, modelName, modelDisplay, modelListHtml, perModelCapLimit, modelsCellHtml, setServiceOnlyModels, isHiddenModelId, setPausedModels, isPausedModelId };';
 const helperVm = { globalThis: null };
 helperVm.globalThis = helperVm;
 vm.runInNewContext(helperSource, helperVm);
@@ -776,6 +781,28 @@ assert.match(helperVm.__modelUi.modelsCellHtml({ quota: [
   '官方撤门后名单变空，账号可用模型列必须自动恢复显示');
 assert.match(app, /S\.aliases = cfg\.aliases[\s\S]{0,200}?setServiceOnlyModels\(cfg\.serviceOnlyModels\)/s,
   '面板必须从 /_api/config 拿服务专用名单，不能在前端硬编码');
+// 暂停名单同理由 worker 下发。关键是「官方重新启用后自动恢复」：名单里没有的 id 必须
+// 立刻不再算停用，否则前端写死的三条会把已恢复的模型继续藏起来 / 继续挂停用标签。
+assert.match(app, /setServiceOnlyModels\(cfg\.serviceOnlyModels\);\s*\n\s*setPausedModels\(cfg\.pausedModels\)/s,
+  '面板必须从 /_api/config 拿官方暂停名单');
+assert.equal(helperVm.__modelUi.isPausedModelId('minimax/minimax-m3'), true,
+  '拿到 /_api/config 之前必须用静态兜底继续停用 M3');
+helperVm.__modelUi.setPausedModels(['z-ai/glm-5.2']);
+assert.equal(helperVm.__modelUi.isPausedModelId('z-ai/glm-5.2'), true,
+  '官方新增的暂停模型必须跟着名单生效');
+assert.equal(helperVm.__modelUi.isPausedModelId('minimax/minimax-m3'), false,
+  '官方把模型移出暂停名单（重新启用）后，前端不得继续按停用处理');
+assert.equal(helperVm.__modelUi.isPausedModelId('z-ai/glm-5.2-20260901'), true,
+  '日期变体必须与 worker 的 isPausedModelId 同口径命中');
+assert.doesNotMatch(helperVm.__modelUi.modelsCellHtml({ quota: [
+  { model: 'z-ai/glm-5.2', used: 0, limit: 5, pool: 'premium' },
+] }), /glm-5\.2/, '停用模型不得出现在账号可用模型列');
+helperVm.__modelUi.setPausedModels([]);
+assert.equal(helperVm.__modelUi.isPausedModelId('minimax/minimax-m3'), false,
+  '官方清空暂停名单时必须全部恢复，不能回落到静态兜底');
+helperVm.__modelUi.setPausedModels(undefined);
+assert.equal(helperVm.__modelUi.isPausedModelId('minimax/minimax-m3'), true,
+  '名单缺失（旧后端/请求失败）必须回落静态兜底 fail closed，而不是当成全部恢复');
 helperVm.__modelState.models = [{ id: 'z-ai/glm-5.3-flash', perModelCap: { limit: 0 } }];
 assert.equal(helperVm.__modelUi.perModelCapLimit('z-ai/glm-5.3-flash'), 0,
   'limit<=0 的畸形 cap 必须当作没有 cap，不能拿去补行');
@@ -1349,8 +1376,10 @@ assert.match(app, /let keyEditingPausedModels = \[\]/,
   '编辑旧 Key 时必须单独记住暂停模型白名单');
 assert.match(app, /const chosen = \[\.\.\.new Set\(selected\.filter\(Boolean\)\)\]/,
   '旧 Key 已存的 M3 必须保留在按钮选择状态中');
-assert.match(app, /aria-pressed="\$\{chosen\.includes\(id\)\}"[^>]*disabled aria-disabled="true"/s,
-  '旧 Key 的 M3 按钮必须保持选中但禁用，新 Key 仍不能主动选择');
+assert.match(app, /aria-pressed="\$\{chosen\.includes\(id\)\}"/s,
+  '旧 Key 已存的模型按钮必须保持选中');
+assert.match(app, /function selectedKeyModels\(\)[\s\S]*?keyEditingPausedModels, \.\.\.keyEditingHiddenModels/s,
+  '停用模型不再出按钮，旧 Key 白名单里的值只能靠这条保留路径提交回去');
 assert.match(app, /if \(!model\)[\s\S]*?setKeyModelSelection\(\[\]\)[\s\S]*?else[\s\S]*?selected\.has\(model\)[\s\S]*?setKeyModelSelection/s,
   '点击 All 须清空具体模型，具体模型须支持独立切换并在空集时回到 All');
 assert.match(app, /models:\s*selectedKeyModels\(\)/,
