@@ -657,6 +657,29 @@ test('自动节点授权探测使用五秒超时，避免坏节点长时间阻�
     '自动候选验证必须显式使用短超时');
 });
 
+test('账号目录按每个探测完成时刻标记快照，不使用整批完成时间', async () => {
+  const source = readFileSync(new URL('../server.js', import.meta.url), 'utf8');
+  const start = source.indexOf('const results = await Promise.all(accounts.map(async (acct) => {');
+  const end = source.indexOf('\n      for (const result of results)', start);
+  assert.ok(start >= 0 && end > start);
+  const collect = new Function('accounts', 'terminalAccountProbe', 'accountEgressFetch', 'accountEgressStatus', 'probeAccount', 'Date',
+    `return (async () => { ${source.slice(start, end)}; return results; })();`);
+  let time = 1000;
+  const releases = {};
+  const pending = collect(
+    [{ key: 'a', token: 'a', hasToken: true }, { key: 'b', token: 'b', hasToken: true }],
+    () => null, () => null, () => ({}),
+    token => new Promise(resolve => { releases[token] = resolve; }), { now: () => time },
+  );
+  releases.a({ state: 'ok', quota: [] });
+  await new Promise(resolve => setImmediate(resolve));
+  time = 2000;
+  releases.b({ state: 'ok', quota: [] });
+  const results = await pending;
+  assert.equal(results[0].probe.observedAt, 1000);
+  assert.equal(results[1].probe.observedAt, 2000);
+});
+
 test('账号探测同账号串行、不同账号并发且总并发有界', async () => {
   const source = readFileSync(new URL('../server.js', import.meta.url), 'utf8');
   const start = source.indexOf('const ACCOUNT_EGRESS_PROBE_CONCURRENCY');
@@ -1399,7 +1422,7 @@ test('账号列表对终态账号只返回持久状态，单账号显式探测�
   );
   assert.match(listRoute, /terminalAccountProbe\(acct\)/,
     '账号列表必须直接使用持久终态，不能每次刷新都向上游探测封禁账号');
-  assert.match(listRoute, /if \(terminalProbe\)[\s\S]*?probe:\s*terminalProbe/,
+  assert.match(listRoute, /if \(terminalProbe\)[\s\S]*?probe:\s*\{\s*\.\.\.terminalProbe, observedAt: Date\.now\(\)/,
     '终态账号应在调用 accountEgressFetch/probeAccount 前短路');
   assert.match(singleRoute, /ensureAccountEgressForAdminProbe\(acct\)/,
     '管理员单账号探测必须走显式恢复准备路径');

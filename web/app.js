@@ -10,6 +10,7 @@ const POLL_MS = 3600000; // 默认 1 小时自动刷新；需要即时数据可�
 // refresh() 那样连带 /accounts 逐个探号——1 小时那条限制是为它设的,与这里无关。
 // 代价：每次回全量环形缓冲(上限 200 条)。真嫌费流量就上 SSE 或按 since 增量。
 const LOG_POLL_MS = 3000;
+const MODEL_POLL_MS = 60000; // 只读目录，不触发账号探测。
 
 const S = {
   accounts: [], health: {}, accountEgress: {}, aliases: {},
@@ -342,15 +343,81 @@ const HIDDEN_MODEL_IDS = new Set([
   // 官方 FREEBUFF_WEB_GOD_ONLY_MODELS（0766319c）：god 账号专属，且不在 CLI 目录里。
   'crof/kimi-k3-eco',
 ]);
+let GOD_ONLY_MODEL_IDS = new Set(HIDDEN_MODEL_IDS);
+let modelCatalogLoaded = false;
+let modelCatalogRevision = 0;
+let modelCatalogRequestId = 0;
+let modelCatalogAppliedRequestId = 0;
+let modelCatalogFlight = null;
+
+function setGodOnlyModels(ids) {
+  if (Array.isArray(ids)) GOD_ONLY_MODEL_IDS = new Set(ids.map((id) => String(id || '').trim().toLowerCase()).filter(Boolean));
+}
 // 服务专用模型（官方 FREEBUFF_SERVICE_ONLY_MODEL_IDS）由 worker 经 /_api/config 下发：
 // 这些行照样出现在账号额度快照里（muse-spark 就是 pool=premium limit=4），但代理调不通，
 // 不能混进可用模型列和 Key 白名单。名单是动态的，撤门后会自动恢复显示。
 let SERVICE_ONLY_MODEL_IDS = new Set();
+let CATALOG_HIDDEN_MODEL_IDS = new Set();
+
+function setCatalogHiddenModels(ids) {
+  CATALOG_HIDDEN_MODEL_IDS = new Set((Array.isArray(ids) ? ids : [])
+    .map((id) => String(id || '').trim().toLowerCase()).filter(Boolean));
+}
 
 function setServiceOnlyModels(ids) {
   SERVICE_ONLY_MODEL_IDS = new Set((Array.isArray(ids) ? ids : [])
     .map((id) => String(id || '').trim().toLowerCase())
     .filter(Boolean));
+}
+
+function applyModelCatalog(models, requestId = ++modelCatalogRequestId) {
+  if (!models || !Array.isArray(models.data)) return false;
+  const revision = Number(models.catalog?.revision);
+  if (models.catalog && (!Number.isFinite(revision) || revision <= 0)) return false;
+  if (Number.isFinite(revision) && revision > 0
+    && ['hidden_models', 'serviceOnlyModels', 'pausedModels', 'godOnlyModels'].some((key) => !Array.isArray(models[key]))) return false;
+  const updatedAt = Number(models.catalog?.updatedAt) || 0;
+  const currentUpdatedAt = Number(S.modelCatalog?.updatedAt) || 0;
+  if (updatedAt < currentUpdatedAt) return false;
+  if (Number.isFinite(revision) && revision > 0) {
+    if (updatedAt === currentUpdatedAt && revision < modelCatalogRevision) return false;
+    modelCatalogRevision = revision;
+  } else if (modelCatalogRevision > 0 || requestId < modelCatalogAppliedRequestId) return false;
+  modelCatalogAppliedRequestId = Math.max(modelCatalogAppliedRequestId, requestId);
+  S.models = models.data || [];
+  setCatalogHiddenModels(models.hidden_models);
+  // config 可能先于目录刷新读到旧兜底；以模型响应的同一份快照为准。
+  if (Array.isArray(models.serviceOnlyModels)) setServiceOnlyModels(models.serviceOnlyModels);
+  if (Array.isArray(models.pausedModels)) setPausedModels(models.pausedModels);
+  if (Array.isArray(models.godOnlyModels)) setGodOnlyModels(models.godOnlyModels);
+  S.modelCatalog = models.catalog || null;
+  modelCatalogLoaded = true;
+  return true;
+}
+
+async function loadModelCatalog(force = false) {
+  if (!force && modelCatalogFlight) return modelCatalogFlight;
+  const requestId = ++modelCatalogRequestId;
+  const pending = rawApi('/v1/models' + (force ? '?refresh=1' : ''), {
+    headers: { 'Authorization': 'Bearer ' + S.apiKey },
+  }).then((models) => {
+    if (!Array.isArray(models?.data)) throw new Error('模型目录返回格式异常，已保留当前列表');
+    return applyModelCatalog(models, requestId) ? models : null;
+  });
+  modelCatalogFlight = pending;
+  try { return await pending; }
+  finally { if (modelCatalogFlight === pending) modelCatalogFlight = null; }
+}
+
+async function refreshModelCatalogQuietly() {
+  if (document.hidden || !S.apiKey || modelCatalogFlight) return;
+  try {
+    if (!await loadModelCatalog()) return;
+    renderModels(); renderAccounts(); renderKeys(); renderUsageModels(); syncColumnBottoms();
+  } catch {
+    const button = $('modelRefresh');
+    if (button) button.title = '目录更新暂时失败，已保留当前列表；稍后自动重试，也可点击重试';
+  }
 }
 
 function isPausedModelId(modelId) {
@@ -367,11 +434,11 @@ function isPausedModelId(modelId) {
 
 function isHiddenModelId(modelId) {
   const value = String(modelId || '').trim().toLowerCase();
-  if (HIDDEN_MODEL_IDS.has(value)
-    || value.startsWith('openai/gpt-5.6-luna-es')
-    || value.startsWith('crof/kimi-k3-eco')) return true;
+  if (GOD_ONLY_MODEL_IDS.has(value)
+    || (GOD_ONLY_MODEL_IDS.has('openai/gpt-5.6-luna-es') && value.startsWith('openai/gpt-5.6-luna-es'))
+    || (GOD_ONLY_MODEL_IDS.has('crof/kimi-k3-eco') && value.startsWith('crof/kimi-k3-eco'))) return true;
   // 与 worker 的 isHiddenModelId 同口径：命中 id 本身或 <id>-YYYYMMDD 日期变体。
-  for (const base of SERVICE_ONLY_MODEL_IDS) {
+  for (const base of [...GOD_ONLY_MODEL_IDS, ...SERVICE_ONLY_MODEL_IDS, ...CATALOG_HIDDEN_MODEL_IDS]) {
     if (value === base) return true;
     if (value.startsWith(`${base}-`) && /^\d{6,8}(?:$|[-:])/.test(value.slice(base.length + 1))) return true;
   }
@@ -405,6 +472,35 @@ function modelName(id) {
   return value.slice(value.lastIndexOf('/') + 1);
 }
 
+// 2026-09-06 公开目录快照：OpenRouter /api/v1/models 的 context_length 与
+// reasoning.supported_efforts。MiMo 在该目录的 ID 为 xiaomi/mimo-v2.5。
+// DeepSeek 采用 Freebuff 自身的 low/high/max 档位；Luna 与 worker.js 的
+// MODEL_PINNED_EFFORT 对齐，只显示实际固定的 high。未对受限模型发起探测。
+// 这是模型容量，不是账号额度或客户端压缩阈值。新增型号缺资料时显示未收录。
+const MODEL_CAPABILITIES = {
+  'mimo/mimo-v2.5': { contextWindow: 1050000, efforts: [] },
+  'deepseek/deepseek-v4-flash': { contextWindow: 1048576, efforts: ['low', 'high', 'max'] },
+  'meta/muse-spark-1.2-contributor': { contextWindow: 1048576, efforts: ['minimal', 'low', 'medium', 'high', 'xhigh'] },
+  'meta/muse-spark-1.3-contributor': { contextWindow: 1048576, efforts: ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'] },
+  'z-ai/glm-5.3-flash': { contextWindow: 1310720, efforts: ['low', 'high', 'max'] },
+  'anthropic/claude-fable-5': { contextWindow: 1000000, efforts: ['low', 'medium', 'high', 'xhigh', 'max'] },
+  'openai/gpt-5.6-luna': { contextWindow: 1050000, efforts: ['high'], note: '当前网关固定' },
+  'upstage/solar-pro4': { contextWindow: 524288, efforts: [] },
+  'google/gemini-3.8-flash': { contextWindow: 1048576, efforts: ['low', 'medium', 'high'], note: 'max 自动映射为 high' },
+};
+
+function modelTooltip(id) {
+  const info = Object.hasOwn(MODEL_CAPABILITIES, id) ? MODEL_CAPABILITIES[id] : null;
+  const efforts = info
+    ? (info.efforts.length ? info.efforts.join(' / ') : '无可选档位')
+    : '未收录';
+  const note = info?.note ? `（${info.note}）` : '';
+  const context = info?.contextWindow
+    ? `${info.contextWindow.toLocaleString('en-US')} tokens（模型目录）`
+    : '未收录';
+  return `${id}\n思考等级：${efforts}${note}\n上下文：${context}`;
+}
+
 // 访问层固定的 tag：不跟随 pool 声明。GLM 5.3 Flash 的独立额度池是它的访问层特征，
 // 目录行里残留的 pool=premium 不能把它降标成高级；Luna 的独立池已被上游删除，
 // 旧快照里回的 pool='luna' 一律按 Premium 显示。
@@ -418,6 +514,9 @@ function modelDisplay(id, model = null) {
   const name = modelName(id);
   if (isPausedModelId(id)) {
     return { id, name, tierKey: 'paused', tier: '停用' };
+  }
+  if (known.tier === 'limited' && normalizeQuotaPool(model?.pool) === 'premium') {
+    return { id, name, tierKey: 'premium', tier: '高级' };
   }
   const fixed = FIXED_TAG_MODELS[id];
   if (fixed) return { id, name, ...fixed };
@@ -457,7 +556,7 @@ function modelListHtml(modelIds = [], models = null) {
     return id && !isHiddenModelId(id);
   }))].map((id) => {
     const { name, tier, tierKey } = modelDisplay(id, byId.get(id));
-    return `<span class="model-label" title="${esc(id)}">${esc(name)}${tier ? ` <span class="pill tier tier-${esc(tierKey)}">${esc(tier)}</span>` : ''}</span>`;
+    return `<span class="model-label" title="${esc(modelTooltip(id))}">${esc(name)}${tier ? ` <span class="pill tier tier-${esc(tierKey)}">${esc(tier)}</span>` : ''}</span>`;
   }).join(', ');
 }
 
@@ -982,6 +1081,12 @@ function setKeyModelSelection(selected = []) {
 
 function fillKeyModelButtons(selected = []) {
   const chosen = [...new Set(selected.filter(Boolean))];
+  // 目录刷新可能刚隐藏一个已选模型；必须留住白名单，不能保存成不限模型。
+  for (const id of [...keyEditingPausedModels, ...keyEditingHiddenModels]) {
+    if (!chosen.includes(id)) chosen.push(id);
+  }
+  keyEditingPausedModels = chosen.filter(isPausedModelId);
+  keyEditingHiddenModels = chosen.filter(isHiddenModelId);
   const ids = catalogModelIds();
   // 停用/隐藏模型不出按钮：它们调不通，选中只会换来一次 409/403。已存的白名单值
   // 由 keyEditingPausedModels / keyEditingHiddenModels 原样保留，不会因为看不见而丢。
@@ -994,12 +1099,14 @@ function fillKeyModelButtons(selected = []) {
     ...ids.map((id) => {
       const model = (Array.isArray(S.models) ? S.models : []).find((entry) => entry?.id === id);
       const { name, tier } = modelDisplay(id, model);
-      return `<button type="button" class="key-model-option" data-key-model="${esc(id)}" aria-pressed="${chosen.includes(id)}" title="${esc(id)}">${esc(name)}${tier ? ` · ${esc(tier)}` : ''}</button>`;
+      return `<button type="button" class="key-model-option" data-key-model="${esc(id)}" aria-pressed="${chosen.includes(id)}" title="${esc(modelTooltip(id))}">${esc(name)}${tier ? ` · ${esc(tier)}` : ''}</button>`;
     }),
   ].join('');
   root.querySelectorAll('[data-key-model]').forEach((button) => button.addEventListener('click', () => {
     const model = button.dataset.keyModel;
     if (!model) {
+      keyEditingPausedModels = [];
+      keyEditingHiddenModels = [];
       setKeyModelSelection([]);
     } else {
       const selected = new Set(selectedKeyModels());
@@ -1172,6 +1279,12 @@ const MODEL_TIER_LABELS = { free: '免费', us_sg: '高级', limited: '限定' }
 
 function renderModels() {
   const ul = $('models');
+  const refreshButton = $('modelRefresh');
+  if (refreshButton && S.modelCatalog?.updatedAt) {
+    const updated = new Date(S.modelCatalog.updatedAt).toLocaleString('zh-CN', { hour12: false });
+    refreshButton.title = `获取最新模型列表\n上次目录同步：${updated}`
+      + (S.modelCatalog.stale ? '\n正在使用上次成功列表，稍后自动重试' : '');
+  }
   // 停用模型不进列表：官方把它从 FREEBUFF_PAUSED_FREE_MODEL_IDS 里移出去（重新启用）
   // 之后，/v1/models 会重新带上它，这里自动恢复显示。
   const list = (Array.isArray(S.models) ? S.models : []).filter((m) => {
@@ -1184,7 +1297,7 @@ function renderModels() {
     const li = document.createElement('li');
     const { name, tier, tierKey } = modelDisplay(m.id, m);
     li.textContent = name;
-    li.title = m.id;
+    li.title = modelTooltip(m.id);
     // 未分组的模型不带任何 tag
     if (tier) li.append(' ', tag(`pill tier tier-${tierKey}`, tier));
     return li;
@@ -1481,7 +1594,7 @@ function renderUsageModels() {
   ul.replaceChildren(...rows.map((r) => {
     const li = document.createElement('li');
     const nm = tag('nm', modelName(r.key));
-    nm.title = r.key;              // 窄档省略号截断，悬停看全名
+    nm.title = modelTooltip(r.key);
     const n = document.createElement('b');
     n.textContent = fmtCount(r.success);
     li.append(nm, n);
@@ -1518,8 +1631,10 @@ async function refresh() {
     const keys = await api('/keys').catch(() => null);
     if (cfg) {
       S.aliases = cfg.aliases || {};
-      setServiceOnlyModels(cfg.serviceOnlyModels);
-      setPausedModels(cfg.pausedModels);
+      if (!modelCatalogLoaded) {
+        setServiceOnlyModels(cfg.serviceOnlyModels);
+        setPausedModels(cfg.pausedModels);
+      }
       S.apiKey = cfg.apiKey || 'freebuff-default-key';
       S.keyRotatable = cfg.keyRotatable !== false;
       S.build = cfg.build || ''; S.buildUrl = cfg.buildUrl || ''; S.repoUrl = cfg.repoUrl || '';
@@ -1546,8 +1661,7 @@ async function refresh() {
       S.keysLocked = keys.locked === true;
     }
     // /v1/models 是 worker 路由,带 key 头直连
-    const models = await rawApi('/v1/models', { headers: { 'Authorization': 'Bearer ' + S.apiKey } }).catch(() => null);
-    if (models) S.models = models.data || [];
+    await loadModelCatalog().catch(() => null);
     renderStats(); renderAccounts(); renderAliases(); renderKeys(); renderModels(); renderProxy(); renderUsageOverview(); renderCallLog();
     syncColumnBottoms();
   } catch (e) {
@@ -1685,11 +1799,10 @@ function wire() {
     btn.disabled = true;
     btn.classList.add('spin');
     try {
-      const models = await rawApi('/v1/models?refresh=1', {
-        headers: { 'Authorization': 'Bearer ' + S.apiKey },
-      });
-      S.models = models.data || [];
+      const models = await loadModelCatalog(true);
+      if (!models) return;
       renderModels();
+      renderAccounts();
       renderKeys();
       syncColumnBottoms();
       if (models.refresh?.updated === false) {
@@ -2070,4 +2183,7 @@ watchColumnBottoms();
 refresh();
 setInterval(refresh, POLL_MS);
 setInterval(refreshCallLogLive, LOG_POLL_MS);
-document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshCallLogLive(); });
+setInterval(refreshModelCatalogQuietly, MODEL_POLL_MS);
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) { refreshCallLogLive(); refreshModelCatalogQuietly(); }
+});

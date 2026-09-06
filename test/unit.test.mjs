@@ -11,7 +11,7 @@ const wrapper = src
   .replace('const DYNAMIC_MODELS_FETCH_TIMEOUT_MS = 10000;', 'const DYNAMIC_MODELS_FETCH_TIMEOUT_MS = 25;')
   .replace('const DYNAMIC_MODEL_ENDPOINT_RETRY_MS = 60 * 1000;', 'const DYNAMIC_MODEL_ENDPOINT_RETRY_MS = 25;') +
   '\n\nglobalThis.__workerDefault__ = __workerDefault__;\n' +
-  'globalThis.__unitTestApi__ = { normalizeChatThinking, anthropicThinkingToEffort, namedEffort, normalizeReasoningEffort, collectReasoningTexts, anthropicStopReason, anthropicModelToOpenAI, parseModelAliases, parseModelIdConstants, parseModelPools, annotateDynamicModelPools, resolveModelAlias, resolveModelConfig, findModelConfig, refreshDynamicModelsIfStale, modelIsAvailable, setTestAliases: (raw) => { currentAliases = parseModelAliases(raw); }, setTestDynamicModels: (models, fetchedAt = Date.now(), pool = { premium: new Set(), standard: null, glm: new Set(), perModelCaps: {}, paused: null, serviceOnly: null }) => { dynamicModelsCache = { fetchedAt, models, pool }; if (typeof dynamicModelAvailability !== "undefined") dynamicModelAvailability = new Map(); if (typeof dynamicEndpointRefreshFlights !== "undefined") dynamicEndpointRefreshFlights.clear(); }, setTestModelAvailability: (id, available) => { if (typeof dynamicModelAvailability !== "undefined") dynamicModelAvailability.set(id, { available, checkedAt: Date.now(), retryAt: 0 }); }, resetTestModelRefreshFlight: () => { dynamicModelsRefreshFlight = null; if (typeof dynamicEndpointRefreshFlights !== "undefined") dynamicEndpointRefreshFlights.clear(); }, cooldown, cooldownInfo, inCooldown, parseCooldown, nextPacificMidnight: typeof nextPacificMidnight === "function" ? nextPacificMidnight : null, pickToken, releaseToken: typeof releaseToken === "function" ? releaseToken : null, accountPoolExhaustion: typeof accountPoolExhaustion === "function" ? accountPoolExhaustion : null, waitingRoomResponse: typeof waitingRoomResponse === "function" ? waitingRoomResponse : null, pipeUpstreamToClient, pipeUpstreamToResponsesStream, anthropicStream, streamToNonStream, buildUpstreamPayload, anthropicFromChat, responsesToNonStream, markSessionInvalidated, wasRecentlyInvalidated, singleFlight, sessionRemainingMs, INVALIDATION_WINDOW_MS, SESSION_REUSE_SAFE_MS, SESSION_VERIFY_WINDOW_MS, executeChat, readCallUsage, accountLabel, summarizeAccountHealth, logCall, callLogSnapshot, readUsageFull, recordRequest, blankUsageTotals, recordAccountObservation, configureUsagePersistence, restoreUsageSnapshot, usageSnapshot, setTestEgressReject: (fn) => { onEgressReject = fn; }, egressRejectedResponse: typeof egressRejectedResponse === "function" ? egressRejectedResponse : null, MODEL_TIERS, ENDPOINT_CHECK_MODEL_IDS, handleModels, isHiddenModelId, isPausedModelId };\n';
+  'globalThis.__unitTestApi__ = { normalizeChatThinking, anthropicThinkingToEffort, namedEffort, normalizeReasoningEffort, collectReasoningTexts, anthropicStopReason, anthropicModelToOpenAI, parseModelAliases, parseModelIdConstants, parseModelPools, annotateDynamicModelPools, resolveModelAlias, resolveModelConfig, findModelConfig, refreshDynamicModelsIfStale, modelIsAvailable, setTestAliases: (raw) => { currentAliases = parseModelAliases(raw); }, setTestDynamicModels: (models, fetchedAt = Date.now(), pool = { premium: new Set(), standard: null, glm: new Set(), perModelCaps: {}, paused: null, serviceOnly: null }) => { dynamicModelsCache = { fetchedAt, models, pool }; dynamicModelsRetryAt = 0; if (typeof dynamicModelAvailability !== "undefined") dynamicModelAvailability = new Map(); if (typeof dynamicEndpointRefreshFlights !== "undefined") dynamicEndpointRefreshFlights.clear(); }, setTestModelAvailability: (id, available) => { if (typeof dynamicModelAvailability !== "undefined") dynamicModelAvailability.set(id, { available, checkedAt: Date.now(), retryAt: 0 }); }, resetTestModelRefreshFlight: () => { dynamicModelsRefreshFlight = null; if (typeof dynamicEndpointRefreshFlights !== "undefined") dynamicEndpointRefreshFlights.clear(); }, cooldown, cooldownInfo, inCooldown, parseCooldown, nextPacificMidnight: typeof nextPacificMidnight === "function" ? nextPacificMidnight : null, pickToken, releaseToken: typeof releaseToken === "function" ? releaseToken : null, accountPoolExhaustion: typeof accountPoolExhaustion === "function" ? accountPoolExhaustion : null, waitingRoomResponse: typeof waitingRoomResponse === "function" ? waitingRoomResponse : null, pipeUpstreamToClient, pipeUpstreamToResponsesStream, anthropicStream, streamToNonStream, buildUpstreamPayload, anthropicFromChat, responsesToNonStream, markSessionInvalidated, wasRecentlyInvalidated, singleFlight, sessionRemainingMs, INVALIDATION_WINDOW_MS, SESSION_REUSE_SAFE_MS, SESSION_VERIFY_WINDOW_MS, executeChat, readCallUsage, accountLabel, summarizeAccountHealth, logCall, callLogSnapshot, readUsageFull, recordRequest, blankUsageTotals, recordAccountObservation, configureUsagePersistence, restoreUsageSnapshot, usageSnapshot, setTestEgressReject: (fn) => { onEgressReject = fn; }, egressRejectedResponse: typeof egressRejectedResponse === "function" ? egressRejectedResponse : null, MODEL_TIERS, ENDPOINT_CHECK_MODEL_IDS, handleModels, isHiddenModelId, isPausedModelId };\n';
 
 // 可编程 fetch mock：测试里可替换 sandbox.fetch，返回可定制的 Response 形状
 // （worker 里用的是 { status, ok, headers, text() } 简化形状）。
@@ -821,6 +821,9 @@ await tAsync('Reviewer 上游 400 原文回传，不换号也不冷却账号', a
 });
 
 await tAsync('模型目录携带官方动态 pool 元数据', async () => {
+  workerDefault.setAccountCatalogProbes({ fixture: { state: 'ok', quota: [
+    { model: 'z-ai/glm-5.3-flash', pool: 'glm_v53_flash', limit: 2, used: 0 },
+  ] } });
   // 共享 Premium → us_sg 这条契约的主体换成 luna：D4P 已被官方 paused 列表撤下，
   // 目录里查不到它，拿它当样本只会测到闸门而不是 pool 元数据。
   setTestDynamicModels([
@@ -853,15 +856,19 @@ await tAsync('模型目录携带官方动态 pool 元数据', async () => {
     throw new Error('Luna 共享 Premium 分组错误: ' + JSON.stringify(luna));
   }
   const fable = body.data.find((entry) => entry.id === 'anthropic/claude-fable-5');
-  if (!fable || fable.pool !== 'standard' || fable.tier !== 'limited') {
-    throw new Error('Fable 限定 tier 错误: ' + JSON.stringify(fable));
+  if (fable || !body.hidden_models.includes('anthropic/claude-fable-5')) {
+    throw new Error('Fable 的 standard 兼容池不能放出限定模型');
   }
+  workerDefault.setAccountCatalogProbes({});
   setTestDynamicModels(null);
 });
 
 // 独立额度池（非共享 premium）进限定分组；luna 的旧兼容池名 luna 要折算回 premium
 // 才不会掉标签（上游旧快照仍会回 pool='luna'）。
 await tAsync('独立额度池进限定分组，luna 旧池名折算回共享 Premium', async () => {
+  workerDefault.setAccountCatalogProbes({ fixture: { state: 'ok', quota: [
+    { model: 'z-ai/glm-5.3-flash', pool: 'glm_v53_flash', limit: 2, used: 0 },
+  ] } });
   setTestDynamicModels([
     {
       id: 'z-ai/glm-5.3-flash', session: 'z-ai/glm-5.3-flash',
@@ -883,6 +890,7 @@ await tAsync('独立额度池进限定分组，luna 旧池名折算回共享 Pre
   if (!luna || luna.tier !== 'us_sg') {
     throw new Error('luna 旧池名 luna 未折算回共享 Premium: ' + JSON.stringify(luna));
   }
+  workerDefault.setAccountCatalogProbes({});
   setTestDynamicModels(null);
 });
 
@@ -1269,6 +1277,9 @@ export const FREEBUFF_PROBE_MODEL_ID = 'probe/endpoint-gated'
 export const FREEBUFF_PREMIUM_MODEL_IDS = [] as const
 export const FREEBUFF_WEB_PREMIUM_MODEL_IDS = [...FREEBUFF_PREMIUM_MODEL_IDS] as const
 export const FREEBUFF_GLM_V52_MODEL_IDS = [] as const
+export const FREEBUFF_PAUSED_FREE_MODEL_IDS = [] as const
+export const FREEBUFF_SERVICE_ONLY_MODEL_IDS = [] as const
+export const FREEBUFF_WEB_GOD_ONLY_MODELS = [] as const
 `,
   stable: `
 export const FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID = 'deepseek/deepseek-v4-flash'

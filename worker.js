@@ -65,9 +65,10 @@ const DYNAMIC_MODELS_RELEASE_SOURCES = [
 ];
 const MODEL_ENDPOINTS_API = "https://openrouter.ai/api/v1/models";
 const ENDPOINT_CHECK_MODEL_IDS = new Set(["stealth/ox-alpha"]);
-// 刷新间隔：与 Quorinex 对齐，6 小时。失败时回退到硬编码 MODELS。
-const DYNAMIC_MODELS_REFRESH_MS = 6 * 60 * 60 * 1000;
-// endpoint 首次无法确认时保持下架，但不要跟着目录缓存冻结 6 小时。
+// 公开目录五分钟过期；失败时保留已发布快照，一分钟后自动重试。
+const DYNAMIC_MODELS_REFRESH_MS = 5 * 60 * 1000;
+const DYNAMIC_MODELS_RETRY_MS = 60 * 1000;
+// endpoint 首次无法确认时保持下架，使用自己的短重试周期。
 const DYNAMIC_MODEL_ENDPOINT_RETRY_MS = 60 * 1000;
 const DYNAMIC_MODELS_FETCH_TIMEOUT_MS = 10000;
 
@@ -76,12 +77,14 @@ let dynamicModelsCache = {
   fetchedAt: 0,
   models: null, // 动态模型表（含分类）
   // { premium: Set, standard: Set, glm: Set, perModelCaps: Object, paused: Set|null,
-  //   serviceOnly: Set|null }。paused / serviceOnly 为 null = 没读到官方名单（兜底路径/
+  //   serviceOnly: Set|null, godOnly: Set|null }。控制名单为 null = 没读到官方名单（兜底路径/
   // 解析失败），与「读到了但是空」不同：前者由 isPausedModelId / isHiddenModelId 落静态
   // 兜底 fail closed，后者才代表官方确实全部恢复了。
   pool: null,
 };
 let dynamicModelsRefreshFlight = null;
+let dynamicModelsRetryAt = 0;
+let catalogResponseRevision = 0;
 const dynamicEndpointRefreshFlights = new Map();
 // 公开 provider 端点状态。endpoints: [] / 404 标记不可用；网络错误沿用上次
 // 结果。冷启动尚无可信状态时 fail closed，避免把未经确认的模型漏进目录。
@@ -175,11 +178,13 @@ function stripSourceComments(text) {
 // `readonly string[]`、`FREE_MODE_AGENT_MODELS[...]`）时，惰性匹配会在注释里的第一个
 // `]` 提前收尾，只解析出名单的前几行。
 function extractArrayBody(source, name) {
-  const decl = new RegExp(`export\\s+const\\s+${name}\\b[^=]*=`).exec(source);
-  if (!decl) return null;
   const cleaned = stripSourceComments(source);
-  const open = cleaned.indexOf("[", decl.index + decl[0].length - 1);
-  if (open < 0) return null;
+  const decl = new RegExp(`export\\s+const\\s+${name}\\b[^=]*=`).exec(cleaned);
+  if (!decl) return null;
+  const start = decl.index + decl[0].length;
+  const prefix = /^\s*(?:Object\.freeze\s*\(\s*)?\[/.exec(cleaned.slice(start));
+  if (!prefix) return null; // 不能越过当前表达式去读取后续声明的数组。
+  const open = start + prefix[0].lastIndexOf('[');
   let depth = 0;
   for (let i = open; i < cleaned.length; i++) {
     if (cleaned[i] === "[") depth++;
@@ -247,6 +252,43 @@ function parsePerModelSessionCaps(source, modelIdConstants) {
 // 解析 freebuff-models.ts 的共享池、单模型 cap、暂停清单与服务专用清单。
 // STANDARD 仍由 non-premium/non-GLM 推导；独立 cap 只覆盖展示/作用域，不会抹掉
 // GLM 5.3 Flash 同时属于共享 Premium 池的事实。
+function parseStrictModelList(source, name, refs) {
+  const read = (listName, seen = new Set()) => {
+    if (seen.has(listName)) return null;
+    const body = extractArrayBody(source, listName);
+    if (body === null) return null;
+    const nextSeen = new Set([...seen, listName]);
+    const ids = [];
+    for (const raw of body.split(',')) {
+      const entry = raw.trim();
+      if (!entry) continue;
+      const literal = /^(['"])([^'"]+)\1$/.exec(entry);
+      const spread = /^\.\.\.([A-Z0-9_]+)$/.exec(entry);
+      if (literal) ids.push(literal[2]);
+      else if (spread) {
+        const nested = read(spread[1], nextSeen);
+        if (nested === null) return null;
+        ids.push(...nested);
+      } else if (Object.hasOwn(refs, entry)) ids.push(refs[entry]);
+      else return null; // 未解析的引用不是“官方清空名单”。
+    }
+    return [...new Set(ids)];
+  };
+  return read(name);
+}
+
+function parseGodOnlyModels(source, modelIdConstants) {
+  const cleaned = stripSourceComments(source);
+  const refs = { ...modelIdConstants };
+  const modelRe = /\bconst\s+([A-Z0-9_]+)(?:\s*:\s*[^=\n]+)?\s*=\s*\{\s*id\s*:\s*(?:'([^']+)'|"([^"]+)"|([A-Z0-9_]+))/g;
+  let match;
+  while ((match = modelRe.exec(cleaned)) !== null) {
+    const id = match[2] || match[3] || modelIdConstants[match[4]];
+    if (id) refs[match[1]] = id;
+  }
+  return parseStrictModelList(cleaned, 'FREEBUFF_WEB_GOD_ONLY_MODELS', refs);
+}
+
 function parseModelPools(source, modelIdConstants) {
   const premium = new Set();
   const glm = new Set();
@@ -293,10 +335,7 @@ function parseModelPools(source, modelIdConstants) {
   const perModelCaps = parsePerModelSessionCaps(source, modelIdConstants);
   // 与 serviceOnly 同样是三态：没有这张表 → null（落静态兜底），读到空数组 → []
   // （官方把所有模型都恢复了，不该再由我们继续停用）。
-  const pausedBody = extractArrayBody(source, "FREEBUFF_PAUSED_FREE_MODEL_IDS");
-  const paused = pausedBody === null
-    ? null
-    : [...new Set(expandItems(parseIdListItems(pausedBody, modelIdConstants)))];
+  const paused = parseStrictModelList(cleaned, "FREEBUFF_PAUSED_FREE_MODEL_IDS", modelIdConstants);
   // 服务专用名单 = 官方唯一有牙的 surface 门：执法点在 Web 的
   // /api/v1/chat/completions，按服务端持有的 runner API key 判定，surface 头 / agent id /
   // model id 都是调用方能自己写的文本，绕不过。
@@ -309,12 +348,10 @@ function parseModelPools(source, modelIdConstants) {
   // constValues 的 spread 展开。
   // 名单为空是合法状态（2026-09-02 之前一直是空的），所以「源里没有这张表」必须与
   // 「读到了但是空」分开：没有 → null，让调用层落静态兜底。
-  const serviceOnlyBody = extractArrayBody(source, "FREEBUFF_SERVICE_ONLY_MODEL_IDS");
-  const serviceOnly = serviceOnlyBody === null
-    ? null
-    : [...new Set(expandItems(parseIdListItems(serviceOnlyBody, modelIdConstants)))];
+  const serviceOnly = parseStrictModelList(cleaned, "FREEBUFF_SERVICE_ONLY_MODEL_IDS", modelIdConstants);
   // FREEBUFF_PREMIUM_MODEL_IDS 与 FREEBUFF_WEB_PREMIUM_MODEL_IDS 都算 premium。
-  return { premium: [...premium], glm: [...glm], perModelCaps, paused, serviceOnly };
+  return { premium: [...premium], glm: [...glm], perModelCaps, paused, serviceOnly,
+    godOnly: parseGodOnlyModels(source, modelIdConstants) };
 }
 
 // 上游把这些模型的 base2 root agent 在服务端下线了：session 200、agent-runs 200，
@@ -509,7 +546,7 @@ function modelIsAvailable(modelId, availability = dynamicModelAvailability) {
 function endpointAvailabilityNeedsRetry(modelId, now = Date.now()) {
   const id = String(modelId || "");
   if (!ENDPOINT_CHECK_MODEL_IDS.has(id)) return false;
-  // 冷启动需要先拉目录；已发布目录里没有这个模型时按正常 6 小时 TTL 等待。
+  // 冷启动需要先拉目录；已发布目录里没有这个模型时按目录 TTL 等待。
   if (!Array.isArray(dynamicModelsCache.models)) return true;
   if (!dynamicModelsCache.models.some((model) => model?.id === id)) return false;
   const state = dynamicModelAvailability.get(id);
@@ -589,7 +626,11 @@ async function performDynamicModelsRefresh() {
         paused: pools.paused ? new Set(pools.paused) : null,
         // null 与空集合含义不同：null = 官方源里读不到这张表 → 隐藏落静态兜底。
         serviceOnly: pools.serviceOnly ? new Set(pools.serviceOnly) : null,
+        godOnly: pools.godOnly ? new Set(pools.godOnly) : null,
       };
+      // 已有明确名单不能被缺字段或未解析的结果降回静态兜底。
+      if (["paused", "serviceOnly", "godOnly"].some((key) =>
+        dynamicModelsCache.pool?.[key] != null && pool[key] === null)) return dynamicModelsSnapshot();
       nextCache = {
         fetchedAt: Date.now(),
         models: annotateDynamicModelPools(buildDynamicModelTable(agentMappings), pool),
@@ -634,10 +675,18 @@ async function refreshDynamicModelsIfStale(force = false) {
   if (!force && dynamicModelsCache.models && now - dynamicModelsCache.fetchedAt < DYNAMIC_MODELS_REFRESH_MS) {
     return dynamicModelsSnapshot();
   }
+  if (!force && now < dynamicModelsRetryAt) {
+    return dynamicModelsSnapshot();
+  }
   const flight = performDynamicModelsRefresh();
   dynamicModelsRefreshFlight = flight;
   try {
-    return await flight;
+    const result = await flight;
+    dynamicModelsRetryAt = result.refreshed ? 0 : Date.now() + DYNAMIC_MODELS_RETRY_MS;
+    return result;
+  } catch (error) {
+    dynamicModelsRetryAt = Date.now() + DYNAMIC_MODELS_RETRY_MS;
+    throw error;
   } finally {
     if (dynamicModelsRefreshFlight === flight) dynamicModelsRefreshFlight = null;
   }
@@ -645,6 +694,8 @@ async function refreshDynamicModelsIfStale(force = false) {
 
 // Releases JSON 兜底：直接拉预生成的 models.json，零解析成本
 async function tryReleaseFallback() {
+  // Release 的年代/控制名单不一定比当前缓存完整，只用于没有成功快照的冷启动。
+  if (Array.isArray(dynamicModelsCache.models) && dynamicModelsCache.models.length) return null;
   for (const url of DYNAMIC_MODELS_RELEASE_SOURCES) {
     try {
       const ctrl = new AbortController();
@@ -674,6 +725,7 @@ async function tryReleaseFallback() {
               // 让隐藏落静态兜底，而不是当成「官方名单是空的」。
               serviceOnly: Array.isArray(json.upstream?.serviceOnly)
                 ? new Set(json.upstream.serviceOnly) : null,
+              godOnly: Array.isArray(json.upstream?.godOnly) ? new Set(json.upstream.godOnly) : null,
             };
             return {
               fetchedAt: Date.now(),
@@ -816,6 +868,8 @@ function modelCatalogTier(modelId, pool) {
   const normalizedPool = LEGACY_POOL_ALIASES[raw] || raw;
   if (POOL_DRIVEN_TIER_MODELS.has(id) && normalizedPool === "premium") return "us_sg";
   const rank = MODEL_TIERS.findIndex(([, ids]) => ids.has(id));
+  if (rank >= 0 && MODEL_TIERS[rank][0] === "limited" && normalizedPool === "premium"
+    && id !== "z-ai/glm-5.3-flash") return "us_sg";
   return rank >= 0 ? MODEL_TIERS[rank][0] : null;
 }
 
@@ -865,8 +919,7 @@ function isPausedModelId(modelId, cache = dynamicModelsCache) {
 }
 // God-only / 服务专用模型。普通 token 一定调不通，动态源即使返回也必须 fail closed。
 // 两类来源：
-//   1) 下面这张手写表 —— 官方 FREEBUFF_WEB_GOD_ONLY_MODELS。它在官方源里是**模型对象**
-//      数组（id 由 .map(m => m.id) 派生），静态解析不出 id，只能手写。
+//   1) 官方 FREEBUFF_WEB_GOD_ONLY_MODELS，解析模型对象引用；下表仅为无资料时的兜底。
 //   2) 官方 FREEBUFF_SERVICE_ONLY_MODEL_IDS —— 动态解析，见 serviceOnlyModelIds()。
 // stealth/ox-alpha 曾在此列（当时官方 FREEBUFF_SERVICE_ONLY_MODEL_IDS 非空）；2026-08-24
 // 官方把它放进了 CLI/Desktop 目录并清空该名单（d534205ad39d），隐藏前提失效，已开放。
@@ -878,6 +931,11 @@ const HIDDEN_MODEL_IDS = new Set([
   // 旧 08-16 观测里它曾经能调通，之后被划成 god-only —— 按 fail closed 处理。
   "crof/kimi-k3-eco",
 ]);
+function godOnlyModelIds(cache = dynamicModelsCache) {
+  const dynamic = cache?.pool?.godOnly;
+  return new Set([...(dynamic && typeof dynamic[Symbol.iterator] === "function" ? dynamic : HIDDEN_MODEL_IDS)]
+    .map((id) => String(id || "").trim().toLowerCase()).filter(Boolean));
+}
 // 官方 FREEBUFF_SERVICE_ONLY_MODEL_IDS 的静态兜底：动态源拉不到 / Releases 兜底 /
 // 冷缓存时用它 fail closed。**只是兜底**——动态名单一旦读到就完全以它为准，所以
 // 官方哪天把 muse 移出该表（= 同时给 CLI/Desktop 放行，ox-alpha 2026-08-24 就是这么
@@ -903,14 +961,15 @@ function serviceOnlyModelIds(cache = dynamicModelsCache) {
 function isHiddenModelId(modelId, cache = dynamicModelsCache) {
   const value = String(modelId || "").trim().toLowerCase();
   if (!value) return false;
-  if (HIDDEN_MODEL_IDS.has(value)) return true;
+  const godOnly = godOnlyModelIds(cache);
+  if (godOnly.has(value)) return true;
   // 官方模型判定都是 suffix/前缀容错的，免得带日期的 provider 快照绕过分类。
-  if (value.startsWith("openai/gpt-5.6-luna-es")) return true;
-  if (value.startsWith("crof/kimi-k3-eco")) return true;
+  if (godOnly.has("openai/gpt-5.6-luna-es") && value.startsWith("openai/gpt-5.6-luna-es")) return true;
+  if (godOnly.has("crof/kimi-k3-eco") && value.startsWith("crof/kimi-k3-eco")) return true;
   // 服务专用名单按官方同样的规则匹配带日期的变体：官方
   // isFreebuffServiceOnlyModelId 走 freebuffModelIdMatches，注释写明
   // 「滑过这个判定的变体就是同一个模型、只是门关着」。
-  for (const base of serviceOnlyModelIds(cache)) {
+  for (const base of [...godOnly, ...serviceOnlyModelIds(cache)]) {
     if (value === base) return true;
     if (!value.startsWith(base + "-")) continue;
     if (/^\d{6,8}(?:$|[-:])/.test(value.slice(base.length + 1))) return true;
@@ -951,6 +1010,8 @@ const DESKTOP_INCLUDE_RATE_LIMITS = { "x-freebuff-include-unused-rate-limits": "
 export default {
   // 面板调用日志快照（server.js 的 GET /_api/usage 直接吐出）。
   getCallLog() { return callLogSnapshot(); },
+  // 管理面板的脱敏额度快照只供目录判断，不触发新的账号探测。
+  setAccountCatalogProbes,
   // 服务专用模型名单（官方 FREEBUFF_SERVICE_ONLY_MODEL_IDS）。账号额度快照里仍然带这些行，
   // 而面板不解析官方源码，只能由 worker 下发（server.js 的 GET /_api/config 顺路带出去）。
   serviceOnlyModels() { return [...serviceOnlyModelIds()]; },
@@ -1401,7 +1462,91 @@ function parseAccounts(env) {
 // ---------------------------------------------------------------------------
 
 const acctHealth = new Map(); // token -> { alive, state, uid, quota, checkedAt, quotaUntil }
+const catalogAccountProbes = new Map(); // Bearer token -> { state, quota, observedAt }，仅内存
+let catalogAccountSnapshotReady = false;
 const HEALTH_OBSERVATION_TTL_MS = 10 * 60 * 1000;
+
+function setAccountCatalogProbes(probes) {
+  const next = new Map();
+  for (const [token, probe] of Object.entries(probes && typeof probes === "object" ? probes : {})) {
+    if (!token || !probe || typeof probe !== "object") continue;
+    next.set(token, {
+      state: probe.state,
+      alive: probe.alive,
+      isolatedPermanent: probe.isolatedPermanent === true,
+      quota: Array.isArray(probe.quota) ? probe.quota : null,
+      observedAt: Number.isFinite(probe.observedAt) ? probe.observedAt : Date.now(),
+    });
+  }
+  catalogAccountProbes.clear();
+  for (const [token, probe] of next) catalogAccountProbes.set(token, probe);
+  catalogAccountSnapshotReady = true;
+}
+
+function currentCatalogProbes() {
+  // 管理端以 Bearer token 对齐账号；完整快照中的删除不能被旧业务缓存抵消。
+  const tokens = catalogAccountSnapshotReady ? catalogAccountProbes.keys() : acctHealth.keys();
+  const rows = [];
+  const version = (probe) => {
+    if (!probe) return -1;
+    const terminal = probe.isolatedPermanent || ["banned", "token_invalid", "manual_disabled"].includes(probe.state);
+    return terminal ? (probe.checkedAt ?? probe.observedAt ?? 0)
+      : (probe.quotaCheckedAt ?? probe.observedAt ?? 0);
+  };
+  for (const token of tokens) {
+    if (accountIsBlocked(token)) continue;
+    const admin = catalogAccountProbes.get(token);
+    const observed = acctHealth.get(token);
+    const latest = version(observed) > version(admin) ? observed : admin;
+    if (latest) rows.push(latest);
+  }
+  return rows;
+}
+
+function catalogQuotaHasRemaining(row) {
+  if (!row || typeof row !== "object") return false;
+  if (row.remaining != null && row.remaining !== "") {
+    const remaining = Number(row.remaining);
+    if (Number.isFinite(remaining)) return remaining > 0;
+  }
+  const limit = Number(row.limit);
+  const rawUsed = row.used ?? row.recentCount;
+  if (rawUsed == null || rawUsed === "") return false;
+  const used = Number(rawUsed);
+  return Number.isFinite(limit) && limit > 0 && Number.isFinite(used) && limit - used > 0;
+}
+
+function modelCatalogAccess(model, probes = catalogAccountProbes) {
+  const id = String(model?.id || "").trim();
+  const declaredPool = safePoolName(model?.pool);
+  const pool = LEGACY_POOL_ALIASES[declaredPool] || declaredPool;
+  if (!id) return { visible: false, pool };
+  const tier = modelCatalogTier(id, "") || String(model?.tier || "").toLowerCase();
+  if (tier !== "limited" || pool === "premium") return { visible: true, pool };
+  const rows = probes === catalogAccountProbes ? currentCatalogProbes()
+    : probes instanceof Map ? [...probes.values()] : Array.isArray(probes) ? probes : [];
+  for (const probe of rows) {
+    if (!probe || probe.alive === false || probe.isolatedPermanent
+      || ["banned", "token_invalid", "manual_disabled"].includes(probe.state)) continue;
+    const observedAt = probe.quotaCheckedAt ?? probe.observedAt;
+    if (Number.isFinite(observedAt) && Date.now() - observedAt > HEALTH_OBSERVATION_TTL_MS) continue;
+    const quota = Array.isArray(probe.quota) ? probe.quota
+      : Object.entries(probe.quota || {}).map(([model, entry]) => ({ ...entry, model }));
+    for (const row of quota) {
+      if (String(row?.model || "").trim().toLowerCase() !== id.toLowerCase()) continue;
+      const rawPool = safePoolName(row?.pool);
+      const rowPool = LEGACY_POOL_ALIASES[rawPool] || rawPool;
+      if (rowPool === "premium") return { visible: true, pool: rowPool };
+      const independent = rowPool && !["standard", "limited", "deepseek_pro"].includes(rowPool);
+      if (independent && catalogQuotaHasRemaining(row)) return { visible: true, pool: rowPool };
+    }
+  }
+  return { visible: false, pool };
+}
+
+function modelCatalogVisible(model, probes = catalogAccountProbes) {
+  return modelCatalogAccess(model, probes).visible;
+}
 
 // 只记录真实业务请求已经观察到的上游结果。不要在 healthz 中主动探测，
 // 也不要把网络错误/未知响应误记成账号失效。
@@ -3627,6 +3772,7 @@ async function up(method, path, token, body, extraHeaders = {}, timeoutMs = UPST
     signal: AbortSignal.timeout(timeoutMs),
   });
   const text = await resp.text();
+  if (isOverloadedFailure(resp.status, text)) throw new OverloadedUpstreamError(retryAfterDelay(resp.headers));
   let data = null;
   try { data = text ? JSON.parse(text) : null; } catch { data = text; }
   const terminalState = terminalStateFromResponse(resp.status, data ?? text);
@@ -4220,6 +4366,8 @@ function namedEffort(value) {
 //                        但那是 OpenRouter 广告的档位，实际链路只收 high
 //   - minimax-m3 / mimo / fable：无 effort 档位或不接受 effort → 不在表中，原样透传
 const MODEL_EFFORTS = {
+  // Google / OpenRouter 目录仅支持 low、medium、high；max 不再原样发出。
+  "google/gemini-3.8-flash": ["low", "medium", "high"],
   "deepseek/deepseek-v4-flash": ["low", "high", "max"],
   "deepseek/deepseek-v4-pro": ["low", "high", "max"],
   "meta/muse-spark-1.2-contributor": ["minimal", "low", "medium", "high", "xhigh"],
@@ -4671,6 +4819,13 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode, requestSig
       if (!resp.ok) {
         lastEgressUnavailable = false;
         const text = await resp.text();
+        if (isOverloadedFailure(resp.status, text)) {
+          callTotals.upstreamError++;
+          if (reviewerRunId) await finishRun(token, reviewerRunId, 1).catch(() => {});
+          if (rootRunId) await finishRun(token, rootRunId, 1).catch(() => {});
+          recordRequest(mc.id, null, false, client);
+          return overloadedErrorResponse(retryAfterDelay(resp.headers));
+        }
         recordAccountObservation(token, resp.status, text, { headers: resp.headers, model: mc.session });
         throwIfTerminalResponse(token, resp.status, text);
         if (resp.status === 401) {
@@ -4746,6 +4901,11 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode, requestSig
       return mode === "responses" ? jsonResponse(result, 200) : jsonResponse(result, 200);
     } catch (e) {
       if (requestSignal?.aborted) throw e;
+      if (e instanceof OverloadedUpstreamError) {
+        callTotals.upstreamError++;
+        recordRequest(mc.id, null, false, client);
+        return overloadedErrorResponse(e.retryAfterMs);
+      }
       if (!isExpectedFlowError(e)) console.error("[code_review]", e);
       lastErrMsg = String(e.message || e);
       if (e instanceof EgressRejectedError) {
@@ -4991,6 +5151,11 @@ async function executeChatPooled(env, chatParams, mc, isStream, mode, requestSig
           break;
         }
         errText = await resp.text();
+        if (isOverloadedFailure(resp.status, errText)) {
+          callTotals.upstreamError++;
+          recordRequest(mc.id, null, false, client);
+          return overloadedErrorResponse(retryAfterDelay(resp.headers));
+        }
         recordAccountObservation(token, resp.status, errText, { headers: resp.headers, model: mc.session });
         throwIfTerminalResponse(token, resp.status, errText);
         if (resp.status === 401) await confirmTokenInvalid(token, mc.session);
@@ -5085,6 +5250,11 @@ async function executeChatPooled(env, chatParams, mc, isStream, mode, requestSig
       return jsonResponse(agg, 200);
     } catch (e) {
       if (requestSignal?.aborted) throw e;
+      if (e instanceof OverloadedUpstreamError) {
+        callTotals.upstreamError++;
+        recordRequest(mc.id, null, false, client);
+        return overloadedErrorResponse(e.retryAfterMs);
+      }
       if (!isExpectedFlowError(e)) console.error("[" + mode + "]", e);
       const msg = String(e.message || e);
       if (e instanceof EgressRejectedError) {
@@ -5365,6 +5535,33 @@ function anthropicFromChat(oai, mc) {
     usage.input_tokens = Math.max(0, usage.input_tokens - cached);
   }
   return { id: oai?.id || ("msg_" + Math.random().toString(36).slice(2, 10)), type: "message", role: "assistant", model: mc.id, content, stop_reason: anthropicStopReason(choice.finish_reason), stop_sequence: null, usage };
+}
+
+class OverloadedUpstreamError extends Error {
+  constructor(retryAfterMs = null) {
+    super("upstream overloaded");
+    this.name = "OverloadedUpstreamError";
+    this.retryAfterMs = retryAfterMs;
+  }
+}
+
+function isOverloadedFailure(status, text) {
+  return Number(status) === 529 || (Number(status) >= 500
+    && /\b(?:529|overloaded(?:_error)?|at capacity)\b/i.test(String(text || "")));
+}
+
+function overloadedErrorResponse(retryAfterMs = null) {
+  const supplied = Number(retryAfterMs);
+  const retry = Number.isFinite(supplied) && supplied > 0 ? supplied : 30000;
+  const seconds = Math.max(1, Math.ceil(retry / 1000));
+  const headers = { "Retry-After": String(seconds) };
+  return jsonResponse({
+    error: {
+      message: `上游（Freebuff）模型服务当前过载，暂时无法处理请求，请约 ${seconds} 秒后重试`,
+      type: "overloaded_error",
+      retryAfterMs: retry,
+    },
+  }, 503, headers);
 }
 
 function anthropicError(message, type, status, retryAfter) {
@@ -6051,16 +6248,23 @@ async function handleModels(client = null, { forceRefresh = false } = {}) {
   // 模型目录，否则客户端会先选中再收到上游 409。
   const snapshotCache = refreshResult.cache;
   const snapshotAvailability = refreshResult.availability;
+  const restrictedIds = new Set(MODEL_TIERS.find(([tier]) => tier === "limited")?.[1] || []);
+  for (const model of modelList) if (model.tier === "limited") restrictedIds.add(model.id);
+  const hiddenModels = [...restrictedIds].filter((id) => {
+    const model = modelList.find((m) => m.id === id);
+    return !model || !modelCatalogVisible(model);
+  });
   modelList = modelList.filter((m) =>
     !isPausedModelId(m.id, snapshotCache)
       && !isHiddenModelId(m.id, snapshotCache)
+      && modelCatalogVisible(m, catalogAccountProbes)
       && modelIsAvailable(m.id, snapshotAvailability));
   const data = modelList
     .map((m) => {
       // 实测（2026-08-15）：免费账号只有 Flash / MiMo 2.5 两个模型能建会话
       // （上游 409 session_model_mismatch / 403 free_mode_invalid_agent_model 拒绝其余模型）。
       // 分组键与排序都取自 MODEL_TIERS：免费 → US/SG → 限定 → 未分组。
-      const declaredPool = safePoolName(m.pool);
+      const declaredPool = modelCatalogAccess(m).pool;
       const pool = declaredPool || modelPoolCategory(m.id, null, snapshotCache) || "";
       const sharedPool = safePoolName(m.sharedPool);
       const tier = modelCatalogTier(m.id, pool);
@@ -6101,13 +6305,22 @@ async function handleModels(client = null, { forceRefresh = false } = {}) {
   return jsonResponse({
     object: "list",
     data,
+    hidden_models: hiddenModels,
+    serviceOnlyModels: [...serviceOnlyModelIds(snapshotCache)],
+    pausedModels: [...pausedModelIds(snapshotCache)],
+    godOnlyModels: [...godOnlyModelIds(snapshotCache)],
+    catalog: {
+      revision: (catalogResponseRevision = Math.max(Date.now(), catalogResponseRevision + 1)),
+      updatedAt: snapshotCache.fetchedAt || null,
+      stale: !snapshotCache.fetchedAt || Date.now() - snapshotCache.fetchedAt >= DYNAMIC_MODELS_REFRESH_MS,
+    },
     ...(forceRefresh ? {
       refresh: {
         updated: refreshResult?.refreshed === true,
         source: refreshResult?.source || "cache",
       },
     } : {}),
-  }, 200, { "X-Freebuff2api-Version": VERSION });
+  }, 200, { "X-Freebuff2api-Version": VERSION, "Cache-Control": "no-store" });
 }
 
 // 请求带的 key。Bearer 优先，其次 x-api-key。

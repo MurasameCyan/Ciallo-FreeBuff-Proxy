@@ -1401,7 +1401,7 @@ async function handleWebApi(req, res, url) {
         }
         const terminalProbe = terminalAccountProbe(acct);
         if (terminalProbe) {
-          return { key: acct.key, egress: accountEgressStatus(acct), probe: terminalProbe };
+          return { key: acct.key, egress: accountEgressStatus(acct), probe: { ...terminalProbe, observedAt: Date.now() } };
         }
         const upstreamFetch = accountEgressFetch(acct);
         const accountEgress = accountEgressStatus(acct);
@@ -1410,19 +1410,29 @@ async function handleWebApi(req, res, url) {
             upstreamFetch,
             queueKey: acct.key,
           });
-          return { key: acct.key, egress: accountEgress, probe };
+          return { key: acct.key, egress: accountEgress, probe: { ...probe, observedAt: Date.now() } };
         } catch (error) {
           if (error?.code !== 'ACCOUNT_EGRESS_UNAVAILABLE') throw error;
           return {
             key: acct.key,
             egress: accountEgress,
-            probe: { state: 'egress_unavailable', label: '出站节点尚未就绪' },
+            probe: { state: 'egress_unavailable', label: '出站节点尚未就绪', observedAt: Date.now() },
           };
         }
       }));
       for (const result of results) {
         egress[result.key] = result.egress;
         if (result.probe) health[result.key] = result.probe;
+      }
+      if (typeof handler.setAccountCatalogProbes === 'function') {
+        const probes = Object.fromEntries(accounts.filter((account) => account.hasToken)
+          .map((account) => [normalizeAccountToken(account.token), health[account.key] || { observedAt: 0 }]));
+        // env 账号仍属当前池；没有管理探测时允许使用它自己的业务观测。
+        for (const raw of (env.FREEBUFF_TOKEN || '').split(/[\n,]/)) {
+          const token = normalizeAccountToken(raw);
+          if (token && !Object.hasOwn(probes, token)) probes[token] = { observedAt: 0 };
+        }
+        handler.setAccountCatalogProbes(probes);
       }
       return json(res, 200, { accounts: accounts.map(publicAccountDto), health, egress, readonly: CFG.readonlyAccounts });
     }

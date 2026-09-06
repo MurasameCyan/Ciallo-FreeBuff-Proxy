@@ -431,11 +431,11 @@ assert.match(html,
 assert.match(html, /id="modelRefresh"[\s\S]*?refresh/s,
   '模型列表刷新按钮必须使用刷新图标');
 assert.match(app,
-  /modelRefresh[\s\S]*?rawApi\('\/v1\/models\?refresh=1'/s,
+  /modelRefresh[\s\S]*?loadModelCatalog\(true\)/s,
   '模型列表刷新按钮必须请求无 session 的强制模型目录接口');
 const modelRefreshStart = app.indexOf("$('modelRefresh')", app.indexOf('function wire()'));
 const modelRefreshFlow = app.slice(modelRefreshStart, app.indexOf("$('maskEmail')", modelRefreshStart));
-assert.ok(modelRefreshFlow.includes('S.models = models.data || []'),
+assert.ok(modelRefreshFlow.includes('loadModelCatalog(true)'),
   '模型列表刷新成功后必须更新前端模型状态');
 assert.ok(modelRefreshFlow.includes('renderModels()') && modelRefreshFlow.includes('renderKeys()'),
   '模型列表刷新成功后必须同步模型目录和 Key 模型选择');
@@ -502,8 +502,8 @@ assert.match(app, /function renderModels\(\)[\s\S]*?modelDisplay\(/s,
   '模型列表必须使用统一标签展示');
 assert.match(app, /function renderModels\(\)[\s\S]*?li\.textContent = name/s,
   '模型列表条目必须只显示模型名（去掉 provider 前缀）');
-assert.match(app, /fillKeyModelButtons[\s\S]*?title="\$\{esc\(id\)\}">\$\{esc\(name\)\}/s,
-  'Key 模型按钮必须只显示模型名，完整 id 留在 title');
+assert.match(app, /fillKeyModelButtons[\s\S]*?title="\$\{esc\(modelTooltip\(id\)\)\}">\$\{esc\(name\)\}/s,
+  'Key 模型按钮只显示模型名，完整 id 和能力信息留在 title');
 assert.doesNotMatch(app, /PAUSED_MODEL_IDS[\s\S]*?fillKeyModelButtons[\s\S]*?disabled aria-disabled="true"/s,
   '停用模型不再进 Key 按钮列表，禁用态渲染必须一起删掉');
 assert.match(app, /function catalogModelIds\(\)[\s\S]*?!isPausedModelId\(id\) && !isHiddenModelId\(id\)/s,
@@ -535,10 +535,20 @@ assert.doesNotMatch(app, /function perModelCapLimit[\s\S]*?limit\s*-\s*(?:used|r
 const helperSource = `const S = { models: [], health: {} };\nconst esc = (value) => String(value);\n${app.match(/const MODEL_TIER_LABELS = \{[^\n]+/)[0]}\n`
   + `${app.slice(app.indexOf('const MODEL_DISPLAY ='), app.indexOf('function poolResetAt'))}\n`
   + 'globalThis.__modelState = S;\n'
-  + 'globalThis.__modelUi = { accountQuotaSummary, modelName, modelDisplay, modelListHtml, perModelCapLimit, modelsCellHtml, setServiceOnlyModels, isHiddenModelId, setPausedModels, isPausedModelId };';
+  + 'globalThis.__modelUi = { accountQuotaSummary, modelName, modelDisplay, modelListHtml, perModelCapLimit, modelsCellHtml, setServiceOnlyModels, setCatalogHiddenModels, isHiddenModelId, setPausedModels, isPausedModelId };';
 const helperVm = { globalThis: null };
 helperVm.globalThis = helperVm;
 vm.runInNewContext(helperSource, helperVm);
+helperVm.__modelUi.setCatalogHiddenModels(['anthropic/claude-fable-5']);
+assert.equal(helperVm.__modelUi.modelListHtml(['anthropic/claude-fable-5']), '',
+  '无可用访问池的限定模型不能出现在账号模型或 Key 标签中');
+assert.equal(helperVm.__modelUi.isHiddenModelId('anthropic/claude-fable-5-20260906'), true,
+  '受限模型日期变体须遵守同一隐藏规则');
+helperVm.__modelUi.setCatalogHiddenModels([]);
+assert.equal(helperVm.__modelUi.modelDisplay('anthropic/claude-fable-5', { pool: 'premium' }).tier, '高级',
+  '限定模型进入 Premium 后必须恢复并显示高级标签');
+assert.equal(helperVm.__modelUi.isHiddenModelId('crof/kimi-k3-eco'), true,
+  '恢复访问池不能放出 god-only 模型');
 assert.deepEqual(
   JSON.parse(JSON.stringify(helperVm.__modelUi.accountQuotaSummary({ quota: [
     { model: 'z-ai/glm-5.3-flash', used: 0, limit: 2, pool: 'glm_v53_flash' },
@@ -927,7 +937,7 @@ assert.equal(
     ['openai/gpt-5.6-luna'],
     [{ id: 'openai/gpt-5.6-luna', pool: 'luna' }],
   ),
-  '<span class="model-label" title="openai/gpt-5.6-luna">gpt-5.6-luna'
+  '<span class="model-label" title="openai/gpt-5.6-luna\n思考等级：high（当前网关固定）\n上下文：1,050,000 tokens（模型目录）">gpt-5.6-luna'
   + ' <span class="pill tier tier-premium">高级</span></span>',
   '旧 Luna pool 必须显示模型名 + 高级 tag',
 );
