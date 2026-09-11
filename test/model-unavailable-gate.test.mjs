@@ -178,6 +178,89 @@ test('POST /session 回 model_unavailable：带上 availableHours 告诉客户�
   }
 });
 
+test('POST /session 回 updateRequired：明确要求更新，不误报模型下线', async () => {
+  const start = Date.UTC(2030, 0, 1);
+  const tokens = ['gate-update-token-aaaaaaaaaaaaaa', 'gate-update-token-bbbbbbbbbbbbbb'];
+  const log = [];
+  const upstream = createFakeUpstream({
+    start, log,
+    sessionResponder: ({ model }) => upstreamResponse(409, {
+      status: 'model_unavailable', accessTier: 'full', requestedModel: model,
+      availableHours: 'Update Freebuff Desktop to resume your purchased hour.',
+      updateRequired: true,
+    }),
+    chatResponder: () => sseResponse(),
+  });
+  const workerVm = createWorkerVm({ now: start, fetchImpl: upstream.fetch });
+
+  const response = await workerVm.api.executeChat(
+    envFor(tokens), chatParams(GATED), modelCfg(GATED, 'base2-free-deepseek'), true, 'chat',
+  );
+  const body = await response.json();
+
+  assert.equal(response.status, 503);
+  assert.equal(body.error.updateRequired, true);
+  assert.equal(body.error.availableHours, 'Update Freebuff Desktop to resume your purchased hour.');
+  assert.match(body.error.message, /更新 Freebuff 客户端/);
+  assert.doesNotMatch(body.error.message, /模型.*不提供|请改用其他模型/);
+  assert.equal(log.filter((e) => e.path === '/api/v1/freebuff/session' && e.method === 'POST').length, 1);
+});
+
+test('POST /session 回 purchasesPaused：明确购买会话暂停，不误报模型下线', async () => {
+  const start = Date.UTC(2030, 0, 1);
+  const tokens = ['gate-pause-token-aaaaaaaaaaaaaaa', 'gate-pause-token-bbbbbbbbbbbbbbb'];
+  const log = [];
+  const upstream = createFakeUpstream({
+    start, log,
+    sessionResponder: ({ model }) => upstreamResponse(409, {
+      status: 'model_unavailable', accessTier: 'full', requestedModel: model,
+      availableHours: 'Purchased Desktop sessions are temporarily unavailable.',
+      purchasesPaused: true,
+    }),
+    chatResponder: () => sseResponse(),
+  });
+  const workerVm = createWorkerVm({ now: start, fetchImpl: upstream.fetch });
+
+  const response = await workerVm.api.executeChat(
+    envFor(tokens), chatParams(GATED), modelCfg(GATED, 'base2-free-deepseek'), true, 'chat',
+  );
+  const body = await response.json();
+
+  assert.equal(response.status, 503);
+  assert.equal(body.error.purchasesPaused, true);
+  assert.equal(body.error.availableHours, 'Purchased Desktop sessions are temporarily unavailable.');
+  assert.match(body.error.message, /购买会话.*暂停|暂停.*购买会话/);
+  assert.doesNotMatch(body.error.message, /模型.*不提供|请改用其他模型/);
+  assert.equal(log.filter((e) => e.path === '/api/v1/freebuff/session' && e.method === 'POST').length, 1);
+});
+
+test('POST /session 同时回两种拒绝：购买暂停优先，不能承诺更新即可恢复', async () => {
+  const start = Date.UTC(2030, 0, 1);
+  const tokens = ['gate-both-token-aaaaaaaaaaaaaaaa'];
+  const log = [];
+  const upstream = createFakeUpstream({
+    start, log,
+    sessionResponder: ({ model }) => upstreamResponse(409, {
+      status: 'model_unavailable', accessTier: 'full', requestedModel: model,
+      availableHours: 'Purchased Desktop sessions are temporarily unavailable.',
+      updateRequired: true,
+      purchasesPaused: true,
+    }),
+    chatResponder: () => sseResponse(),
+  });
+  const workerVm = createWorkerVm({ now: start, fetchImpl: upstream.fetch });
+
+  const response = await workerVm.api.executeChat(
+    envFor(tokens), chatParams(GATED), modelCfg(GATED, 'base2-free-deepseek'), true, 'chat',
+  );
+  const body = await response.json();
+
+  assert.equal(body.error.updateRequired, true);
+  assert.equal(body.error.purchasesPaused, true);
+  assert.match(body.error.message, /购买会话.*暂停|暂停.*购买会话/);
+  assert.doesNotMatch(body.error.message, /更新.*后才能恢复/);
+});
+
 // 回归锁：410 上还有 session_expired，它 endsTheSession:true，必须继续走
 // 「删会话 → 重建 → 重试」。判定必须 code + status 同时匹配，不能把所有 410 都当成
 // model_unavailable（那会让过期会话再也恢复不了）。

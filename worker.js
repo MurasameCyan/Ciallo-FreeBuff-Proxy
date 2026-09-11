@@ -3358,22 +3358,22 @@ function isModelLockedResponse(resp) {
   return String(resp?.data?.status || "") === "model_locked";
 }
 
-// 上游 `model_unavailable`：模型本身当前不可选（已从 free mode 撤下，或只在
-// 某些时段开放，联合体里带 `availableHours`）。这是**全局**结果，和账号无关。
+// 上游 `model_unavailable` 有三种语义：模型本身当前不可选（可能带开放时段）、
+// Desktop 客户端太旧而不能恢复已购买时段（updateRequired），或服务端暂停签发
+// 购买会话（purchasesPaused）。三者都不是账号故障，不能冷却、换号、删会话或重建。
 //
-// ⚠️ 官方 FREEBUFF_GATE_CODES 把它定成 `{status: 410, endsTheSession: false}`，
-// 注释写明为什么不能置 true：已发布客户端的编译期目录里还留着被下线的 id，
-// 客户端下次发送还会再问一次；置 true 会让每次重发都变成一次新 admission ——
-// 正是 #1801 里让 limited tier admissions 涨 2.5 倍、91% 会话卡在 0.1 unit
-// 下限的那个循环。所以拿到它绝不能删会话/重建会话，也绝不能冷却账号或换号
-// （换号只是把同一个全局结果再要一遍），只能立刻把原因回给客户端。
+// ⚠️ 官方 FREEBUFF_GATE_CODES 把它定成 `{status: 410, endsTheSession: false}`。
+// 已发布客户端的编译期目录可能还留着被下线的 id；若结束会话，重发就会再次扣
+// admission，重现 #1801 的循环。购买会话两种拒绝原因同样必须直接回客户端。
 class ModelUnavailableError extends Error {
-  constructor(requestedModel, availableHours, detail) {
+  constructor(requestedModel, availableHours, detail, options = {}) {
     super(`model_unavailable: ${requestedModel || "model"} is not selectable right now`);
     this.name = "ModelUnavailableError";
     this.requestedModel = requestedModel || null;
     this.availableHours = availableHours || null;
     this.detail = detail || "";
+    this.updateRequired = options.updateRequired === true;
+    this.purchasesPaused = options.purchasesPaused === true;
   }
 }
 
@@ -3381,7 +3381,10 @@ class ModelUnavailableError extends Error {
 function throwIfModelUnavailableResponse(resp, sessionModel) {
   const data = resp?.data;
   if (String(data?.status || "") !== "model_unavailable") return;
-  throw new ModelUnavailableError(data.requestedModel || sessionModel, data.availableHours);
+  throw new ModelUnavailableError(data.requestedModel || sessionModel, data.availableHours, data.message, {
+    updateRequired: data.updateRequired,
+    purchasesPaused: data.purchasesPaused,
+  });
 }
 
 // chat gate 形态：必须 code + HTTP status **同时**匹配（官方注释：410 本身也是
@@ -3408,14 +3411,24 @@ function isFreeModeGate(status, body) {
 
 function modelUnavailableResponse(error) {
   const model = error?.requestedModel ? String(error.requestedModel) : "该模型";
-  const hours = error?.availableHours ? `，开放时段：${error.availableHours}` : "";
+  const hours = error?.availableHours ? `，上游说明：${error.availableHours}` : "";
+  let message;
+  if (error?.purchasesPaused) {
+    message = `上游当前暂停签发 ${model} 的购买会话${hours}，请稍后重试。`;
+  } else if (error?.updateRequired) {
+    message = `需要更新 Freebuff 客户端后才能恢复 ${model} 的已购买时段${hours}。`;
+  } else {
+    message = `上游当前不提供 ${model}（model_unavailable）${hours}。`
+      + `这是上游的全局状态，换账号也一样，请改用其他模型。`;
+  }
   return jsonResponse({
     error: {
-      message: `上游当前不提供 ${model}（model_unavailable）${hours}。`
-        + `这是上游的全局状态，换账号也一样，请改用其他模型。`,
+      message,
       type: "model_unavailable",
       requestedModel: error?.requestedModel || null,
       ...(error?.availableHours ? { availableHours: error.availableHours } : {}),
+      ...(error?.updateRequired ? { updateRequired: true } : {}),
+      ...(error?.purchasesPaused ? { purchasesPaused: true } : {}),
     },
   }, 503);
 }
@@ -4359,16 +4372,16 @@ function namedEffort(value) {
   return REASONING_EFFORT_RANK.includes(s) ? s : null;
 }
 
-// 官方 per-model efforts（2026-08-13 源码 freebuff-models.ts，同步 DEEPSEEK_V4_REASONING_EFFORTS）：
-//   - deepseek-v4-flash / deepseek-v4-pro: [low, high, max]（GA 后两模型同表，无 medium）
-//   - meta/muse-spark:   EFFORTS_THROUGH_XHIGH（minimal..xhigh，ALWAYS reasons，none=400）
-//   - gpt-5.6-luna:      见 MODEL_PINNED_EFFORT —— 目录里写的是 EFFORTS_THROUGH_MAX，
-//                        但那是 OpenRouter 广告的档位，实际链路只收 high
+// 官方 per-model efforts：
+//   - deepseek-v4-flash：2026-09-10 起为 V4.1 Flash，接受 none..max 全档
+//   - deepseek-v4-pro：仍为 [low, high, max]
+//   - meta/muse-spark：EFFORTS_THROUGH_XHIGH（minimal..xhigh，ALWAYS reasons，none=400）
+//   - gpt-5.6-luna：见 MODEL_PINNED_EFFORT，实际链路只收 high
 //   - minimax-m3 / mimo / fable：无 effort 档位或不接受 effort → 不在表中，原样透传
 const MODEL_EFFORTS = {
   // Google / OpenRouter 目录仅支持 low、medium、high；max 不再原样发出。
   "google/gemini-3.8-flash": ["low", "medium", "high"],
-  "deepseek/deepseek-v4-flash": ["low", "high", "max"],
+  "deepseek/deepseek-v4-flash": ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
   "deepseek/deepseek-v4-pro": ["low", "high", "max"],
   "meta/muse-spark-1.2-contributor": ["minimal", "low", "medium", "high", "xhigh"],
   // 官方目录给 glm-5.3-flash 不带 reasoningEffort 字段（= 不在 effort 表里），

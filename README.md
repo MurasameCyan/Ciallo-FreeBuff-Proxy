@@ -122,7 +122,7 @@ Freebuff 把免费账号分成两个**访问层**（`accessTier`）：出口 IP 
 
 | 模型 ID | 官方名 | 需要 US 出口 | 思考强度档位 | 实测状态 |
 |---|---|---|---|---|
-| `deepseek/deepseek-v4-flash` | DeepSeek V4 Flash 07/31 | **否** | `low` `high` `max` | ✅ 可用（limited 层默认模型） |
+| `deepseek/deepseek-v4-flash` | DeepSeek V4.1 Flash | **否** | `none` `minimal` `low` `medium` `high` `xhigh` `max` | ✅ 可用（limited 层默认模型，原生图片输入） |
 | `mimo/mimo-v2.5` | MiMo 2.5 | **否** | 无档位（仅思考开/关） | ✅ 可用 |
 | `z-ai/glm-5.2` | GLM 5.2 | 否，但要邀请解锁 | 路由忽略 `reasoning_effort` | ⚠️ 额度 `0/0`，未解锁 |
 | `minimax/minimax-m3` | MiniMax M3 | **是** | 无档位（adaptive / 关） | ⏸️ 官方已暂停（2026-08-20），代理不再暴露或调用 |

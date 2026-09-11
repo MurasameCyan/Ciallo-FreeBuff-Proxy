@@ -535,7 +535,7 @@ assert.doesNotMatch(app, /function perModelCapLimit[\s\S]*?limit\s*-\s*(?:used|r
 const helperSource = `const S = { models: [], health: {} };\nconst esc = (value) => String(value);\n${app.match(/const MODEL_TIER_LABELS = \{[^\n]+/)[0]}\n`
   + `${app.slice(app.indexOf('const MODEL_DISPLAY ='), app.indexOf('function poolResetAt'))}\n`
   + 'globalThis.__modelState = S;\n'
-  + 'globalThis.__modelUi = { accountQuotaSummary, modelName, modelDisplay, modelListHtml, perModelCapLimit, modelsCellHtml, setServiceOnlyModels, setCatalogHiddenModels, isHiddenModelId, setPausedModels, isPausedModelId };';
+  + 'globalThis.__modelUi = { accountQuotaSummary, modelName, modelTooltip, modelDisplay, modelListHtml, perModelCapLimit, modelsCellHtml, setServiceOnlyModels, setCatalogHiddenModels, isHiddenModelId, setPausedModels, isPausedModelId };';
 const helperVm = { globalThis: null };
 helperVm.globalThis = helperVm;
 vm.runInNewContext(helperSource, helperVm);
@@ -855,6 +855,11 @@ assert.deepEqual(
   JSON.parse(JSON.stringify(helperVm.__modelUi.modelDisplay('deepseek/deepseek-v4-flash'))),
   { id: 'deepseek/deepseek-v4-flash', name: 'deepseek-v4-flash', tierKey: 'free', tier: '免费' },
   'DS4F 必须去掉 provider 前缀，只保留模型名 + 免费标签',
+);
+assert.match(
+  helperVm.__modelUi.modelTooltip('deepseek/deepseek-v4-flash'),
+  /思考等级：none \/ minimal \/ low \/ medium \/ high \/ xhigh \/ max[\s\S]*输入：文本 \/ 图片/,
+  'DeepSeek V4.1 Flash 悬停信息必须公开完整思考档位和原生图片输入能力',
 );
 assert.deepEqual(
   JSON.parse(JSON.stringify(helperVm.__modelUi.modelDisplay('anthropic/claude-fable-5', { pool: 'standard' }))),

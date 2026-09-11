@@ -472,14 +472,13 @@ function modelName(id) {
   return value.slice(value.lastIndexOf('/') + 1);
 }
 
-// 2026-09-06 公开目录快照：OpenRouter /api/v1/models 的 context_length 与
-// reasoning.supported_efforts。MiMo 在该目录的 ID 为 xiaomi/mimo-v2.5。
-// DeepSeek 采用 Freebuff 自身的 low/high/max 档位；Luna 与 worker.js 的
+// 2026-09-10 官方目录快照。DeepSeek 的同一 wire id 已切至 V4.1 Flash：原生
+// 图片输入，并接受 none/minimal/low/medium/high/xhigh/max。Luna 与 worker.js 的
 // MODEL_PINNED_EFFORT 对齐，只显示实际固定的 high。未对受限模型发起探测。
 // 这是模型容量，不是账号额度或客户端压缩阈值。新增型号缺资料时显示未收录。
 const MODEL_CAPABILITIES = {
   'mimo/mimo-v2.5': { contextWindow: 1050000, efforts: [] },
-  'deepseek/deepseek-v4-flash': { contextWindow: 1048576, efforts: ['low', 'high', 'max'] },
+  'deepseek/deepseek-v4-flash': { contextWindow: 1048576, efforts: ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'], inputs: ['文本', '图片'] },
   'meta/muse-spark-1.2-contributor': { contextWindow: 1048576, efforts: ['minimal', 'low', 'medium', 'high', 'xhigh'] },
   'meta/muse-spark-1.3-contributor': { contextWindow: 1048576, efforts: ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'] },
   'z-ai/glm-5.3-flash': { contextWindow: 1310720, efforts: ['low', 'high', 'max'] },
@@ -498,7 +497,8 @@ function modelTooltip(id) {
   const context = info?.contextWindow
     ? `${info.contextWindow.toLocaleString('en-US')} tokens（模型目录）`
     : '未收录';
-  return `${id}\n思考等级：${efforts}${note}\n上下文：${context}`;
+  const inputs = info?.inputs?.length ? `\n输入：${info.inputs.join(' / ')}` : '';
+  return `${id}\n思考等级：${efforts}${note}${inputs}\n上下文：${context}`;
 }
 
 // 访问层固定的 tag：不跟随 pool 声明。GLM 5.3 Flash 的独立额度池是它的访问层特征，

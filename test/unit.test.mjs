@@ -137,15 +137,18 @@ t('no thinking → undefined', () => {
 });
 
 console.log('--- normalizeReasoningEffort (per-model clamp) ---');
-// 官方 efforts 表：deepseek-v4-* = [low, high, max]；gpt-5.6-luna 由服务端钉死 high
+// DeepSeek V4.1 Flash 接受 none..max；V4 Pro 仍是 low/high/max；Luna 由服务端钉死 high
 t('max 在 deepseek-v4-pro 上原样保留', () => {
   if (normalizeReasoningEffort('deepseek/deepseek-v4-pro', 'max') !== 'max') throw new Error('nope');
 });
 t('xhigh 在 deepseek-v4-pro 上被下取成 high（所以 max 绝不能先折成 xhigh）', () => {
   if (normalizeReasoningEffort('deepseek/deepseek-v4-pro', 'xhigh') !== 'high') throw new Error('nope');
 });
-t('medium 在 deepseek-v4-flash 上被下取成 low（该模型无 medium 档）', () => {
-  if (normalizeReasoningEffort('deepseek/deepseek-v4-flash', 'medium') !== 'low') throw new Error('nope');
+t('DeepSeek V4.1 Flash 收下 none..max 全档，不再把 medium 降成 low', () => {
+  for (const effort of ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']) {
+    const got = normalizeReasoningEffort('deepseek/deepseek-v4-flash', effort);
+    if (got !== effort) throw new Error(`${effort} → ${got}`);
+  }
 });
 // luna：上游注入 reasoning.effort=high，任何不等于 high 的 reasoning_effort 都会 400
 // （"both provided with conflicting values"），所以是钉死不是 clamp —— 低档也要抬回 high。
@@ -187,7 +190,7 @@ t('glm-5.3-flash 把 none 兜到最低档 minimal（上游强制思考）', () =
 t('muse-spark 的 none 同样兜到 minimal（ALWAYS reasons）', () => {
   if (normalizeReasoningEffort('meta/muse-spark-1.2-contributor', 'none') !== 'minimal') throw new Error('nope');
 });
-t('deepseek-v4-* 的 none 兜到该模型最低档 low（无 minimal 档）', () => {
+t('DeepSeek V4 Pro 的 none 兜到最低档 low（无 minimal 档）', () => {
   if (normalizeReasoningEffort('deepseek/deepseek-v4-pro', 'none') !== 'low') throw new Error('nope');
 });
 t('未列 efforts 表的模型不替上游猜 none 的语义', () => {
