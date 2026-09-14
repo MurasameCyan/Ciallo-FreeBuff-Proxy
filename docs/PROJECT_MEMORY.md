@@ -1,6 +1,6 @@
 # 项目记忆：Freebuff 上游账号安全参考
 
-最后复查：2026-08-18
+最后复查：2026-09-14（上游契约漂移实测，见「待跟进的上游变化」一节）
 
 这份文件记录可持续复查的上游来源和本项目实际采用的行为。它不是把上游代码当作依赖；
 修改前先确认当前协议、许可证和测试仍然适用。
@@ -47,6 +47,70 @@
 - uTLS/JA3、浏览器头伪装、按账号换 IP 可能改变风控信号，且不适合本项目 Node 架构；明确不采用。
 - 上游模型表和协议会变化，旧仓库的固定 agent、旧模型 ID、Cloudflare/TLS 推断不能直接当作当前事实。
 - 本项目持久化是单进程 JSON 文件，不是多实例共享数据库；`.tmp`/`.bak` 只提供进程崩溃后的恢复，不解决多实例并发写入；横向扩展前必须先设计锁和一致性。
+
+## 待跟进的上游变化（2026-09-14 容器内实测）
+
+这一节记录**已经证实、但本次未落代码**的上游变化。每条都带实测证据和「为什么先不动」，
+下次复查时按此表决定是否实现，不要重新摸一遍。
+
+### G. 周 / 月窗口已经在计量（display-only，尚未执法）
+
+`GET /api/v1/freebuff/session` 的 `freeWindows` 字段（`FreebuffFreeWindowsInfo`）在线上已经返回：
+
+| 字段 | 6 个账号实测值 |
+|---|---|
+| `dayUsed` / `dayLimit` | `0 / 5` |
+| `weekUsed` / `weekLimit` | `2 ~ 3.4 / 14`（滚动 7 天，非固定重置） |
+| `monthUsed` / `monthLimit` | `2.1 ~ 6 / 40`（太平洋日历月） |
+| `dayResetAt` / `monthResetAt` | ISO 时刻，月边界为 `2026-10-01T07:00:00Z` |
+
+上游类型注释明确写了 **DISPLAY-ONLY**：「nothing refuses on the week or month yet
+(operator decision — enforcement is a later change), so `weekUsed` can legitimately exceed
+`weekLimit` until it lands」。所以 `weekUsed > weekLimit` 目前是合法状态，不能当耗尽判据。
+
+为什么先不动：现在没有任何拒绝挂在这两个窗口上，实现执法逻辑等于凭空给自己加限制。
+但**计数已经在跑**，意味着上游随时可以打开开关。
+
+跟进触发条件（任一出现即需实现）：
+- 出现挂在周/月窗口上的 429 / `rate_limited`（`resetAt` 指向周或月边界而不是次日 15:00 北京时间）；
+- 上游把该字段的 DISPLAY-ONLY 注释删掉；
+- 实测 `weekUsed` 达到 `weekLimit` 后仍能正常 `POST /session`（说明还没执法）或开始被拒（说明已执法）。
+
+实现时的口径：日额度用 `dayUsed/dayLimit`（现有逻辑），周/月只做**展示与调度排序参考**，
+在确认执法前不得据此写冷却 —— 否则会重演「limit=0 被判耗尽」那类自伤（见下）。
+
+### A. freebucks 钱包才是当前真实计费口径（未接入调度）
+
+实测：每日 100 freebucks，价目 `glm-5.3-flash=5`、`mimo=10`、`ds4f=15`、`luna=20`、
+`gemini-3.8-flash=50`。买 glm-5.3 → `daily.spent 0→5`；买 luna → `5→25`。
+即 100/天 ≈ **5 次 luna 或 20 次 glm-5.3**。worker.js 对 freebucks 的引用数为 0。
+
+为什么先不动：接入调度要设计「按 `balance/price` 估算这个号还能开几次」并接进选号排序，
+是独立的一块设计，不是补一个判断。当前按场次调度不会算错方向，只是不够准。
+
+### C. 提前 DELETE 只退场次，不退 freebucks
+
+实测：`DELETE /api/v1/freebuff/session` → `{status:"ended", freebucksRefundPending:true}`。
+15 秒后复查：场次退了（`dayUsed 1/5 → 0.1/5`，按实际占用时长重新 stamp），
+但 `freebucks.spent` 仍是 25，**没有退**。两套计量、只有一套退款。
+
+含义：早退能回收场次窗口（值得做），但不能回收钱包余额。`freebucksRefundPending` 这个 flag
+在观测窗口内没有落账，不要据它假设余额会回来。
+
+### D. `/session/admission` 与 `/session/reuse` 路由存在，但 operation 判别式未摸出
+
+- `OPTIONS` 两条路由都回 `allow: OPTIONS, POST`（不是 404，路由真实存在）；
+- 16 个 `operation` 候选值 + 5 种字段名（`action`/`type`/`op`/`mode`/`intent`）全部 `400 {"error":"invalid_admission_operation"}`；
+- 而 `POST /session/reuse` + `x-freebuff-reuse-instance-id` 头 → **200**，且 `spent` 不变（复用不扣费）。
+
+结论：判别式在**头**上而不是 body 字段里，`admission` 那条的具体 operation 值本次没试出来。
+要继续就从头部组合入手，别再穷举 body。
+
+### E. `x-freebuff-wallet-spend-limit: 0` 不是 fail-closed 护栏
+
+实测：带 `x-freebuff-wallet-spend-limit: 0` 发 `POST /session` 仍然 200 active，
+并照扣 luna 的 20 freebucks。**不要把这个头当成「防止意外购买」的本地护栏** ——
+上游注释说它只在请求以 Freebuff Web 服务账号身份认证时才被采信，普通调用方设了无效。
 
 ## 定期复查清单
 

@@ -673,9 +673,14 @@ function accountQuotaSummary(probe) {
   return { text: `( ${parts.join(' ')} )`, title: `额度 ${details.join(' · ')}` };
 }
 
-// 独立 cap。官方 FREEBUFF_PER_MODEL_SESSION_CAPS 给某些模型加了一层
-// 「共享池之外的每日上限」（当前只有 GLM 5.3 Flash，2 次/日），worker 把它
-// 解析好后经 /v1/models 的 perModelCap 下发。
+// 独立 cap。历史上官方 FREEBUFF_PER_MODEL_SESSION_CAPS 给某些模型加过一层
+// 「共享池之外的每日上限」（GLM 5.3 Flash 曾是 2 次/日），worker 解析后经
+// /v1/models 的 perModelCap 下发。
+//
+// ⚠️ 2026-09 上游删掉了这张表，换成按美元计的 FREEBUFF_PER_MODEL_SESSION_SPEND_CAPS
+// （目前只有 gemini-3.8-flash 一条 $0.50，不是次数）。所以现在活着的目录源解析不出
+// 任何 perModelCap，这个函数对线上数据恒返回 0 —— 保留它是因为 Release JSON 兜底
+// 和历史快照里仍带旧字段，删掉会让那些快照的模型行凭空少一行。
 //
 // 只返回上限数字，不渲染任何文字：账号名后的额度徽标已经把数字给过了，模型行
 // 再挂一个「上限 N/日」是同一件事说两遍。cap 在面板里的唯一用处是让

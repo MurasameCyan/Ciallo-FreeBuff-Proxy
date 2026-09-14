@@ -851,7 +851,7 @@ await tAsync('模型目录携带官方动态 pool 元数据', async () => {
   const body = await (await handleModels()).json();
   const glm = body.data.find((model) => model.id === 'z-ai/glm-5.3-flash');
   if (!glm || glm.pool !== 'glm_v53_flash' || glm.sharedPool !== 'premium'
-    || glm.perModelCap?.limit !== 2 || glm.tier !== 'limited') {
+    || glm.perModelCap?.limit !== 2 || glm.tier !== 'free') {
     throw new Error('GLM 5.3 独立 cap 池分组错误: ' + JSON.stringify(glm));
   }
   const luna = body.data.find((entry) => entry.id === 'openai/gpt-5.6-luna');
@@ -866,9 +866,11 @@ await tAsync('模型目录携带官方动态 pool 元数据', async () => {
   setTestDynamicModels(null);
 });
 
-// 独立额度池（非共享 premium）进限定分组；luna 的旧兼容池名 luna 要折算回 premium
-// 才不会掉标签（上游旧快照仍会回 pool='luna'）。
-await tAsync('独立额度池进限定分组，luna 旧池名折算回共享 Premium', async () => {
+// 独立 cap 池的 pool 元数据仍要如实下发（Release 兜底快照里还有），但 tier 归 free：
+// 上游 2026-09 把 glm-5.3-flash 设成 DEFAULT_FREEBUFF_MODEL_ID 且 premium: false，
+// 2026-09-14 实测 limited 账号能直接开它的会话。luna 的旧兼容池名 luna 要折算回
+// premium 才不会掉标签（上游旧快照仍会回 pool='luna'）。
+await tAsync('独立 cap 池元数据照发但 tier 归 free，luna 旧池名折算回共享 Premium', async () => {
   workerDefault.setAccountCatalogProbes({ fixture: { state: 'ok', quota: [
     { model: 'z-ai/glm-5.3-flash', pool: 'glm_v53_flash', limit: 2, used: 0 },
   ] } });
@@ -886,7 +888,7 @@ await tAsync('独立额度池进限定分组，luna 旧池名折算回共享 Pre
   ]);
   const body = await (await handleModels()).json();
   const glm = body.data.find((entry) => entry.id === 'z-ai/glm-5.3-flash');
-  if (!glm || glm.tier !== 'limited') {
+  if (!glm || glm.tier !== 'free') {
     throw new Error('GLM 5.3 独立额度 tier 错误: ' + JSON.stringify(glm));
   }
   const luna = body.data.find((entry) => entry.id === 'openai/gpt-5.6-luna');
@@ -1230,7 +1232,9 @@ await tAsync('模型按 免费 → US/SG → 限定 分组打 tier', async () =>
     'deepseek/deepseek-v4-flash': 'free',
     'meta/muse-spark-1.2-contributor': 'us_sg',
     'z-ai/glm-5.2': 'limited',
-    'z-ai/glm-5.3-flash': 'limited',
+    // glm-5.3-flash 归 free：上游 DEFAULT_FREEBUFF_MODEL_ID + premium:false，
+    // 且它永远拿不到额度行（不计量），留在 limited 组会被取证逻辑永久隐藏。
+    'z-ai/glm-5.3-flash': 'free',
     'anthropic/claude-fable-5': 'limited',
     // D4P 已被官方 paused 列表撤下，不该再占静态分组表的位置
     'deepseek/deepseek-v4-pro': null,

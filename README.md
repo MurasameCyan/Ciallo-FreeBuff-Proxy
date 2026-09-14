@@ -164,8 +164,14 @@ Luna 是**钉死**而不是 clamp —— 任何档位（含 `low` / `none` / `au
 
 | | `limited` | `full` |
 |---|---|---|
-| 额度表内容 | `deepseek-v4-flash`、`mimo-v2.5`（+ `glm-5.2` 的 `0/0`） | D4P、Luna 及共享 Premium 模型；M3 残留行会被忽略 |
-| 每日额度 | 以上游快照为准 | D4P、Luna 各有独立上限；DS4F / Kimi / Muse 共用 Premium 池，面板动态显示 `D… L… P…` |
+| 额度表内容 | `deepseek-v4-flash`、`mimo-v2.5`、`solar-pro4`（pool=`limited`/poolLabel `Daily`）+ `glm-5.3-flash`（pool=`glm`/poolLabel `Reward`，`limit: 0`） | `gpt-5.6-luna`、`muse-spark-1.2`、`kimi-k3-eco`、`gpt-5.6-luna-es`、`gemini-3.8-flash` 五行，全部 pool=`premium`/poolLabel `Premium` |
+| 每日额度 | `Daily` 池 6 次/日 | 共享 `Premium` 池 5 次/日；面板动态显示 `P…` 等徽标 |
+
+上游 Access Level（`freebuff-levels.ts`）2026-09 把基线从 3~5 免费 / 4 高级抬到 **6 免费 / 5 高级**，
+等级最高把两者都推到 7（`FREEBUFF_LEVEL_SESSION_CEILING`）。上表的 6 / 5 就是 level 0 的基线值。
+
+⚠️ `limit: 0` 不等于「已用完」，而是「这个池没给该模型额度」——`glm-5.3-flash` 的 `Reward` 行就是
+这样，而 2026-09-14 实测 limited 账号照样能开它的会话（`POST /session` → 200 active）。
 
 上游额度按 `America/Los_Angeles` 日历日重置；UTC 时刻随夏令时为 `07:00` 或 `08:00`（北京时间
 15:00 或 16:00），面板优先显示上游返回的 `resetAt`。代理对没有 typed 状态或时间提示的 generic

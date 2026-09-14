@@ -289,6 +289,100 @@ function parseGodOnlyModels(source, modelIdConstants) {
   return parseStrictModelList(cleaned, 'FREEBUFF_WEB_GOD_ONLY_MODELS', refs);
 }
 
+// 解析 freebuff-models.ts 里的模型对象常量（`const GPT_5_6_LUNA_MODEL = { id: …, premium: true, … }`）。
+// 2026-09 上游把池成员从字面量名单改成了从目录派生：
+//   export const FREEBUFF_PREMIUM_MODEL_IDS = Object.freeze(
+//     FREEBUFF_MODELS.filter((model) => model.premium).map((model) => model.id))
+// 于是只认 `= [ … ]` 的 poolRe 读到空池，premium/glm 双双清空，所有模型退化成
+// standard（实测 2026-09-14：线上 luna 被判 standard，额度记错池）。
+// 用花括号配平取整个对象体，不能只匹配 `{ id: …` 那一行 —— premium 字段在后面几行。
+function parseModelObjects(source, modelIdConstants) {
+  const cleaned = stripSourceComments(source);
+  const out = [];
+  const declRe = /\bconst\s+([A-Z0-9_]+)(?:\s*:\s*[^=\n]+)?\s*=\s*\{/g;
+  let decl;
+  while ((decl = declRe.exec(cleaned)) !== null) {
+    const open = cleaned.indexOf("{", decl.index + decl[0].length - 1);
+    if (open < 0) continue;
+    let depth = 0;
+    let end = -1;
+    for (let i = open; i < cleaned.length; i++) {
+      if (cleaned[i] === "{") depth++;
+      else if (cleaned[i] === "}" && --depth === 0) { end = i; break; }
+    }
+    if (end < 0) continue;
+    const body = cleaned.slice(open + 1, end);
+    // 只要顶层 id 字段；嵌套对象里的同名键不算（配平已限定在本对象内）。
+    const idMatch = /(?:^|[{,\s])id\s*:\s*(?:'([^']+)'|"([^"]+)"|([A-Za-z0-9_]+))/.exec(body);
+    if (!idMatch) continue;
+    const id = idMatch[1] || idMatch[2] || modelIdConstants[idMatch[3]];
+    if (!id || !id.includes("/")) continue;
+    out.push({
+      name: decl[1],
+      id,
+      premium: /(?:^|[{,\s])premium\s*:\s*true\b/.test(body),
+    });
+    declRe.lastIndex = end;
+  }
+  return out;
+}
+
+// 一次扫出所有 `const NAME = [ … ]` 的数组体（含 `Object.freeze([ … )`）。
+// 供目录成员展开复用，避免对每个标识符重复挖注释（这个文件 200KB+）。
+function collectArrayBodies(cleaned) {
+  const bodies = new Map();
+  const declRe = /\bconst\s+([A-Z0-9_]+)(?:\s*:\s*[^=\n]+)?\s*=\s*(?:Object\.freeze\s*\(\s*)?\[/g;
+  let decl;
+  while ((decl = declRe.exec(cleaned)) !== null) {
+    const open = cleaned.lastIndexOf("[", declRe.lastIndex);
+    let depth = 0;
+    for (let i = open; i < cleaned.length; i++) {
+      if (cleaned[i] === "[") depth++;
+      else if (cleaned[i] === "]" && --depth === 0) {
+        bodies.set(decl[1], cleaned.slice(open + 1, i));
+        declRe.lastIndex = i;
+        break;
+      }
+    }
+  }
+  return bodies;
+}
+
+// 目录成员展开：FREEBUFF_MODELS / FREEBUFF_WEB_ALL_MODELS 的数组体里写的是模型
+// 对象常量名，还夹着 `...FREEBUFF_MODELS` 与 `...(FLAG ? [MIMO_V25_MODEL] : [])`
+// 这类 spread，所以要跟着数组名递归（带环保护）。
+// ⚠️ 不能只按「文件里 premium: true」扫：freebuff-models.ts 里还有一堆没进任何
+// 目录的模型对象（fable-5、luna-max、glm-5.2、muse-spark-1.3 …）。把它们算进
+// premium 会让 modelCatalogAccess 的 `pool === "premium"` 短路放行，/v1/models
+// 于是放出账号压根开不了的行，客户端每选一次白扣一个 admission —— 正是上游
+// #1801 那个循环。判据必须与上游一致：**进了目录数组** 且自己 premium: true。
+// 条件 spread 一律按「包含」处理：读不到运行期 flag，宁可多认一个成员（当前唯一
+// 一例 MIMO_V25_MODEL 是 premium: false，不进 premium），也不漏掉真的 premium 行。
+function catalogPremiumModelIds(cleaned, modelObjects) {
+  const byName = new Map(modelObjects.map((model) => [model.name, model]));
+  const bodies = collectArrayBodies(cleaned);
+  const members = new Set();
+  const seen = new Set();
+  const walk = (arrayName) => {
+    if (seen.has(arrayName)) return;
+    seen.add(arrayName);
+    const body = bodies.get(arrayName);
+    if (body === undefined) return;
+    for (const token of body.match(/[A-Za-z_][A-Za-z0-9_]*/g) || []) {
+      if (byName.has(token)) members.add(token);
+      else walk(token);
+    }
+  };
+  walk("FREEBUFF_MODELS");
+  walk("FREEBUFF_WEB_ALL_MODELS");
+  const ids = [];
+  for (const name of members) {
+    const model = byName.get(name);
+    if (model?.premium) ids.push(model.id);
+  }
+  return ids;
+}
+
 function parseModelPools(source, modelIdConstants) {
   const premium = new Set();
   const glm = new Set();
@@ -320,7 +414,10 @@ function parseModelPools(source, modelIdConstants) {
     }
     return out;
   };
-  // 解析池
+  // 解析池。两种写法都要认：
+  //   旧（≤2026-08）：export const FREEBUFF_PREMIUM_MODEL_IDS = [A, B] as const
+  //   新（2026-09）：从 FREEBUFF_MODELS.filter(m => m.premium) 派生
+  // Releases JSON 兜底和历史快照仍是旧写法，所以字面量名单优先，读不到再派生。
   const poolRe = /export\s+const\s+(FREEBUFF_WEB_PREMIUM_MODEL_IDS|FREEBUFF_GLM_V52_MODEL_IDS|FREEBUFF_PREMIUM_MODEL_IDS)\s*=\s*\[([^\]]*)\]/g;
   let pm;
   while ((pm = poolRe.exec(cleaned)) !== null) {
@@ -331,6 +428,17 @@ function parseModelPools(source, modelIdConstants) {
     } else {
       for (const id of items) premium.add(id);
     }
+  }
+  // 字面量名单读不到 premium 时按目录成员派生。实测 2026-09-14 与线上
+  // rateLimitsByModel 逐行一致：luna / kimi-k3-eco / luna-es / muse-spark-1.2 /
+  // gemini-3.8-flash 五行报 pool=premium，派生结果完全相同。
+  // 刻意不把 FREEBUFF_REWARD_MODEL_IDS 当成 glm 独立池：上游那张表是「挣来的
+  // 奖励场次」这种权益概念，而它现在指向的 glm-5.3-flash 是 premium:false 的
+  // 免费默认模型（线上额度快照里根本没有它的行）。塞进 glm 会让调度以为这个
+  // 免费默认模型属于稀缺独立池，反而误判。
+  if (premium.size === 0) {
+    const modelObjects = parseModelObjects(cleaned, modelIdConstants);
+    for (const id of catalogPremiumModelIds(cleaned, modelObjects)) premium.add(id);
   }
   const perModelCaps = parsePerModelSessionCaps(source, modelIdConstants);
   // 与 serviceOnly 同样是三态：没有这张表 → null（落静态兜底），读到空数组 → []
@@ -808,7 +916,6 @@ function modelPoolCategory(modelId, quota = null, cache = dynamicModelsCache) {
     if (dynamicStandardModels(cache).has(id)) return "standard";
   }
   // 静态兼容兜底只在没有实时/动态 pool 时使用。
-  if (GLM_V53_FLASH_QUOTA_MODELS.has(id)) return "glm_v53_flash";
   if (PREMIUM_QUOTA_MODELS.has(id)) return "premium";
   if (STANDARD_MODELS.has(id)) return "standard";
   if (GLM_QUOTA_MODELS.has(id)) return "glm";
@@ -828,18 +935,31 @@ const MODELS = [
 //   deepseek-v4-flash / mimo-v2.5 —— 其余模型（v4-pro、luna、m3、glm 等）
 //   上游返回 409 session_model_mismatch / 403 free_mode_invalid_agent_model，
 //   "Limited free access is only available with DeepSeek V4 Flash or MiMo 2.5"。
-//   面板 /v1/models 只对这两个打 free tag。
+//   面板 /v1/models 只对这些打 free tag。
+// glm-5.3-flash 于 2026-09 加入：上游把它设成 DEFAULT_FREEBUFF_MODEL_ID 与
+// LIMITED_FREEBUFF_HERO_MODEL_ID，且**不在** FREEBUFF_LIMITED_TIER_PLAN_ONLY_MODEL_IDS
+// （那张表是 [luna, gemini-3.8-flash]），所以 limited 号无需付费计划就能开它。
+// 它同时是 premium: false 的不计量行 —— 见下面 MODEL_TIERS 为什么必须归到 free。
+// 实测 2026-09-14：POST /api/v1/freebuff/session 回 200 active，freebucks 报价 5
+//（全表最低，mimo 10 / ds4f 15 / luna 20 / gemini-3.8 50）。
 const FREE_AVAILABLE_MODELS = new Set([
   "deepseek/deepseek-v4-flash",
   "mimo/mimo-v2.5",
+  "z-ai/glm-5.3-flash",
 ]);
 
 // /v1/models 的分组键，数组顺序 = 面板「模型列表」的展示顺序（组内保持模型表原序）：
-//   free    免费号实测能建会话的两个（= FREE_AVAILABLE_MODELS）
+//   free    免费号实测能建会话的模型（= FREE_AVAILABLE_MODELS）
 //   us_sg   要 full accessTier（美/新出口 IP）才能建会话的 premium 模型
 //   limited 额度池独立、要 referral / 白名单解锁的模型（glm-5.2 独立池、fable-5 白名单）
 // 未列入的模型不带 tag、排在最后。这里只给分组键，标签文案和配色由 web/app.js 决定
 // —— 别把中文文案塞进 /v1/models，那是给客户端读的协议字段。
+//
+// ⚠️ limited 组要按账号额度行取证才可见（modelCatalogAccess）。所以**只有真的靠
+// 额度行解锁的模型**能进这一组：把不计量的模型放进来 = 永久隐藏。glm-5.3-flash
+// 曾在这一组，而它是 premium: false 的不计量行、线上 rateLimitsByModel 里根本
+// 没有它的行 —— 于是取证永远失败，上游的默认模型（也是最便宜的一行）被我们
+// 白白藏了整整两周（2026-09-14 实测确认）。
 const MODEL_TIERS = [
   ["free", FREE_AVAILABLE_MODELS],
   ["us_sg", new Set([
@@ -847,7 +967,6 @@ const MODEL_TIERS = [
   ])],
   ["limited", new Set([
     "z-ai/glm-5.2",
-    "z-ai/glm-5.3-flash",
     "anthropic/claude-fable-5",
   ])],
 ];
@@ -868,8 +987,7 @@ function modelCatalogTier(modelId, pool) {
   const normalizedPool = LEGACY_POOL_ALIASES[raw] || raw;
   if (POOL_DRIVEN_TIER_MODELS.has(id) && normalizedPool === "premium") return "us_sg";
   const rank = MODEL_TIERS.findIndex(([, ids]) => ids.has(id));
-  if (rank >= 0 && MODEL_TIERS[rank][0] === "limited" && normalizedPool === "premium"
-    && id !== "z-ai/glm-5.3-flash") return "us_sg";
+  if (rank >= 0 && MODEL_TIERS[rank][0] === "limited" && normalizedPool === "premium") return "us_sg";
   return rank >= 0 ? MODEL_TIERS[rank][0] : null;
 }
 
@@ -976,15 +1094,23 @@ function isHiddenModelId(modelId, cache = dynamicModelsCache) {
   }
   return false;
 }
+// 官方 premium 成员的静态兜底：只在没有实时额度行、也没有动态池时使用。
+// 内容对齐 2026-09-14 实测的线上 rateLimitsByModel（五行 pool=premium）：
+// luna / kimi-k3-eco / luna-es / muse-spark-1.2 / gemini-3.8-flash。
+// 已移出的两个：
+//   - deepseek-v4-flash：上游 `premium: false`，full 号根本没有它的 premium 行
+//     （limited 号报 pool=limited）。留着会把免费模型的 429 记到 premium 池。
+//   - glm-5.3-flash：同为 `premium: false` 且不计量，见下方 KNOWN_QUOTA_POOLS 的说明。
+// muse / kimi / luna-es 当前被 god-only / service-only 名单隐藏，两个读这张表的地方
+// （modelPoolCategory / premiumQuotaEntry）都先过 isHiddenModelId，所以现在取不到
+// premium 归属；这些行**故意留着**：官方确实按 premium 池给它们计量，哪天门撤了
+// 自动解隐藏后，池归属立刻还是对的。
 const PREMIUM_QUOTA_MODELS = new Set([
-  "deepseek/deepseek-v4-flash",
   "openai/gpt-5.6-luna",
-  "z-ai/glm-5.3-flash",
-  // muse 当前被 FREEBUFF_SERVICE_ONLY_MODEL_IDS 隐藏，两个读这张表的地方
-  // （modelPoolCategory / premiumQuotaEntry）都先过 isHiddenModelId，所以它现在
-  // 取不到 premium 归属、也写不了 premium 冷却。这一行**故意留着**：官方确实按
-  // premium 池给它计量，哪天门撤了自动解隐藏后，池归属立刻还是对的。
+  "crof/kimi-k3-eco",
+  "openai/gpt-5.6-luna-es",
   "meta/muse-spark-1.2-contributor",
+  "google/gemini-3.8-flash",
 ]);
 const STANDARD_MODELS = new Set([
   "mimo/mimo-v2.5",
@@ -992,9 +1118,27 @@ const STANDARD_MODELS = new Set([
 const GLM_QUOTA_MODELS = new Set([
   "z-ai/glm-5.2",
 ]);
-const GLM_V53_FLASH_QUOTA_MODELS = new Set([
-  "z-ai/glm-5.3-flash",
+
+// 限额不按账号算、而是**全体 freebuff 用户共享一个团队配额**的模型。
+// 上游 freebuff-models.ts 原文（MUSE_SPARK_CONTRIBUTOR_RPM/TPM）：
+//   "Contributor-tier limits, PER TEAM and shared by every Freebuff user —
+//    and shared across BOTH Contributor versions, so 1.3 did not add headroom."
+//   150 req/min + 3,000,000 token/min（2026-09-02 实测 x-ratelimit-limit-* 响应头）
+// 两个 Contributor 版本共用同一个桶，所以 1.3 不带来任何额外余量。
+//
+// 对调度的意义：撞上这个限额时**换号完全无效** —— 换到的号问到的是同一个团队桶，
+// 只会把 admission 白烧一遍（每个新号建会话就扣一次）。所以这类模型的额度耗尽
+// 必须就地回客户端，不进换号链；冷却也只写模型级，不牵连同池的 luna/gemini。
+// TPM 是先撞上的那一个：一个长上下文请求花的 token 预算远多于请求数预算。
+const SHARED_TEAM_LIMIT_MODELS = new Set([
+  "meta/muse-spark-1.2-contributor",
+  "meta/muse-spark-1.3-contributor",
 ]);
+
+// 这个模型的额度是否与其他账号共享（= 换号拿不到新额度）。
+function hasSharedTeamLimit(modelId) {
+  return SHARED_TEAM_LIMIT_MODELS.has(String(modelId || "").trim());
+}
 
 // ---------------------------------------------------------------------------
 // 桌面版协议常量（逆向自 Freebuff Desktop orchestrator.js）
@@ -2498,6 +2642,7 @@ function isTransientUpstreamError(error) {
     || error instanceof WaitingRoomError
     || error instanceof ModelLockedError
     || error instanceof ModelUnavailableError
+    || error instanceof SessionRefusedError
     || error instanceof EmptyUpstreamStreamError) return false;
   const msg = String((error && error.message) || error);
   if (/\b429\b/.test(msg) || /stayed queued|waiting.room/i.test(msg)) return false;
@@ -2684,6 +2829,25 @@ function waitingRoomResponse(retryAfterMs = 30 * 1000, modelHint = "") {
   }, 503, { "Retry-After": String(seconds) });
 }
 
+// 团队共享限额（muse-spark）撞顶的对外形状。与 waiting_room 区分开：
+// waiting_room 是「上游后端容量满、等一会儿再来」，这条是「全体 freebuff 用户
+// 共用的团队配额打满，换号也没用」—— 说法不一样，客户端的正确反应也不一样
+// （前者原样重试，后者应该改模型）。
+function sharedTeamLimitResponse(modelId, retryAfterMs) {
+  const ms = Math.max(1000, Number(retryAfterMs) || GENERIC_429_COOLDOWN_MS);
+  const seconds = Math.max(1, Math.ceil(ms / 1000));
+  return jsonResponse({
+    error: {
+      message: `模型 ${modelId} 的限额由全体 freebuff 用户共享（团队级 150 req/min + 3M token/min），`
+        + `当前已被打满。换账号拿到的是同一个配额桶，因此网关不再换号；`
+        + `请约 ${seconds}s 后重试，或改用其他模型。`,
+      type: "shared_team_rate_limit",
+      model: modelId || null,
+      retryAfterMs: ms,
+    },
+  }, 429, { "Retry-After": String(seconds), "X-RateLimit-Scope": "upstream-team" });
+}
+
 // 两种 state 必须分开说（2026-08-26 用户反馈）：egress_unavailable 是本地判定
 // （lane 未就绪，请求根本没发出去），说「被上游拒绝」会把锅甩给上游；只有
 // egress_rejected 才是上游真拒了出口 IP。
@@ -2726,7 +2890,8 @@ function isLiveSession(session, now = Date.now()) {
 
 // 这个号是否已经被另一个模型的会话占住。CLI 通道一个号同时只能有一个会话，
 // 所以在它上面开新模型必须先 DELETE 旧会话 —— 而重建一次要扣一份 premium
-// admission（每天只有 4~7 份）。选号时把这种号排到最后，让「换模型」优先落到
+// admission（上游 Access Level 基线 5 份/日，最高 7 —— 2026-09 从 4~7 抬到 5~7）。
+// 选号时把这种号排到最后，让「换模型」优先落到
 // 干净的空闲号上：这才是两个模型真正并行的方式，也是不白烧额度的方式。
 function hasConflictingSession(token, sessionModel, now = Date.now()) {
   const id = String(sessionModel || "");
@@ -2766,13 +2931,13 @@ function scopedCooldownKey(token, scope) {
 function quotaScopeForModel(model, quota = null) {
   const id = String(model || "").trim();
   if (!id) return "account";
-  // GLM 5.3 Flash 同时消耗 Premium 共享池，并额外受独立 2 次/日上限约束。
-  // rateLimitsByModel 的精确行优先；typed 429 未携带快照时按官方独立 cap
-  // fail closed，不能退成模型级或误锁整个 Premium 池。
-  if (GLM_V53_FLASH_QUOTA_MODELS.has(id)) {
-    const exactPool = normalizePoolName(quotaRowForModel(quota, id)?.pool);
-    return "pool:" + (exactPool || "glm_v53_flash");
-  }
+  // ⚠️ 2026-09 上游删掉了 FREEBUFF_PER_MODEL_SESSION_CAPS（换成按美元计的
+  // FREEBUFF_PER_MODEL_SESSION_SPEND_CAPS，只剩 gemini-3.8-flash 一条 $0.50），
+  // glm-5.3-flash 同时被改成 `premium: false`。实测 2026-09-14：它在
+  // rateLimitsByModel 里**没有任何行**，买一次 dayUsed 仍是 0（只扣 5 freebucks），
+  // 即它不消耗任何会话池。原先那段「独立 cap + 同时消耗 premium」的 fail-closed
+  // 因此两头都不成立，且会让 premium 耗尽连带锁死这个免费默认模型 —— 已删除。
+  // 没有实时行的模型一律落到下面的 `model:` 模型级隔离，不猜共享池。
   const category = modelPoolCategory(id, quota);
   if (["deepseek_pro", "luna", "premium"].includes(category)) return "pool:" + category;
   if (category === "glm") return "pool:glm";
@@ -2784,11 +2949,6 @@ function quotaScopeForModel(model, quota = null) {
 function quotaScopesForModel(model, quota = null) {
   const id = String(model || "").trim();
   if (!id) return ["account"];
-  if (GLM_V53_FLASH_QUOTA_MODELS.has(id)) {
-    const exactPool = normalizePoolName(quotaRowForModel(quota, id)?.pool);
-    if (exactPool === "premium") return ["pool:premium"];
-    return ["pool:glm_v53_flash", "pool:premium"];
-  }
   return [quotaScopeForModel(id, quota)];
 }
 
@@ -2952,31 +3112,23 @@ function premiumQuotaEntry(quota, exact = null) {
   };
 }
 
-function quotaEntryForScope(quota, scope) {
-  const pool = String(scope || "").startsWith("pool:") ? String(scope).slice(5) : "";
-  if (!pool) return null;
-  if (pool === "premium") return premiumQuotaEntry(quota);
-  for (const entry of Object.values(quota || {})) {
-    if (entry && typeof entry === "object" && safePoolName(entry.pool) === pool) return entry;
-  }
-  return null;
-}
-
 function quotaConstraintsForModel(quota, sessionModel) {
   const id = String(sessionModel || "").trim();
-  if (!GLM_V53_FLASH_QUOTA_MODELS.has(id)) {
-    const primary = quotaEntryForModel(quota, id);
-    return primary ? [{ entry: primary, scope: quotaScopeForModel(id, quota) }] : [];
-  }
-
-  return quotaScopesForModel(id, quota)
-    .map((scope) => ({ scope, entry: quotaEntryForScope(quota, scope) }))
-    .filter((constraint) => constraint.entry);
+  const primary = quotaEntryForModel(quota, id);
+  return primary ? [{ entry: primary, scope: quotaScopeForModel(id, quota) }] : [];
 }
 
+// ⚠️ limit=0 不是「已用尽」，是「这个池对该模型没有额度概念」。
+// 实测 2026-09-14（limited tier 账号 lupperbooher）：
+//   z-ai/glm-5.3-flash → {pool:'glm', poolLabel:'Reward', limit:0, recentCount:0}
+// 而同一个号 POST /api/v1/freebuff/session 明确回 200 active（只扣 5 freebucks）。
+// 按 limit-recentCount=0 判耗尽的话，每个 limited 号一上来就被判额度耗尽 →
+// 冷却 + 换号，直到全池打完。所以 limit<=0 一律返回 null（未知），把判定交给
+// 真正有牙的信号：上游 429 / freebucks。
 function quotaConstraintRemaining(constraint) {
   const entry = constraint?.entry;
   if (!entry || typeof entry.recentCount !== "number" || typeof entry.limit !== "number") return null;
+  if (entry.limit <= 0) return null;
   return entry.limit - entry.recentCount;
 }
 
@@ -3387,6 +3539,55 @@ function throwIfModelUnavailableResponse(resp, sessionModel) {
   });
 }
 
+// 上游 2026-09 在 FreebuffSessionAdmissionResponse 上新增的四个「购买/授权层」拒绝态。
+// 2026-09-14 实测：worker 一个都不认，于是它们全落进通用异常分支 → 冷却当前号 + 换号。
+// 四者都不是账号故障，换号拿到的是同一个答案，而每换一个号都要先建一次会话
+// （= 真扣 admission），正是上游 #1801 那个循环：
+//   consent_required        钱包扣款需要显式同意（带 walletConsent: {price, walletSpend}）
+//   purchase_claim_released 一次性 Desktop claim 已作废，官方处置是「换个新 id 再试」
+//   purchase_in_use         该模型已被另一个实例占着（带 currentInstanceId）
+//   purchase_capacity       并发槽位打满（带 concurrency / slotLimit）
+//
+// ⚠️ consent_required 绝不自动同意：walletSpend 花的是账号钱包里的真余额
+// （freebucks 的 wallet 段，与每日 100 的 daily 段是两笔钱）。代理无权替用户
+// 花钱，只能把价格原样回给客户端由人决定。
+const SESSION_REFUSED_STATES = new Set([
+  "consent_required",
+  "purchase_claim_released",
+  "purchase_in_use",
+  "purchase_capacity",
+]);
+
+class SessionRefusedError extends Error {
+  constructor(state, data = {}) {
+    super(`session refused: ${state}`);
+    this.name = "SessionRefusedError";
+    this.state = String(state || "");
+    this.requestedModel = data.requestedModel || null;
+    this.currentInstanceId = data.currentInstanceId || null;
+    const slotLimit = Number(data.slotLimit);
+    this.slotLimit = Number.isFinite(slotLimit) ? slotLimit : null;
+    const consent = data.walletConsent;
+    const price = Number(consent?.price);
+    const walletSpend = Number(consent?.walletSpend);
+    this.walletConsent = consent && typeof consent === "object"
+      && (Number.isFinite(price) || Number.isFinite(walletSpend))
+      ? {
+        ...(Number.isFinite(price) ? { price } : {}),
+        ...(Number.isFinite(walletSpend) ? { walletSpend } : {}),
+      }
+      : null;
+  }
+}
+
+// session 联合体形态（POST/GET /session）：判别式同样只看 body 的 status。
+function throwIfSessionRefusedResponse(resp, sessionModel) {
+  const data = resp?.data;
+  const state = String(data?.status || "");
+  if (!SESSION_REFUSED_STATES.has(state)) return;
+  throw new SessionRefusedError(state, { ...data, requestedModel: data.requestedModel || sessionModel });
+}
+
 // chat gate 形态：必须 code + HTTP status **同时**匹配（官方注释：410 本身也是
 // 普通 provider 结果，且上游 error body 可能回显同名 code，只对一半会让无关故障
 // 冒充 gate）。410 上的另一个 code 是 session_expired，由 isStaleSessionGate 处理，
@@ -3401,7 +3602,7 @@ function isModelUnavailableGate(status, body) {
 // free mode 的请求级 gate：403 且 body 报了 free_mode_* 名字
 // （free_mode_legacy_luna_agent / free_mode_cli_required / free_mode_invalid_agent_model…）。
 // 这类结果跟账号、跟出口节点都无关 —— 全池每个号问到的都是同一句话，而每次换号重试
-// 都要先建一次会话（真扣 admission 额度：luna 一天只有 3 次）。所以与 400 同口径：
+// 都要先建一次会话（真扣 admission 额度：共享 Premium 池基线 5 次/日）。所以与 400 同口径：
 // 不冷却、不换号，直接把上游原文回给客户端。
 function isFreeModeGate(status, body) {
   if (status !== 403) return false;
@@ -3431,6 +3632,36 @@ function modelUnavailableResponse(error) {
       ...(error?.purchasesPaused ? { purchasesPaused: true } : {}),
     },
   }, 503);
+}
+
+// 四个购买/授权层拒绝态的对外形状。都不重试、不换号，直接把原因回客户端。
+// 409 而不是 503：这不是「上游暂时不可用、稍后重试」，而是「需要你做一个决定」
+// （同意扣款 / 换 claim id / 等占用的实例结束）。
+function sessionRefusedResponse(error) {
+  const model = error?.requestedModel ? String(error.requestedModel) : "该模型";
+  const messages = {
+    consent_required: error?.walletConsent?.price != null
+      ? `开启 ${model} 需要先同意从账号钱包扣款（本次报价 ${error.walletConsent.price}`
+        + `${error.walletConsent.walletSpend != null ? `，其中钱包支付 ${error.walletConsent.walletSpend}` : ""}）。`
+        + `代理不会替你花钱包余额，请在 Freebuff 官方端确认后再重试。`
+      : `开启 ${model} 需要先在 Freebuff 官方端同意钱包扣款，代理不会替你花钱包余额。`,
+    purchase_claim_released: `${model} 的一次性购买凭据已作废，需要换一个新的实例 id 重新申请。`,
+    purchase_in_use: `${model} 已被另一个实例占用`
+      + `${error?.currentInstanceId ? `（instance ${error.currentInstanceId}）` : ""}，`
+      + `等它结束后再重试；换账号拿到的是同一个答案。`,
+    purchase_capacity: `${model} 的并发槽位已满`
+      + `${error?.slotLimit != null ? `（上限 ${error.slotLimit}）` : ""}，请稍后重试。`,
+  };
+  return jsonResponse({
+    error: {
+      message: messages[error?.state] || `上游拒绝为 ${model} 建会话（${error?.state || "unknown"}）。`,
+      type: error?.state || "session_refused",
+      requestedModel: error?.requestedModel || null,
+      ...(error?.walletConsent ? { walletConsent: error.walletConsent } : {}),
+      ...(error?.currentInstanceId ? { currentInstanceId: error.currentInstanceId } : {}),
+      ...(error?.slotLimit != null ? { slotLimit: error.slotLimit } : {}),
+    },
+  }, 409);
 }
 
 
@@ -3560,6 +3791,7 @@ function isExpectedFlowError(error) {
     || error instanceof ClientSessionLimitError
     || error instanceof ModelLockedError
     || error instanceof ModelUnavailableError
+    || error instanceof SessionRefusedError
     || error instanceof EmptyUpstreamStreamError;
 }
 
@@ -4121,6 +4353,7 @@ async function createSession(token, sessionModel, forceCreate = false, client = 
       throwIfAdmissionResponse(cur.status, cur.data, cur.headers, sessionModel,
         cur.data?.rateLimitsByModel || acctHealth.get(token)?.quota || null);
       throwIfModelUnavailableResponse(cur, sessionModel);
+      throwIfSessionRefusedResponse(cur, sessionModel);
       if (cur.status === 200 && cur.data?.status === "active" && cur.data?.instanceId) {
         const cm = cur.data.model;
         if (!cm || cm === sessionModel) {
@@ -4157,6 +4390,9 @@ async function createSession(token, sessionModel, forceCreate = false, client = 
       // model_unavailable：模型全局不可选（联合体里带 availableHours）。不是这个号
       // 的问题，换号只会把同一个结果再要一遍，所以直接抛到最外层回客户端。
       throwIfModelUnavailableResponse(resp, sessionModel);
+      // 购买/授权层拒绝（consent_required / purchase_* ）：同样不是这个号的问题，
+      // 换号只会把同一个决定再要一遍。直接抛到最外层回客户端。
+      throwIfSessionRefusedResponse(resp, sessionModel);
       return resp;
     };
     let r = await postSession();
@@ -4941,6 +5177,16 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode, requestSig
         recordRequest(mc && mc.id ? mc.id : "", null, false);
         return modelUnavailableResponse(e);
       }
+      // 购买/授权层拒绝（consent_required / purchase_in_use / purchase_capacity /
+      // purchase_claim_released）：和 model_unavailable 同口径 —— 不是这个号的问题，
+      // 换号只会把同一个决定再要一遍，还每次白扣一份 admission。收尾 run 后原文回传。
+      if (e instanceof SessionRefusedError) {
+        if (reviewerRunId) await finishRun(token, reviewerRunId, 1).catch(() => {});
+        if (rootRunId) await finishRun(token, rootRunId, 1).catch(() => {});
+        callTotals.upstreamError++;
+        recordRequest(mc && mc.id ? mc.id : "", null, false);
+        return sessionRefusedResponse(e);
+      }
       if (e instanceof WaitingRoomError || /session stayed queued|waiting.room/i.test(lastErrMsg)) {
         lastWaitingRetryAfter = e.retryAfterMs || 30 * 1000;
       } else lastWaitingRetryAfter = null;
@@ -4957,6 +5203,19 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode, requestSig
       if (!terminal && rootRunId) await finishRun(token, rootRunId, 1).catch(() => {});
       if (e instanceof QuotaExhaustedError) {
         const ra = e.retryAfterMs || GENERIC_429_COOLDOWN_MS;
+        // 团队共享限额（muse-spark）：换号问到的是同一个团队桶，只会白扣 admission。
+        // 冷却写模型级，然后就地回客户端，不进换号链（同 executeChatPooled）。
+        if (hasSharedTeamLimit(mc.session)) {
+          cooldown(token, ra, {
+            reason: "quota",
+            retryAfterMs: ra,
+            model: mc.session,
+            scope: "model:" + String(mc.session),
+          });
+          callTotals.rateLimited++;
+          recordRequest(mc && mc.id ? mc.id : "", null, false);
+          return sharedTeamLimitResponse(mc.session, ra);
+        }
         cooldown(token, ra, {
           reason: "quota",
           retryAfterMs: ra,
@@ -5288,6 +5547,12 @@ async function executeChatPooled(env, chatParams, mc, isStream, mode, requestSig
         recordRequest(mc && mc.id ? mc.id : "", null, false);
         return modelUnavailableResponse(e);
       }
+      // 购买/授权层拒绝：同 model_unavailable，不冷却不换号，直接回客户端。
+      if (e instanceof SessionRefusedError) {
+        callTotals.upstreamError++;
+        recordRequest(mc && mc.id ? mc.id : "", null, false);
+        return sessionRefusedResponse(e);
+      }
       // model_locked：这个号被别的模型占着。换号继续（另一个号就是真正的并行），
       // 但不写冷却、不原地重试 —— 见 ModelLockedError 的注释。
       if (e instanceof ModelLockedError) lastModelLocked = e;
@@ -5302,6 +5567,18 @@ async function executeChatPooled(env, chatParams, mc, isStream, mode, requestSig
       if (e instanceof QuotaExhaustedError) {
         sessCache.delete(token + ":" + mc.session);
         const ra = e.retryAfterMs || parseCooldown("", 429);
+        // 团队共享限额（muse-spark）：换号问到的是同一个桶，只会白扣 admission。
+        // 冷却写模型级（不牵连同池 luna/gemini），然后就地回客户端，不进换号链。
+        if (hasSharedTeamLimit(mc.session)) {
+          cooldown(token, ra, {
+            reason: "quota",
+            retryAfterMs: ra,
+            model: mc.session,
+            scope: "model:" + String(mc.session),
+          });
+          recordRequest(mc && mc.id ? mc.id : "", null, false);
+          return sharedTeamLimitResponse(mc.session, ra);
+        }
         cooldown(token, ra, {
           reason: "quota",
           retryAfterMs: ra,

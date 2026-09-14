@@ -13,6 +13,7 @@ function createApi(fetchImpl = async () => new Response('{}')) {
   };
   vm.runInNewContext(source.replace('export default {', 'const workerDefault = {') + `
     globalThis.api = { parseModelPools, parseModelIdConstants, isHiddenModelId, handleModels,
+      modelPoolCategory,
       DYNAMIC_MODELS_REFRESH_MS,
       seed(models, pool = {}) { dynamicModelsCache = { fetchedAt: Date.now() - 3600000, models,
         pool: { premium: new Set(), standard: null, glm: new Set(), perModelCaps: {},
@@ -59,6 +60,74 @@ test('暂停和服务专用名单中的未知引用不能被静默当作空名�
     export const OTHER_ARRAY = [] as const;
   `, {});
   assert.equal(expression.paused, null, '不能拿下一条声明的数组作为当前名单');
+});
+
+// 2026-09-14 线上回归：上游把 FREEBUFF_PREMIUM_MODEL_IDS 从字面量名单改成
+// `Object.freeze(FREEBUFF_MODELS.filter(m => m.premium).map(m => m.id))` 之后，
+// 只认 `= [ … ]` 的解析器读到空池 —— 于是 luna 被判 standard，额度记错池。
+// 空池不会报错，只会静默降级，所以这条断言必须钉住「派生写法也要读出 premium」。
+test('premium 池改成从目录成员派生后仍能解析（空池不是合法结果）', () => {
+  const api = createApi();
+  const text = `
+    export const LUNA_ID = 'openai/gpt-5.6-luna';
+    export const FLASH_ID = 'z-ai/glm-5.3-flash';
+    export const FABLE_ID = 'anthropic/claude-fable-5';
+    const GPT_5_6_LUNA_MODEL = {
+      id: LUNA_ID,
+      displayName: 'Luna',
+      premium: true,
+      availability: 'always',
+    };
+    const GLM_V53_FLASH_MODEL = {
+      id: FLASH_ID,
+      displayName: 'GLM 5.3 Flash',
+      premium: false,
+      availability: 'always',
+    };
+    const FABLE_5_MODEL = {
+      id: FABLE_ID,
+      displayName: 'Fable 5',
+      premium: true,
+      availability: 'always',
+    };
+    export const FREEBUFF_MODELS = [GLM_V53_FLASH_MODEL, GPT_5_6_LUNA_MODEL] as const;
+    export const FREEBUFF_PREMIUM_MODEL_IDS = Object.freeze(
+      FREEBUFF_MODELS.filter((model) => model.premium).map((model) => model.id),
+    );
+  `;
+  const pools = api.parseModelPools(text, api.parseModelIdConstants(text));
+  assert.deepEqual([...pools.premium], ['openai/gpt-5.6-luna'],
+    'premium:true 的行要进池，premium:false 的不进');
+  // 判据是「进了目录数组」而不是「文件里写了 premium: true」。fable-5 这种
+  // 白名单模型在源里就是 premium: true，但不在任何目录数组里：把它算进 premium
+  // 会让 modelCatalogAccess 的 `pool === "premium"` 短路，/v1/models 放出账号
+  // 开不了的行，客户端每选一次白扣一个 admission（上游 #1801 的循环）。
+  assert.ok(![...pools.premium].includes('anthropic/claude-fable-5'),
+    '没进目录数组的 premium:true 模型不得进 premium 池');
+  // 分类是真正的消费点：premium 空集会让所有模型退化成 standard。
+  const cache = {
+    models: [{ id: 'openai/gpt-5.6-luna' }, { id: 'z-ai/glm-5.3-flash' }],
+    pool: {
+      premium: new Set(pools.premium), glm: new Set(pools.glm),
+      paused: new Set(), serviceOnly: new Set(), godOnly: new Set(),
+    },
+  };
+  assert.equal(api.modelPoolCategory('openai/gpt-5.6-luna', null, cache), 'premium');
+  assert.equal(api.modelPoolCategory('z-ai/glm-5.3-flash', null, cache), 'standard');
+});
+
+// Releases JSON 兜底与历史快照仍是旧的字面量写法，派生逻辑不能把它顶掉。
+test('旧的字面量 premium 名单优先于目录派生', () => {
+  const api = createApi();
+  const text = `
+    export const LUNA_ID = 'openai/gpt-5.6-luna';
+    export const PRO_ID = 'deepseek/deepseek-v4-pro';
+    const OTHER_MODEL = { id: PRO_ID, premium: true };
+    export const FREEBUFF_PREMIUM_MODEL_IDS = [LUNA_ID] as const;
+  `;
+  const pools = api.parseModelPools(text, api.parseModelIdConstants(text));
+  assert.deepEqual([...pools.premium], ['openai/gpt-5.6-luna'],
+    '读到字面量名单就以它为准，不再按 premium 字段派生');
 });
 
 test('冷启动全源失败后也退避一分钟，不反复请求所有源', async () => {
