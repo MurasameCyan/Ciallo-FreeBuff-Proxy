@@ -646,6 +646,156 @@ test('glm-5.3-flash 与 Premium 池互不牵连（官方独立 cap 已删除）'
   releaseIfSelected(glmVm, premiumOpen);
 });
 
+// 2026-09 上游把免费模式计价搬到 freebucks（每天 100，每模型一个报价）。只看场次
+// 额度会把号送进一个必然 spend_limited 的准入：场次剩 5 次、daily 只剩 10 时
+// luna（报价 20）一次都开不了。pickToken 的剩余额度维度因此取两者更紧的那个。
+test('选号把 freebucks 报价算进剩余额度，钱不够的号让位给场次更少但买得起的号', () => {
+  const workerVm = createWorkerVm();
+  const tokenRich = 'freebucks-sort-rich-account-1234567890';
+  const tokenBroke = 'freebucks-sort-broke-account-123456789';
+  const luna = 'openai/gpt-5.6-luna';
+  const env = {
+    FREEBUFF_TOKEN: `${tokenBroke},${tokenRich}`,
+    FREEBUFF_ACCOUNT_STATE: {},
+  };
+
+  // 场次更多（5 次）但 daily 只剩 10 freebucks —— 买不起一次 luna（20）。
+  workerVm.api.recordAccountObservation(tokenBroke, 200, { status: 'ok' }, {
+    quota: { [luna]: { recentCount: 0, limit: 5, pool: 'premium' } },
+    freebucks: {
+      daily: { limit: 100, spent: 90, remaining: 10 },
+      wallet: { balance: 0 },
+      prices: { [luna]: 20 },
+    },
+  });
+  // 场次只剩 1 次，但钱够买 5 次。
+  workerVm.api.recordAccountObservation(tokenRich, 200, { status: 'ok' }, {
+    quota: { [luna]: { recentCount: 4, limit: 5, pool: 'premium' } },
+    freebucks: {
+      daily: { limit: 100, spent: 0, remaining: 100 },
+      wallet: { balance: 0 },
+      prices: { [luna]: 20 },
+    },
+  });
+
+  const selected = workerVm.api.pickToken(env, luna, new Set());
+  assert.equal(selected?.token, tokenRich,
+    '只看场次会选 broke（5 > 1），但它买不起 luna：必须选买得起的 rich');
+  releaseIfSelected(workerVm, selected);
+});
+
+// 钱包余额不算进可用额度：动它要用户明确同意（consent_required + walletConsent），
+// 代理无权替用户花。算进去会把号送进一个我们必然拿不到的准入。
+test('freebucks 只算每日额度，不把钱包余额当成可用额度', () => {
+  const workerVm = createWorkerVm();
+  const walletOnly = 'freebucks-wallet-only-account-123456789';
+  const dailyLeft = 'freebucks-daily-left-account-1234567890';
+  const luna = 'openai/gpt-5.6-luna';
+  const env = {
+    FREEBUFF_TOKEN: `${walletOnly},${dailyLeft}`,
+    FREEBUFF_ACCOUNT_STATE: {},
+  };
+
+  // 每日额度花光，钱包里还有一大笔 —— 上游 balance 会把两者相加，但我们不能用。
+  workerVm.api.recordAccountObservation(walletOnly, 200, { status: 'ok' }, {
+    quota: { [luna]: { recentCount: 0, limit: 5, pool: 'premium' } },
+    freebucks: {
+      balance: 1000,
+      daily: { limit: 100, spent: 100, remaining: 0 },
+      wallet: { balance: 1000 },
+      prices: { [luna]: 20 },
+    },
+  });
+  workerVm.api.recordAccountObservation(dailyLeft, 200, { status: 'ok' }, {
+    quota: { [luna]: { recentCount: 4, limit: 5, pool: 'premium' } },
+    freebucks: {
+      daily: { limit: 100, spent: 60, remaining: 40 },
+      wallet: { balance: 0 },
+      prices: { [luna]: 20 },
+    },
+  });
+
+  const selected = workerVm.api.pickToken(env, luna, new Set());
+  assert.equal(selected?.token, dailyLeft,
+    '钱包有钱不等于我们能花：每日额度为 0 的号必须让位');
+  releaseIfSelected(workerVm, selected);
+});
+
+// 报价表里没有这个模型 = freebucks 管不着它，不能因此把号判成没额度。
+// quotaExempt 同理：服务端授权的豁免，零余额也能开。
+test('不在报价表里的模型与 quotaExempt 不受 freebucks 约束', () => {
+  const workerVm = createWorkerVm();
+  const token = 'freebucks-unpriced-account-1234567890';
+  const mimo = 'mimo/mimo-v2.5';
+  const env = { FREEBUFF_TOKEN: token, FREEBUFF_ACCOUNT_STATE: {} };
+
+  // daily 见底，但报价表里只有 luna：mimo 不该被这份余额判成开不了。
+  workerVm.api.recordAccountObservation(token, 200, { status: 'ok' }, {
+    quota: { [mimo]: { recentCount: 0, limit: 6, pool: 'limited' } },
+    freebucks: {
+      daily: { limit: 100, spent: 100, remaining: 0 },
+      wallet: { balance: 0 },
+      prices: { 'openai/gpt-5.6-luna': 20 },
+    },
+  });
+  const unpriced = workerVm.api.pickToken(env, mimo, new Set());
+  assert.equal(unpriced?.token, token, '没有报价的模型不受 freebucks 约束');
+  releaseIfSelected(workerVm, unpriced);
+
+  // quotaExempt：上游明确授权，报价再高也不构成约束。
+  const exemptVm = createWorkerVm();
+  const luna = 'openai/gpt-5.6-luna';
+  exemptVm.api.recordAccountObservation(token, 200, { status: 'ok' }, {
+    quota: { [luna]: { recentCount: 0, limit: 5, pool: 'premium' } },
+    freebucks: {
+      quotaExempt: true,
+      daily: { limit: 100, spent: 100, remaining: 0 },
+      wallet: { balance: 0 },
+      prices: { [luna]: 20 },
+    },
+  });
+  const exempt = exemptVm.api.pickToken(env, luna, new Set());
+  assert.equal(exempt?.token, token, 'quotaExempt 的号零余额也能开');
+  releaseIfSelected(exemptVm, exempt);
+});
+
+// 上游在 reuse / compact 等响应上就是 `freebucks: null`（注释写明「由客户端自己
+// 带着，不再重发」）。清空会让下一次选号退回瞎猜，必须保留上一份快照。
+test('响应没带 freebucks 时保留上一份快照，不清空', () => {
+  const workerVm = createWorkerVm();
+  const tokenBroke = 'freebucks-keep-broke-account-1234567890';
+  const tokenRich = 'freebucks-keep-rich-account-12345678901';
+  const luna = 'openai/gpt-5.6-luna';
+  const env = {
+    FREEBUFF_TOKEN: `${tokenBroke},${tokenRich}`,
+    FREEBUFF_ACCOUNT_STATE: {},
+  };
+
+  for (const [token, remaining, recentCount] of [
+    [tokenBroke, 10, 0],
+    [tokenRich, 100, 4],
+  ]) {
+    workerVm.api.recordAccountObservation(token, 200, { status: 'ok' }, {
+      quota: { [luna]: { recentCount, limit: 5, pool: 'premium' } },
+      freebucks: {
+        daily: { limit: 100, spent: 100 - remaining, remaining },
+        wallet: { balance: 0 },
+        prices: { [luna]: 20 },
+      },
+    });
+  }
+  // 第二次观测不带 freebucks（上游 reuse 响应的形状）。
+  workerVm.api.recordAccountObservation(tokenBroke, 200, { status: 'ok' }, {
+    quota: { [luna]: { recentCount: 0, limit: 5, pool: 'premium' } },
+    freebucks: null,
+  });
+
+  const selected = workerVm.api.pickToken(env, luna, new Set());
+  assert.equal(selected?.token, tokenRich,
+    'freebucks: null 不得清空上一份快照，否则 broke 会被当成额度未知而排到前面');
+  releaseIfSelected(workerVm, selected);
+});
+
 test('额度快照按上游 pool 选择，不再取任意 Premium 模型行', async () => {
   const workerVm = createWorkerVm();
   const token = 'pool-quota-snapshot-account-123456';

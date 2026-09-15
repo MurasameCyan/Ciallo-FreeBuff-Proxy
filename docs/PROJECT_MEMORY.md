@@ -79,14 +79,39 @@
 实现时的口径：日额度用 `dayUsed/dayLimit`（现有逻辑），周/月只做**展示与调度排序参考**，
 在确认执法前不得据此写冷却 —— 否则会重演「limit=0 被判耗尽」那类自伤（见下）。
 
-### A. freebucks 钱包才是当前真实计费口径（未接入调度）
+### A. freebucks 钱包是当前真实计费口径（2026-09-14 已接入调度）
 
-实测：每日 100 freebucks，价目 `glm-5.3-flash=5`、`mimo=10`、`ds4f=15`、`luna=20`、
-`gemini-3.8-flash=50`。买 glm-5.3 → `daily.spent 0→5`；买 luna → `5→25`。
-即 100/天 ≈ **5 次 luna 或 20 次 glm-5.3**。worker.js 对 freebucks 的引用数为 0。
+实测：`full` tier 每日 100 freebucks，`limited` tier 每日 **25**（同一份价目表，所以
+limited 号的可开次数只有 full 号的四分之一）。价目按 wire 下发，2026-09-14 观测到
+`glm-5.3-flash=5`、`kimi-k3-eco=5`、`mimo=10`、`solar-pro4=10`、`ds4f=15`、
+`muse-spark-1.2/1.3=15`、`luna=20`、`luna-es=20`、`gemini-3.8-flash=50`。
+买 glm-5.3 → `daily.spent 0→5`；买 luna → `5→25`。
 
-为什么先不动：接入调度要设计「按 `balance/price` 估算这个号还能开几次」并接进选号排序，
-是独立的一块设计，不是补一个判断。当前按场次调度不会算错方向，只是不够准。
+⚠️ **报价会变**：同一个 `solar-pro4` 在 09-14 的两次探测之间从 5 变成 10。所以实现
+一律从 `freebucks.prices` 读，绝不把价目写进代码 —— 写死的那一刻就开始漂。
+
+已落地（`worker.js`）：
+
+- `recordAccountObservation` 捕获 `freebucks` + `freebucksCheckedAt`，与 `quota` 同为
+  三态：带对象 = 新快照，`null`/缺失 = 保留上一份。上游在 `/session/reuse`、
+  compact 等响应上就是 `freebucks: null`（注释写明「由客户端自己带着」），清空会
+  让刚拿到的报价表凭空消失。6 个 session 观测点全部接入。
+- `freebucksAdmissionsLeft(token, model)` = `floor(daily.remaining / prices[model])`。
+- `admissionsLeft` = `min(remainingQuota, freebucksAdmissionsLeft)`，两者单位相同
+  （都是「还能开几次」），任一为 null 就只看另一个。`pickToken` 的第 ③ 维度改读它。
+
+三条刻意的取舍：
+
+1. **只算 `daily.remaining`，不算 `wallet.balance`。** 上游 `balance` 的定义是两者之和，
+   但动钱包要用户明确同意（`consent_required` + `FreebuffWalletConsent`），代理无权替
+   用户花钱。少算钱包只让估计偏保守；多算会把号送进一个我们必然拿不到的准入。
+2. **`quotaExempt === true` 返回 null**（不构成约束）：服务端授权的豁免，零余额也能开。
+3. **不在报价表里的模型返回 null**：freebucks 管不着它，交给场次维度判断。
+
+为什么这不只是「更准」而是必需：`glm-5.3-flash` 是 `premium: false` 的不计量模型，
+`full` tier 的 `rateLimitsByModel` 里**根本没有它的行**，`remainingQuota` 恒为 null。
+B 项把它放进目录之后，freebucks 成了它唯一的计量信号 —— 不看就只能靠撞
+`spend_limited` 才知道没钱了。
 
 ### C. 提前 DELETE 只退场次，不退 freebucks
 

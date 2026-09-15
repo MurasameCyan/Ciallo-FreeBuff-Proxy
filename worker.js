@@ -1750,6 +1750,10 @@ function recordAccountObservation(token, status, dataOrText, extra = {}) {
   }
 
   const hasQuota = Boolean(extra.quota && typeof extra.quota === "object");
+  // freebucks 与 quota 同样是三态：带对象 = 新快照，null/缺失 = 这次响应没带
+  // （上游在 reuse、compact 等响应上就是 `freebucks: null`，注释写明「由客户端
+  // 自己带着，不再重发」），必须保留上一份而不是清空。
+  const hasFreebucks = Boolean(extra.freebucks && typeof extra.freebucks === "object");
   const hasScopedQuota = Boolean(rateLimit && rateLimit.reason === "quota");
   const observedAt = Date.now();
   const retryAfterMs = hasScopedQuota && Number.isFinite(Number(rateLimit.retryAfterMs))
@@ -1763,6 +1767,8 @@ function recordAccountObservation(token, status, dataOrText, extra = {}) {
     uid: extra.uid || previous.uid || null,
     quota: hasQuota ? extra.quota : previous.quota || null,
     quotaCheckedAt: hasQuota ? observedAt : previous.quotaCheckedAt || null,
+    freebucks: hasFreebucks ? extra.freebucks : previous.freebucks || null,
+    freebucksCheckedAt: hasFreebucks ? observedAt : previous.freebucksCheckedAt || null,
     quotaScope: hasScopedQuota ? rateLimit.scope : state === "ok" ? null : previous.quotaScope || null,
     quotaModel: hasScopedQuota
       ? (extra.model ? String(extra.model) : null)
@@ -2700,6 +2706,10 @@ function pickToken(env, sessionModel, attempted = new Set(), client = null) {
   // ② 然后是该模型上没挂着别的 Key 会话的号（避免上下文污染，同模型优先换号新建）；
   // ③ 最后把新鲜的正剩余额度按降序提到前面；未知仍在已知 0 之前。
   // ①在②前面：抢占别人的会话既毁掉对方的上下文又白扣一份额度，比共用一条会话更糟。
+  //
+  // ③ 的「剩余」取场次额度与 freebucks 报价里更紧的那个（admissionsLeft）：
+  // 2026-09 上游把计价搬到 freebucks 之后，光看场次会把号送进一个必然
+  // spend_limited 的准入 —— 场次剩 5 次、daily 只剩 10 时 luna（20）一次都开不了。
   const candidates = [];
   const nowTs = Date.now();
   for (let k = 0; k < finalPool.length; k++) {
@@ -2714,7 +2724,7 @@ function pickToken(env, sessionModel, attempted = new Set(), client = null) {
         conflict: hasConflictingSession(t, sessionModel) ? 1 : 0,
         foreign: isLiveSession(cached) && !sessionOwnedByClient(client, t, sessionModel, cached) ? 1 : 0,
         waiting: recentlyWaitingRoom(t, env, nowTs) ? 1 : 0,
-        remaining: remainingQuota(t, sessionModel),
+        remaining: admissionsLeft(t, sessionModel),
       });
     }
   }
@@ -3140,7 +3150,8 @@ function exhaustedQuotaScope(info, sessionModel) {
   return null;
 }
 
-// 仅供流式无首数据时确认对应额度池是否耗尽；不参与账号轮询排序。
+// 场次额度行给出的「还能开几次」。经 admissionsLeft 汇入 pickToken 的排序维度，
+// 也供流式无首数据时确认对应额度池是否耗尽。
 function remainingQuota(token, sessionModel) {
   const h = acctHealth.get(token);
   if (!h || !h.quota || !Number.isFinite(Number(h.quotaCheckedAt))) return null;
@@ -3149,6 +3160,52 @@ function remainingQuota(token, sessionModel) {
     .map(quotaConstraintRemaining)
     .filter((value) => value !== null);
   return remaining.length ? Math.min(...remaining) : null;
+}
+
+// 这个号按 freebucks 还能开几次 `sessionModel` 的会话。
+//
+// 2026-09 上游把免费模式的计价搬到了 freebucks：每天 100，每个模型一个报价
+// （2026-09-14 实测 glm-5.3-flash=5 / mimo=10 / ds4f=15 / luna=20 / gemini-3.8=50），
+// 买一次会话就从 `daily` 段扣掉一份报价。这是**独立于场次额度**的第二道闸：
+// 场次还剩 5 次，但 daily 只剩 10 freebucks 时，luna（20）已经一次都开不了了。
+//
+// 对 glm-5.3-flash 这类 `premium: false` 的不计量模型，它更是唯一的计量信号 ——
+// 那些模型在 rateLimitsByModel 里根本没有行（实测 full tier 无此行），
+// remainingQuota 恒为 null，不看 freebucks 就只能靠撞 spend_limited 才知道没钱了。
+//
+// ⚠️ 只算 `daily.remaining`，**不算 wallet.balance**。上游 balance 的定义是
+// `daily.remaining + wallet.balance`，但动钱包那部分要用户明确同意
+// （consent_required + FreebuffWalletConsent，见 SessionRefusedError），代理无权
+// 替用户花钱包余额。少算 wallet 只会让估计偏保守，多算会让调度把号送进
+// 一个需要用户点头、而我们必然拿不到的准入。
+//
+// 返回 null = 没有约束或无法判断（没快照、快照过期、上游没给这个模型报价、
+// 服务端授权了 quotaExempt），交给其他维度决定，不猜。
+function freebucksAdmissionsLeft(token, sessionModel) {
+  const h = acctHealth.get(token);
+  const fb = h?.freebucks;
+  if (!fb || typeof fb !== "object") return null;
+  if (!Number.isFinite(Number(h.freebucksCheckedAt))) return null;
+  if (Date.now() - Number(h.freebucksCheckedAt) > HEALTH_OBSERVATION_TTL_MS) return null;
+  // 服务端授权的额度豁免：零余额也能开，不构成约束。
+  if (fb.quotaExempt === true) return null;
+  const price = Number(fb.prices?.[String(sessionModel || "")]);
+  // 不在报价表里 = 这个模型不上计价表，freebucks 管不着它。
+  if (!Number.isFinite(price) || price <= 0) return null;
+  const remaining = Number(fb.daily?.remaining);
+  if (!Number.isFinite(remaining)) return null;
+  return Math.max(0, Math.floor(remaining / price));
+}
+
+// 「这个号还能开几次这个模型」的合并结论：场次额度行与 freebucks 报价都在回答
+// 同一个问题，单位也相同，所以取更紧的那个。任一为 null（无约束/未知）就只看另一个；
+// 两个都 null 才返回 null，由 pickToken 落回轮询顺序。
+function admissionsLeft(token, sessionModel) {
+  const values = [
+    remainingQuota(token, sessionModel),
+    freebucksAdmissionsLeft(token, sessionModel),
+  ].filter((value) => value !== null);
+  return values.length ? Math.min(...values) : null;
 }
 
 // 长流不应因为固定秒数被误杀：只有上游额度探测明确表示不可用时，
@@ -3443,6 +3500,7 @@ async function confirmTokenInvalid(token, sessionModel) {
   );
   recordAccountObservation(token, probe.status, probe.data ?? probe.text, {
     quota: probe.data?.rateLimitsByModel || null,
+    freebucks: probe.data?.freebucks || null,
     uid: probe.data?.uid || null,
     retryAfterMs: probe.data?.retryAfterMs,
     headers: probe.headers,
@@ -4272,6 +4330,7 @@ async function verifySessionInBackground(token, sessionModel) {
       DESKTOP_INCLUDE_RATE_LIMITS, SESSION_TIMEOUT_MS);
     recordAccountObservation(token, cur.status, cur.data, {
       quota: cur.data?.rateLimitsByModel || null,
+      freebucks: cur.data?.freebucks || null,
       uid: cur.data?.uid || null,
       retryAfterMs: cur.data?.retryAfterMs,
       headers: cur.headers,
@@ -4343,6 +4402,7 @@ async function createSession(token, sessionModel, forceCreate = false, client = 
         DESKTOP_INCLUDE_RATE_LIMITS, SESSION_TIMEOUT_MS);
       recordAccountObservation(token, cur.status, cur.data, {
         quota: cur.data?.rateLimitsByModel || null,
+        freebucks: cur.data?.freebucks || null,
         uid: cur.data?.uid || null,
         retryAfterMs: cur.data?.retryAfterMs,
         headers: cur.headers,
@@ -4378,6 +4438,7 @@ async function createSession(token, sessionModel, forceCreate = false, client = 
         { "x-freebuff-model": sessionModel, "x-freebuff-instance-id": instId, "Content-Type": "application/json" }, SESSION_TIMEOUT_MS);
       recordAccountObservation(token, resp.status, resp.data, {
         quota: resp.data?.rateLimitsByModel || null,
+        freebucks: resp.data?.freebucks || null,
         uid: resp.data?.uid || null,
         retryAfterMs: resp.data?.retryAfterMs,
         headers: resp.headers,
@@ -4411,6 +4472,7 @@ async function createSession(token, sessionModel, forceCreate = false, client = 
         undefined, SESSION_TIMEOUT_MS);
       recordAccountObservation(token, cur.status, cur.data, {
         quota: cur.data?.rateLimitsByModel || null,
+        freebucks: cur.data?.freebucks || null,
         headers: cur.headers,
         model: sessionModel,
       });
@@ -4438,6 +4500,7 @@ async function createSession(token, sessionModel, forceCreate = false, client = 
         const q = await enqueueUp("GET", "/api/v1/freebuff/session", token, undefined, { "x-freebuff-instance-id": inst }, SESSION_TIMEOUT_MS);
         recordAccountObservation(token, q.status, q.data, {
           quota: q.data?.rateLimitsByModel || null,
+          freebucks: q.data?.freebucks || null,
           uid: q.data?.uid || null,
           retryAfterMs: q.data?.retryAfterMs,
           headers: q.headers,
