@@ -76,8 +76,9 @@ const DYNAMIC_MODELS_FETCH_TIMEOUT_MS = 10000;
 let dynamicModelsCache = {
   fetchedAt: 0,
   models: null, // 动态模型表（含分类）
-  // { premium: Set, standard: Set, glm: Set, perModelCaps: Object, paused: Set|null,
-  //   serviceOnly: Set|null, godOnly: Set|null }。控制名单为 null = 没读到官方名单（兜底路径/
+  // { premium: Set, standard: Set, glm: Set, perModelCaps: Object,
+  //   publicCatalog: Set|null, paused: Set|null, serviceOnly: Set|null,
+  //   godOnly: Set|null }。控制名单为 null = 没读到官方名单（兜底路径/
   // 解析失败），与「读到了但是空」不同：前者由 isPausedModelId / isHiddenModelId 落静态
   // 兜底 fail closed，后者才代表官方确实全部恢复了。
   pool: null,
@@ -358,7 +359,7 @@ function collectArrayBodies(cleaned) {
 // #1801 那个循环。判据必须与上游一致：**进了目录数组** 且自己 premium: true。
 // 条件 spread 一律按「包含」处理：读不到运行期 flag，宁可多认一个成员（当前唯一
 // 一例 MIMO_V25_MODEL 是 premium: false，不进 premium），也不漏掉真的 premium 行。
-function catalogPremiumModelIds(cleaned, modelObjects) {
+function catalogModelIds(cleaned, modelObjects, arrayNames = ["FREEBUFF_MODELS"]) {
   const byName = new Map(modelObjects.map((model) => [model.name, model]));
   const bodies = collectArrayBodies(cleaned);
   const members = new Set();
@@ -373,14 +374,21 @@ function catalogPremiumModelIds(cleaned, modelObjects) {
       else walk(token);
     }
   };
-  walk("FREEBUFF_MODELS");
-  walk("FREEBUFF_WEB_ALL_MODELS");
-  const ids = [];
-  for (const name of members) {
-    const model = byName.get(name);
-    if (model?.premium) ids.push(model.id);
-  }
-  return ids;
+  for (const arrayName of arrayNames) walk(arrayName);
+  return [...members].map((name) => byName.get(name)?.id).filter(Boolean);
+}
+
+function parsePublicCatalogModelIds(source, modelIdConstants) {
+  const cleaned = stripSourceComments(source);
+  const bodies = collectArrayBodies(cleaned);
+  if (!bodies.has("FREEBUFF_MODELS")) return null;
+  return catalogModelIds(cleaned, parseModelObjects(cleaned, modelIdConstants));
+}
+
+function catalogPremiumModelIds(cleaned, modelObjects) {
+  const byName = new Map(modelObjects.map((model) => [model.name, model]));
+  return catalogModelIds(cleaned, modelObjects, ["FREEBUFF_MODELS", "FREEBUFF_WEB_ALL_MODELS"])
+    .filter((id) => [...byName.values()].some((model) => model.id === id && model.premium));
 }
 
 function parseModelPools(source, modelIdConstants) {
@@ -457,8 +465,9 @@ function parseModelPools(source, modelIdConstants) {
   // 名单为空是合法状态（2026-09-02 之前一直是空的），所以「源里没有这张表」必须与
   // 「读到了但是空」分开：没有 → null，让调用层落静态兜底。
   const serviceOnly = parseStrictModelList(cleaned, "FREEBUFF_SERVICE_ONLY_MODEL_IDS", modelIdConstants);
+  const publicCatalog = parsePublicCatalogModelIds(source, modelIdConstants);
   // FREEBUFF_PREMIUM_MODEL_IDS 与 FREEBUFF_WEB_PREMIUM_MODEL_IDS 都算 premium。
-  return { premium: [...premium], glm: [...glm], perModelCaps, paused, serviceOnly,
+  return { premium: [...premium], glm: [...glm], perModelCaps, publicCatalog, paused, serviceOnly,
     godOnly: parseGodOnlyModels(source, modelIdConstants) };
 }
 
@@ -726,11 +735,13 @@ async function performDynamicModelsRefresh() {
       }
     } else {
       const pools = parseModelPools(modelsSrc, modelIdConstants);
+      if (!Array.isArray(pools.publicCatalog)) throw new Error("official public catalog missing");
       const pool = {
         premium: new Set(pools.premium),
         standard: null,
         glm: new Set(pools.glm),
         perModelCaps: pools.perModelCaps || {},
+        publicCatalog: new Set(pools.publicCatalog),
         paused: pools.paused ? new Set(pools.paused) : null,
         // null 与空集合含义不同：null = 官方源里读不到这张表 → 隐藏落静态兜底。
         serviceOnly: pools.serviceOnly ? new Set(pools.serviceOnly) : null,
@@ -821,13 +832,15 @@ async function tryReleaseFallback() {
         const resp = await Promise.race([fetch(url, { signal: ctrl.signal }), timeout]);
         if (resp.ok) {
           const json = await Promise.race([resp.json(), timeout]);
-          if (json && Array.isArray(json.models) && json.models.length > 0) {
+          if (json && Array.isArray(json.models) && json.models.length > 0
+            && Array.isArray(json.upstream?.cliCatalog)) {
             const pool = {
               premium: new Set(json.pools?.premium ?? []),
               standard: null,
               glm: new Set(json.pools?.glm ?? []),
               perModelCaps: json.upstream?.perModelCaps && typeof json.upstream.perModelCaps === "object"
                 ? json.upstream.perModelCaps : {},
+              publicCatalog: new Set(json.upstream.cliCatalog),
               paused: Array.isArray(json.upstream?.paused) ? new Set(json.upstream.paused) : null,
               // 兜底 JSON 里没有这块（旧 Releases 资产就没有）时保持 null，
               // 让隐藏落静态兜底，而不是当成「官方名单是空的」。
@@ -6601,6 +6614,10 @@ async function handleModels(client = null, { forceRefresh = false } = {}) {
   // 模型目录，否则客户端会先选中再收到上游 409。
   const snapshotCache = refreshResult.cache;
   const snapshotAvailability = refreshResult.availability;
+  const publicCatalog = snapshotCache.pool?.publicCatalog;
+  if (publicCatalog instanceof Set) {
+    modelList = modelList.filter((model) => publicCatalog.has(model.id));
+  }
   const restrictedIds = new Set(MODEL_TIERS.find(([tier]) => tier === "limited")?.[1] || []);
   for (const model of modelList) if (model.tier === "limited") restrictedIds.add(model.id);
   const hiddenModels = [...restrictedIds].filter((id) => {

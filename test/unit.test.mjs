@@ -1281,6 +1281,9 @@ export const FREEBUFF_WEB_BASE3_AGENT_ID_BY_MODEL: Record<string, string> = {
   models: `
 export const FREEBUFF_MIMO_V25_MODEL_ID = 'mimo/mimo-v2.5'
 export const FREEBUFF_PROBE_MODEL_ID = 'probe/endpoint-gated'
+const MIMO_V25_MODEL = { id: FREEBUFF_MIMO_V25_MODEL_ID, premium: false }
+const PROBE_MODEL = { id: FREEBUFF_PROBE_MODEL_ID, premium: false }
+export const FREEBUFF_MODELS = [MIMO_V25_MODEL, PROBE_MODEL] as const
 export const FREEBUFF_PREMIUM_MODEL_IDS = [] as const
 export const FREEBUFF_WEB_PREMIUM_MODEL_IDS = [...FREEBUFF_PREMIUM_MODEL_IDS] as const
 export const FREEBUFF_GLM_V52_MODEL_IDS = [] as const
@@ -1752,6 +1755,7 @@ await tAsync('官方源码失败改走 Release 兜底时仍检查 endpoints', as
       return modelRefreshResponse(200, {
         models: [{ id: 'probe/endpoint-gated', session: 'probe/endpoint-gated', agent: 'base2-free-probe' }],
         pools: { premium: [], glm: [] },
+        upstream: { cliCatalog: ['probe/endpoint-gated'] },
       });
     }
     if (value.includes('/models/probe/endpoint-gated/endpoints')) {

@@ -12,11 +12,14 @@ function createApi(fetchImpl = async () => new Response('{}')) {
     crypto: { randomUUID: () => 'catalog-refresh-test' }, fetch: fetchImpl,
   };
   vm.runInNewContext(source.replace('export default {', 'const workerDefault = {') + `
-    globalThis.api = { parseModelPools, parseModelIdConstants, isHiddenModelId, handleModels,
+    globalThis.api = { parseModelPools, parseModelIdConstants,
+      parsePublicCatalogModelIds: typeof parsePublicCatalogModelIds === 'function'
+        ? parsePublicCatalogModelIds : undefined,
+      isHiddenModelId, handleModels,
       modelPoolCategory,
       DYNAMIC_MODELS_REFRESH_MS,
       seed(models, pool = {}) { dynamicModelsCache = { fetchedAt: Date.now() - 3600000, models,
-        pool: { premium: new Set(), standard: null, glm: new Set(), perModelCaps: {},
+        pool: { premium: new Set(), standard: null, glm: new Set(), perModelCaps: {}, publicCatalog: null,
           paused: new Set(), serviceOnly: new Set(), godOnly: new Set(), ...pool } }; },
     };`, sandbox);
   return sandbox.api;
@@ -114,6 +117,33 @@ test('premium 池改成从目录成员派生后仍能解析（空池不是合法
   };
   assert.equal(api.modelPoolCategory('openai/gpt-5.6-luna', null, cache), 'premium');
   assert.equal(api.modelPoolCategory('z-ai/glm-5.3-flash', null, cache), 'standard');
+});
+
+test('官方 FREEBUFF_MODELS 目录只解析公开 picker 模型', () => {
+  const api = createApi();
+  const text = `
+    export const PUBLIC_ID = 'public/model';
+    export const PROVISIONED_ID = 'provisioned/model';
+    const PUBLIC_MODEL = { id: PUBLIC_ID, premium: false };
+    const PROVISIONED_MODEL = { id: PROVISIONED_ID, premium: false };
+    export const FREEBUFF_MODELS = [PUBLIC_MODEL] as const;
+    export const FREEBUFF_PROVISIONED_MODELS = [PROVISIONED_MODEL] as const;
+  `;
+  assert.deepEqual([...api.parsePublicCatalogModelIds(text, api.parseModelIdConstants(text))], ['public/model']);
+});
+
+test('动态 root 映射里的 provisioned/internal 模型不进入 /v1/models', async () => {
+  const api = createApi(async () => new Response('', { status: 503 }));
+  api.seed([
+    { id: 'z-ai/glm-5.3-flash', session: 'z-ai/glm-5.3-flash', agent: 'base3-glm' },
+    { id: 'deepseek/deepseek-v4.1-pro', session: 'deepseek/deepseek-v4.1-pro', agent: 'base2-v41' },
+    { id: 'openai/gpt-6-astra-discount-test', session: 'openai/gpt-6-astra-discount-test', agent: 'base2-astra' },
+  ], { publicCatalog: new Set(['z-ai/glm-5.3-flash']) });
+  const body = await (await api.handleModels()).json();
+  const ids = body.data.map((model) => model.id);
+  assert.ok(ids.includes('z-ai/glm-5.3-flash'));
+  assert.ok(!ids.includes('deepseek/deepseek-v4.1-pro'));
+  assert.ok(!ids.includes('openai/gpt-6-astra-discount-test'));
 });
 
 // Releases JSON 兜底与历史快照仍是旧的字面量写法，派生逻辑不能把它顶掉。

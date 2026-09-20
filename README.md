@@ -144,6 +144,10 @@ Cloud 的 runner 开放（服务端持有的 API key 才算数），任何代理
 `/v1/models`、模型解析和额度聚合里一并摘掉，请求在扣额度之前就返回 `unsupported_model`。
 名单是动态的：官方哪天把某个模型移出这张表（2026-08-24 的 `stealth/ox-alpha` 就是这样上 CLI 的），
 它会自动重新出现，不需要改代码。拉不到官方源码时落静态兜底名单，仍然按「隐藏」处理（fail closed）。
+官方 `FREEBUFF_MODELS` 是客户端公开 picker 白名单；动态 root 映射里还可能包含
+`FREEBUFF_PROVISIONED_MODELS` 等仅供服务端按账号授予的模型，它们不会因为能建 root session
+就进入代理的 `/v1/models`。官方目录表缺失或解析不完整时，代理保留上一份成功快照，不把残缺源
+误当成「全量公开目录」。
 
 **Luna 的档位是假的**：官方目录里 Luna 写着 `EFFORTS_THROUGH_MAX`（`low`…`max`），那是 OpenRouter
 广告的元数据。实际链路上 Freebuff 的 `applyFreebuffReasoningDefaults` 会给这条 OpenRouter 路由注入
