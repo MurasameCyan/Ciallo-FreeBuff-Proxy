@@ -58,6 +58,8 @@ jobs:
       - run: node --test test/model-catalog-refresh.test.mjs
       - run: node --test test/model-catalog-ui.test.mjs
       - run: node --test test/model-switch-parallel.test.mjs
+      - run: node --test test/upstream-contract-2026-10.test.mjs
+      - run: node --test test/upstream-watchdog.test.mjs
       - run: node --test test/stream-convergence.test.mjs
       - run: node --test test/account-switch-budget.test.mjs
       - run: node --test test/waiting-room-routing.test.mjs
