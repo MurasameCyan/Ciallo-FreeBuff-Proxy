@@ -1019,6 +1019,44 @@ function serveStatic(req, res, pathname) {
   return true;
 }
 
+// === Prometheus /metrics（面板口令 / HTTP Basic 鉴权）===
+// 只暴露聚合量：账号状态计数、请求/token 总计、存活时长。账号身份（哈希/token/邮箱）
+// 与逐条调用明细留在 /_api/*，不进指标面 —— 指标常被第三方抓取，别把业务明细带出去。
+function metricsText() {
+  const lines = [];
+  const push = (name, help, type, value, labels = '') => {
+    lines.push(`# HELP ${name} ${help}`);
+    lines.push(`# TYPE ${name} ${type}`);
+    lines.push(`${name}${labels} ${value}`);
+  };
+  push('freebuff_up', '1 if the proxy process is answering', 'gauge', 1);
+  push('freebuff_uptime_seconds', 'Process uptime in seconds', 'counter', Math.floor(process.uptime()));
+  const tokens = allTokens();
+  const states = accountStateStore.snapshot(tokens.map((token) => normalizeAccountToken(token)));
+  const counts = { available: 0, banned: 0, token_invalid: 0, manual_disabled: 0 };
+  for (const token of tokens) {
+    const state = states[normalizeAccountToken(token)]?.state;
+    if (state && Object.hasOwn(counts, state)) counts[state] += 1;
+    else counts.available += 1;
+  }
+  lines.push('# HELP freebuff_accounts Account pool size by durable state');
+  lines.push('# TYPE freebuff_accounts gauge');
+  for (const [state, count] of Object.entries(counts)) lines.push(`freebuff_accounts{state="${state}"} ${count}`);
+  const snapshot = typeof handler.usageSnapshot === 'function' ? handler.usageSnapshot() : {};
+  const total = snapshot.total || {};
+  const counters = [
+    ['requests_total', 'Requests recorded since start', [['success', 'success'], ['fail', 'fail']]],
+    ['tokens_total', 'Tokens recorded since start',
+      [['prompt', 'promptTokens'], ['completion', 'completionTokens'], ['reasoning', 'reasoningTokens']]],
+  ];
+  for (const [suffix, help, rows] of counters) {
+    lines.push(`# HELP freebuff_${suffix} ${help}`);
+    lines.push(`# TYPE freebuff_${suffix} counter`);
+    for (const [label, key] of rows) lines.push(`freebuff_${suffix}{kind="${label}"} ${Number(total[key]) || 0}`);
+  }
+  return lines.join('\n') + '\n';
+}
+
 // === 主请求入口 ===
 const server = createServer(async (nodeReq, nodeRes) => {
   const url = new URL(nodeReq.url, `http://${nodeReq.headers.host || 'localhost'}`);
@@ -1027,6 +1065,17 @@ const server = createServer(async (nodeReq, nodeRes) => {
   try {
     // ================= Web 管理 API =================
     if (pathname.startsWith('/_api/')) return handleWebApi(nodeReq, nodeRes, url);
+
+    // ================= Prometheus 指标 =================
+    // 与面板同源鉴权（Cookie 或 HTTP Basic，便于 scrape 配置）。
+    if (nodeReq.method === 'GET' && pathname === '/metrics') {
+      if (!requireAdmin(nodeReq, nodeRes)) {
+        nodeRes.writeHead(401, { 'Content-Type': 'text/plain; charset=utf-8' });
+        return nodeRes.end('unauthorized\n');
+      }
+      nodeRes.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4; charset=utf-8' });
+      return nodeRes.end(metricsText());
+    }
 
     // ================= 静态页面 =================
     if (nodeReq.method === 'GET' && (pathname === '/' || pathname.startsWith('/static/'))) {
@@ -1204,6 +1253,10 @@ function buildWorkerEnv() {
     API_KEY: env.API_KEY || '',
     FREEBUFF_DEBUG: env.FREEBUFF_DEBUG || 'false',
     CODEBUFF_API: env.CODEBUFF_API || '',
+    // 客户端行为链（ads/usage）默认关闭，见 worker.js clientBehaviorEnabled。
+    FREEBUFF_CLIENT_BEHAVIOR: env.FREEBUFF_CLIENT_BEHAVIOR || 'false',
+    // x-fb-timezone 的显式覆盖（不设时由 worker 取宿主时区里可解析的非 UTC 值）。
+    FREEBUFF_TIMEZONE: env.FREEBUFF_TIMEZONE || '',
     MODEL_ALIASES: aliasStr,
     // 分享给别人的那些 key（主 Key 走 FREEBUFF_API_KEY，不在这份表里）。
     // 每条各自限并发/模型/每日上限，worker 只读。

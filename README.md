@@ -73,6 +73,8 @@ docker compose up -d
 | `FREEBUFF_DATA_DIR` | 否 | 数据目录（账号池/Key/模型映射/内核缓存），容器默认 `/data`，本地默认 `./data` |
 | `FREEBUFF_ACCOUNT_STATE_FILE` | 否 | 封禁/凭据失效状态文件，默认位于数据目录 `credentials/account-state.json` |
 | `FREEBUFF_SESSION_WAIT_MS` | 否 | 同一账号的 session 正忙时最多等它多久（默认 `120000`）。免费额度按账号计且只有个位数，等待比换号省额度；设 `0` 则忙时立刻换号 |
+| `FREEBUFF_CLIENT_BEHAVIOR` | 否 | `true` 时代理会替账号发送 ads/usage 行为链（默认 `false`）。上游基座已因「伪造曝光缺卫生头、免费层不结算」删掉整条链，默认不再发这些请求 |
+| `FREEBUFF_TIMEZONE` | 否 | 会话请求 `x-fb-timezone` 的显式覆盖（IANA 名，如 `America/Los_Angeles`）。**不设就不发这个头**（宿主时区不自动声明：可能改变额度重置边界）；想对齐上游太平洋日历日就显式写 |
 
 ### 分享 Key（发给朋友用）
 

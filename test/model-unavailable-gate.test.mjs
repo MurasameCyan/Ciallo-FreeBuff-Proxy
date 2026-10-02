@@ -22,6 +22,9 @@ const workerWrapper = workerSource.replace('export default {', 'const __workerDe
   + 'classifyRateLimit, buildDynamicModelTable, startRunChain, acctHealth, sessCache };\n';
 
 const LUNA = 'openai/gpt-5.6-luna';
+// 需要真正被调度器选中（pickToken 非 null）的用例必须用**当前未 paused** 的模型：
+// gpt-5.6-luna 已进官方 paused 列表，paused 闸门会在 gate 归类之前短路。
+const LIVE_PREMIUM = 'openai/gpt-6-luna';
 // 被测主体必须是**当前未被官方 paused 的**模型：paused 闸门在 gate 归类之前就短路
 // （回 account_pool_unavailable），拿 D4P 这种已撤下的当样本只会测到 paused 闸门。
 // model_unavailable 是上游对在售模型的实时回答，任何活模型都可能收到。
@@ -281,7 +284,7 @@ test('同样是 410 的 session_expired 仍走重建重试，不被 model_unavai
   const workerVm = createWorkerVm({ now: start, fetchImpl: upstream.fetch });
 
   const response = await workerVm.api.executeChat(
-    envFor([token]), chatParams(LUNA), modelCfg(LUNA, 'base2-free-luna'), true, 'chat',
+    envFor([token]), chatParams(LIVE_PREMIUM), modelCfg(LIVE_PREMIUM, 'base2-free-luna'), true, 'chat',
   );
 
   assert.equal(response.status, 200, 'session_expired 应当重建会话后成功');
@@ -377,7 +380,7 @@ test('chat 403 free_mode_legacy_luna_agent：原文回客户端，不换号、�
   workerVm.worker.configureUpstreamRouting({ onReject: (info) => rejects.push(info) });
 
   const response = await workerVm.api.executeChat(
-    envFor(tokens), chatParams(LUNA), modelCfg(LUNA, 'base2-free-luna'), true, 'chat',
+    envFor(tokens), chatParams(LIVE_PREMIUM), modelCfg(LIVE_PREMIUM, 'base2-free-luna'), true, 'chat',
   );
   const body = await response.json();
 
@@ -391,7 +394,7 @@ test('chat 403 free_mode_legacy_luna_agent：原文回客户端，不换号、�
   assert.equal(upstream.created, 1, '每换一个号都要先建会话：luna 一天只有 3 次 admission');
   for (const token of tokens) {
     assert.equal(workerVm.api.cooldownInfo(token), null, `${token} 不该被冷却`);
-    assert.equal(workerVm.api.scopedCooldownInfo(token, LUNA), null, `${token}:LUNA 不该被冷却`);
+    assert.equal(workerVm.api.scopedCooldownInfo(token, LIVE_PREMIUM), null, `${token}:${LIVE_PREMIUM} 不该被冷却`);
   }
 });
 

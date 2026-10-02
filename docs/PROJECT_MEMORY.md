@@ -1,6 +1,6 @@
 # 项目记忆：Freebuff 上游账号安全参考
 
-最后复查：2026-09-14（上游契约漂移实测，见「待跟进的上游变化」一节）
+最后复查：2026-10-03（官方契约漂移 + 竞品新行为落地，见文末「2026-10-03 复查」；上一轮 2026-09-14）
 
 这份文件记录可持续复查的上游来源和本项目实际采用的行为。它不是把上游代码当作依赖；
 修改前先确认当前协议、许可证和测试仍然适用。
@@ -156,3 +156,53 @@ B 项把它放进目录之后，freebucks 成了它唯一的计量信号 —— 
 
 本记忆不指导规避平台检测、批量注册、临时邮箱养号、代理/IP 轮换或 TLS 指纹伪装。账号安全的
 目标是停止重复请求已知坏账号、保留可解释的状态和恢复路径。
+
+## 2026-10-03 复查：官方契约漂移 + 竞品新行为落地
+
+证据：外部工作区 `artifacts/upstream-2026-10-03/`（10 个仓库快照、5 份 scout 报告、离线探针
+`probe-offline.mjs`），以及 `node scripts/check-upstream.mjs` 的哈希 + 语义输出。
+
+### 官方契约（CodebuffAI/freebuff，对照 d534205 → 11350fc）
+- **Levels/Trust 体系退役（2026-09-07）**：`common/src/constants/freebuff-levels.ts` 被删（现 404），
+  `premiumSessionsPerDay` 全局零命中；基线额度改为 `FREEBUFF_PREMIUM_SESSION_LIMIT=5` /
+  `FREEBUFF_LIMITED_SESSION_LIMIT=6`。看门狗 pin 换成 `freebuff-model-entitlements.ts` + `model-config.ts`。
+- **`mimo/mimo-v2.6-pro` 解析丢失（本地实测）**：`freebuff-models.ts:208` 只写 `= mimoModels.mimoV26Pro`，
+  字面量在同目录 `model-config.ts`。worker 新增第 5 个动态源（model-config.ts）+ `knownDefaults` 兜底；
+  离线探针复验 `publicCatalog` 11 行、动态表 63 行。
+- **暂停名单 1 → 5 个**：gpt-5.6-luna / minimax-m3 / deepseek-v4-pro / stealth/ox-alpha / glm-5.2；
+  `PAUSED_QUOTA_MODELS` 静态兜底同步（只影响动态源拉取失败时的 fail-closed 行为）。
+- **wire id 变更**：`anthropic/claude-fable-5` → `…-5.1`；premium 池改为派生式
+  `FREEBUFF_MODELS.filter(m => m.premium)`（worker 早已支持派生解析）。
+- **新 gate**：`freebucks.planRequiredModelIds`（按 viewer 的计划门）已接入 `freebucksGate` 选号；
+  admission 新状态 `first_tab_discount_changed` 先重发一次（同 POST，刷新 freebucks）再面客。
+- 看门狗升级为「哈希 + 语义」两层：把 5 个运行时源喂给 worker 真解析器（VM 内、不联网），
+  与 `scripts/upstream-model-snapshot.json` 比对；解析器退回兜底或目录/名单变化即退出码 1。
+  这层专门覆盖「哈希全绿但解析器悄悄退化」这一类漂移（mimo-v2.6-pro 就是这种）。
+
+### 竞品行为（许可证边界不变：MIT 抄行为需留 notice；无 LICENSE / GPL 只抄思路）
+- **trefeon（MIT）**：FINISH 契约（`steps[].id` 必须 UUIDv4、失败用空 steps、status 诚实）、
+  waiting-room 同会话等一次（`max(Retry-After,10s)` + 0~30% 抖动，每请求一次）、
+  tools 请求 404 `No endpoints found` 去掉 tools 重试一次、DELETE 退款收据 park + 同 instanceId 重放、
+  `x-fb-timezone`（我们改为**仅显式 `FREEBUFF_TIMEZONE` 才发**：宿主时区可能改变额度重置边界，未实测不猜）。
+- **pingmike2（AGPL 基座）**：广告/usage 行为链整条删除（伪造曝光缺 `X-Freebuff-Event-Id` /
+  `X-Freebuff-Render-Delay-Ms` 卫生头、免费层不结算）→ 本地改为默认关闭的 `FREEBUFF_CLIENT_BEHAVIOR`。
+- **HengXin666（MIT）**：freebucks 双账本闸门（`daily_exhausted` / `monthly_exhausted` /
+  `plan_required` 原因细分），全池买不起时回 429 `freebucks_exhausted`（带真实日重置 Retry-After）。
+- **NetroIndonesia（无 LICENSE，仅思路）**：语义漂移看门狗。
+
+### 新增/更新的不变量
+- 会话类调用（POST/GET/DELETE `/api/v1/freebuff/session`，含退款重放）统一走 `sessionHeaders()`；
+  `x-fb-timezone` 只在显式配置且为运行时认识的 IANA 名时发送。
+- agent-runs FINISH 必须带官方 schema 认的 `steps` 数组；失败态写在 run 级 `status`，steps 必须为空。
+- DELETE 的 `freebucksRefundPending` 用同一 `instanceId` 重放直到终态；`404`/非 200 视为已结束；
+  pending 队列由 `createSession` 冷路径惰性驱动（worker 无常驻定时器）。
+- 客户端行为链（ads/impression/usage）默认不发；`FREEBUFF_CLIENT_BEHAVIOR=true` 才发。
+- `accountPoolExhaustion` 把「全池 freebucks 买不起」计入 `allUnavailable`，并单独成一类 429。
+
+### 本轮明确暂缓（需要实测或新流程）
+- foreign-client 降级规避（`mcp__` 工具名前缀 + 真 signature 工具 + 清洗 4 个 harness marker +
+  4 条响应链还原）：官方 `foreign-client-signals.ts` 在 2026-09-23 当天被移出公开镜像，
+  HEAD 是否仍执法未知；需先实测再决定。
+- `x-freebuff-wallet-spend-limit: 0`（IMROVOID 推荐）：与 §E 的实测结论冲突，仍确认无效，不采用。
+- streak 维护（每日 Freebucks bonus）、三态熔断半开、设备码 OAuth 面板登录：各自需要实账号收益验证 /
+  新状态机 / 新面板流程，留作后续。

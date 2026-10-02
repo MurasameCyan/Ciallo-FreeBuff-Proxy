@@ -40,6 +40,10 @@ services:
       # FREEBUFF_READONLY: ${FREEBUFF_READONLY:-false}
       # 封禁/凭据失效状态文件（默认 /data/credentials/account-state.json）
       # FREEBUFF_ACCOUNT_STATE_FILE: ${FREEBUFF_ACCOUNT_STATE_FILE:-}
+      # 客户端行为链（ads/usage）默认关闭；true 才由代理替账号发这些请求
+      # FREEBUFF_CLIENT_BEHAVIOR: ${FREEBUFF_CLIENT_BEHAVIOR:-false}
+      # 会话请求 x-fb-timezone 的显式覆盖（IANA 名，如 America/Los_Angeles）；不设不发
+      # FREEBUFF_TIMEZONE: ${FREEBUFF_TIMEZONE:-}
     volumes:
       # 账号池 / API Key / 模型映射 / mihomo 缓存都落这里。
       # 绑挂到宿主 ./data，方便直接查看和管理账号文件

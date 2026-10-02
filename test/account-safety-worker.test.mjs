@@ -476,9 +476,9 @@ test('quota 冷却按暂停模型的模型级隔离与当前 Premium 共池传�
   assert.equal(workerVm.api.pickToken(env, 'deepseek/deepseek-v4-pro', new Set()), null,
     'D4P 必须被自己的 deepseek_pro 池冷却');
   for (const model of [
-    'openai/gpt-5.6-luna',
+    'openai/gpt-6-luna',
     'deepseek/deepseek-v4-flash',
-    'z-ai/glm-5.2',
+    'z-ai/glm-5.3-flash',
     'mimo/mimo-v2.5',
   ]) {
     const available = workerVm.api.pickToken(env, model, new Set());
@@ -489,7 +489,7 @@ test('quota 冷却按暂停模型的模型级隔离与当前 Premium 共池传�
   workerVm.api.cooldown(token, 60 * 1000, {
     reason: 'quota',
     retryAfterMs: 60 * 1000,
-    model: 'openai/gpt-5.6-luna',
+    model: 'openai/gpt-6-luna',
   });
   // 被试从 DS4F 换成 luna → gemini-3.8-flash：2026-09-14 实测 6 个账号的
   // rateLimitsByModel，DS4F 从未报 premium（full tier 根本没有它的行，limited tier
@@ -529,19 +529,22 @@ test('typed 429 按上游状态选择正确作用域', () => {
 
   // 共享 Premium 的主体换成 luna：官方 FREEBUFF_PREMIUM_MODEL_IDS 现在只剩
   // luna + GLM 5.3 Flash，deepseek_pro / luna 两个独立池名都已被上游删除。
-  const premium = 'openai/gpt-5.6-luna';
+  const premium = 'openai/gpt-6-luna';
   const genericPremium = workerVm.api.classifyRateLimit('{}', 429, {}, premium);
   assert.equal(genericPremium.scope, `model:${premium}`, '无 typed status 时不得扩大到整个 Premium 池');
   const typedPremium = workerVm.api.classifyRateLimit(
     JSON.stringify({ status: 'rate_limited' }), 429, {}, premium,
   );
   assert.equal(typedPremium.scope, 'pool:premium', 'luna typed quota 锁共享 Premium 池');
-  assert.equal(workerVm.api.quotaScopeForModel('openai/gpt-5.6-luna'), 'pool:premium',
+  assert.equal(workerVm.api.quotaScopeForModel('openai/gpt-6-luna'), 'pool:premium',
     'Luna 已并入共享 Premium 池（旧 pool:luna 只剩兼容池名）');
   assert.equal(workerVm.api.quotaScopeForModel('deepseek/deepseek-v4-pro'),
     'model:deepseek/deepseek-v4-pro',
     'D4P 已暂停，静态兜底不得继续声称它占任何共享池');
-  assert.equal(workerVm.api.quotaScopeForModel('z-ai/glm-5.2'), 'pool:glm', 'GLM 静态兜底必须保持独立池');
+  // GLM 5.2 已进官方 paused 列表：静态 glm 池归属不再参与调度，
+  // 冷却只能落在模型级，不能再按独立池写。
+  assert.equal(workerVm.api.quotaScopeForModel('z-ai/glm-5.2'), 'model:z-ai/glm-5.2',
+    '已暂停的 GLM 5.2 必须模型级隔离');
   assert.equal(workerVm.api.quotaScopeForModel('z-ai/glm-5.3-flash', {
     'z-ai/glm-5.3-flash': { recentCount: 0, limit: 2, pool: 'glm_v53_flash' },
   }), 'pool:glm_v53_flash', '上游实时报出的池 token 仍然是权威证据');
@@ -626,7 +629,7 @@ test('glm-5.3-flash 与 Premium 池互不牵连（官方独立 cap 已删除）'
   const premiumVm = createWorkerVm();
   const token = 'glm-v53-decoupled-account-1234567890';
   const glm53 = 'z-ai/glm-5.3-flash';
-  const premium = 'openai/gpt-5.6-luna';
+  const premium = 'openai/gpt-6-luna';
   const env = { FREEBUFF_TOKEN: token, FREEBUFF_ACCOUNT_STATE: {} };
 
   premiumVm.api.cooldown(token, 60 * 1000, {
@@ -653,7 +656,7 @@ test('选号把 freebucks 报价算进剩余额度，钱不够的号让位给场
   const workerVm = createWorkerVm();
   const tokenRich = 'freebucks-sort-rich-account-1234567890';
   const tokenBroke = 'freebucks-sort-broke-account-123456789';
-  const luna = 'openai/gpt-5.6-luna';
+  const luna = 'openai/gpt-6-luna';
   const env = {
     FREEBUFF_TOKEN: `${tokenBroke},${tokenRich}`,
     FREEBUFF_ACCOUNT_STATE: {},
@@ -690,7 +693,7 @@ test('freebucks 只算每日额度，不把钱包余额当成可用额度', () =
   const workerVm = createWorkerVm();
   const walletOnly = 'freebucks-wallet-only-account-123456789';
   const dailyLeft = 'freebucks-daily-left-account-1234567890';
-  const luna = 'openai/gpt-5.6-luna';
+  const luna = 'openai/gpt-6-luna';
   const env = {
     FREEBUFF_TOKEN: `${walletOnly},${dailyLeft}`,
     FREEBUFF_ACCOUNT_STATE: {},
@@ -735,7 +738,7 @@ test('不在报价表里的模型与 quotaExempt 不受 freebucks 约束', () =>
     freebucks: {
       daily: { limit: 100, spent: 100, remaining: 0 },
       wallet: { balance: 0 },
-      prices: { 'openai/gpt-5.6-luna': 20 },
+      prices: { 'openai/gpt-6-luna': 20 },
     },
   });
   const unpriced = workerVm.api.pickToken(env, mimo, new Set());
@@ -744,7 +747,7 @@ test('不在报价表里的模型与 quotaExempt 不受 freebucks 约束', () =>
 
   // quotaExempt：上游明确授权，报价再高也不构成约束。
   const exemptVm = createWorkerVm();
-  const luna = 'openai/gpt-5.6-luna';
+  const luna = 'openai/gpt-6-luna';
   exemptVm.api.recordAccountObservation(token, 200, { status: 'ok' }, {
     quota: { [luna]: { recentCount: 0, limit: 5, pool: 'premium' } },
     freebucks: {
@@ -765,7 +768,7 @@ test('响应没带 freebucks 时保留上一份快照，不清空', () => {
   const workerVm = createWorkerVm();
   const tokenBroke = 'freebucks-keep-broke-account-1234567890';
   const tokenRich = 'freebucks-keep-rich-account-12345678901';
-  const luna = 'openai/gpt-5.6-luna';
+  const luna = 'openai/gpt-6-luna';
   const env = {
     FREEBUFF_TOKEN: `${tokenBroke},${tokenRich}`,
     FREEBUFF_ACCOUNT_STATE: {},
@@ -817,7 +820,7 @@ test('额度快照按上游 pool 选择，不再取任意 Premium 模型行', as
   // 没有自己那一行的共享池模型（Luna：官方独立池已删，静态归属 premium）必须继承
   // 同一个共享池结论。以前这里用 muse 1.2，它现在被服务专用名单隐藏，不再归任何池。
   await assert.rejects(
-    workerVm.api.freshQuotaProbe(token, 'openai/gpt-5.6-luna'),
+    workerVm.api.freshQuotaProbe(token, 'openai/gpt-6-luna'),
     (error) => error?.name === 'QuotaExhaustedError' && error.scope === 'pool:premium',
   );
   await assert.doesNotReject(workerVm.api.freshQuotaProbe(token, 'mimo/mimo-v2.5'));
@@ -887,7 +890,7 @@ test('Premium 快照异常不一致时各模型使用同一保守池结论并忽
       // 2026-08-27 线上形状：DS4F 与 luna 同在 premium 池（deepseek_pro/luna 已被删，
       // V4 Pro 本身也进了 paused 列表，不再参与池聚合）。
       'deepseek/deepseek-v4-flash': { recentCount: 2, limit: 7, pool: 'premium' },
-      'openai/gpt-5.6-luna': { recentCount: 5, limit: 5, pool: 'premium' },
+      'openai/gpt-6-luna': { recentCount: 5, limit: 5, pool: 'premium' },
       'minimax/minimax-m3': { recentCount: 0, limit: 99, pool: 'premium' },
     },
   });
@@ -895,7 +898,7 @@ test('Premium 快照异常不一致时各模型使用同一保守池结论并忽
   // muse-spark 不在这里：它已被 service-only 闸门隐藏，请求在取池结论前就被拒。
   for (const model of [
     'deepseek/deepseek-v4-flash',
-    'openai/gpt-5.6-luna',
+    'openai/gpt-6-luna',
   ]) {
     await assert.rejects(
       workerVm.api.freshQuotaProbe(token, model),
@@ -912,7 +915,7 @@ test('暂停与 god-only 额度行不得把真实 Premium 池算成耗尽', asyn
   const token = 'premium-ghost-rows-account-1234567890';
   const quota = {
     'deepseek/deepseek-v4-flash': { recentCount: 1, limit: 4, pool: 'premium' },
-    'openai/gpt-5.6-luna': { recentCount: 3, limit: 6, pool: 'premium' },
+    'openai/gpt-6-luna': { recentCount: 3, limit: 6, pool: 'premium' },
     'minimax/minimax-m3': { recentCount: 99, limit: 6, pool: 'premium' },
     'deepseek/deepseek-v4-pro': { recentCount: 99, limit: 6, pool: 'premium' },
     'crof/kimi-k3-eco': { recentCount: 99, limit: 6, pool: 'premium' },
@@ -924,11 +927,11 @@ test('暂停与 god-only 额度行不得把真实 Premium 池算成耗尽', asyn
 
   // 聚合结果是 vm 内新建的对象（原型属于 vm），比较前先做一次 JSON 归一。
   assert.deepEqual(
-    JSON.parse(JSON.stringify(workerVm.api.quotaEntryForModel(quota, 'openai/gpt-5.6-luna'))),
+    JSON.parse(JSON.stringify(workerVm.api.quotaEntryForModel(quota, 'openai/gpt-6-luna'))),
     { recentCount: 3, limit: 4, pool: 'premium' },
   );
   await assert.doesNotReject(workerVm.api.freshQuotaProbe(token, 'deepseek/deepseek-v4-flash'));
-  await assert.doesNotReject(workerVm.api.freshQuotaProbe(token, 'openai/gpt-5.6-luna'));
+  await assert.doesNotReject(workerVm.api.freshQuotaProbe(token, 'openai/gpt-6-luna'));
   // 目录侧同样 fail closed：god-only 模型解析不出配置，请求在扣 admission 前就被拒。
   assert.equal(workerVm.api.isHiddenModelId('crof/kimi-k3-eco'), true);
   assert.equal(workerVm.api.isHiddenModelId('crof/kimi-k3-eco-0820'), true,
@@ -976,7 +979,7 @@ test('429 额度冷却的写入池与读取池一致（实时归属覆盖静态�
 test('实时 pool 归属变化后，先前写下的池级冷却仍然有效', () => {
   const workerVm = createWorkerVm();
   const token = 'quota-scope-migration-account-1234567890';
-  const LUNA = 'openai/gpt-5.6-luna';
+  const LUNA = 'openai/gpt-6-luna';
 
   workerVm.api.cooldown(token, 60 * 1000, { reason: 'quota', retryAfterMs: 60 * 1000, model: LUNA });
   const before = workerVm.api.scopedCooldownInfo(token, LUNA);
@@ -995,7 +998,7 @@ test('generic 429 按 Retry-After 锁定当前模型并在到期时恢复', () =
   const start = Date.UTC(2030, 0, 1);
   const workerVm = createWorkerVm({ now: start });
   const token = 'generic-retry-after-account-123456';
-  const model = 'openai/gpt-5.6-luna';
+  const model = 'openai/gpt-6-luna';
   const env = { FREEBUFF_TOKEN: token, FREEBUFF_ACCOUNT_STATE: {} };
   const decision = workerVm.api.classifyRateLimit('{}', 429, { 'Retry-After': '7' }, model, start);
   assert.equal(decision.retryAfterMs, 7000);
@@ -1057,7 +1060,7 @@ test('新鲜额度快照不被旧的 Retry-After 截止时间遮蔽', async () =
   const start = Date.UTC(2030, 0, 1);
   const workerVm = createWorkerVm({ now: start });
   const token = 'retry-after-fresh-quota-account-123456';
-  const model = 'openai/gpt-5.6-luna';
+  const model = 'openai/gpt-6-luna';
 
   workerVm.api.recordAccountObservation(token, 429, {}, {
     model,
@@ -1078,8 +1081,8 @@ test('新鲜额度快照不被旧的 Retry-After 截止时间遮蔽', async () =
 test('startRun 的 typed 429 只锁定对应 quota pool，不污染异池模型', async () => {
   const token = 'start-run-rate-limit-account-123456';
   // 主体换成 luna：glm-5.3-flash 的独立 cap 池已被上游删除，静态兜底不再替它声称池。
-  const sourceModel = 'openai/gpt-5.6-luna';
-  const otherPoolModel = 'z-ai/glm-5.2';
+  const sourceModel = 'openai/gpt-6-luna';
+  const otherPoolModel = 'z-ai/glm-5.3-flash';
   const workerVm = createWorkerVm({
     fetchImpl: async (url) => {
       if (new URL(String(url)).pathname === '/api/v1/agent-runs') {
@@ -1371,8 +1374,8 @@ test('业务 endpoint 瞬时 401 且独立 session 探测成功时不得永久�
     .filter(({ init }) => hasBearer(init))
     .map(({ url }) => new URL(String(url)).pathname);
   assert.deepEqual(bearerPaths, [
-    '/api/v1/ads',
-    '/api/v1/usage',
+    // 客户端行为链（ads/usage）默认关闭：只有显式 FREEBUFF_CLIENT_BEHAVIOR
+    // 才发这两条，这里不再出现在期望序列里。
     '/api/v1/freebuff/session',
     '/api/v1/agent-runs',
     '/api/v1/agent-runs',

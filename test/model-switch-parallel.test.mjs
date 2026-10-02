@@ -30,7 +30,7 @@ const workerWrapper = workerSource.replace('export default {', 'const __workerDe
 // 这组测的是「同一 Key 在会话期内换模型」，需要两个互不相同且都未被官方 paused
 // 的模型。D4P 已撤下（paused 闸门会在换模型逻辑之前就返回），改用 DS4F。
 const DS4F = 'deepseek/deepseek-v4-flash';
-const LUNA = 'openai/gpt-5.6-luna';
+const LUNA = 'openai/gpt-6-luna';
 
 function createWorkerVm({ now, fetchImpl, consoleImpl = console } = {}) {
   let clock = now ?? Date.UTC(2030, 0, 1);

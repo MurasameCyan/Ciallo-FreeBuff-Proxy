@@ -1703,3 +1703,25 @@ test('账号端口范围拒绝越界及 mixed/controller 冲突', () => {
       `非法账号端口 ${accountBase} 应返回明确错误`);
   }
 });
+
+test('Prometheus /metrics：Basic 鉴权后只输出聚合指标，未鉴权 401', async (t) => {
+  const s = await startServer({ ADMIN_PASSWORD: 'metrics-secret' });
+  t.after(() => stopServer(s));
+
+  const unauthorized = await fetch(s.base + '/metrics');
+  assert.equal(unauthorized.status, 401, '未鉴权不得读取指标');
+
+  const response = await fetch(s.base + '/metrics', {
+    headers: { Authorization: 'Basic ' + Buffer.from('x:metrics-secret').toString('base64') },
+  });
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get('content-type') || '', /text\/plain/);
+  const text = await response.text();
+  assert.match(text, /^# TYPE freebuff_up gauge$/m);
+  assert.match(text, /^freebuff_up 1$/m);
+  assert.match(text, /^freebuff_uptime_seconds \d+$/m);
+  assert.match(text, /^freebuff_accounts\{state="available"\} \d+$/m);
+  assert.match(text, /^freebuff_requests_total\{kind="success"\} \d+$/m);
+  assert.match(text, /^freebuff_tokens_total\{kind="prompt"\} \d+$/m);
+  assert.doesNotMatch(text, /enhanced-|token=|@/, '指标面不得出现账号身份/凭据');
+});

@@ -214,7 +214,7 @@ test('非限定模型不受账号准入快照影响', () => {
 
 test('API 目录同步返回隐藏名单，模型进入 Premium 或独立池有余额后恢复', async () => {
   const vmApi = createVm();
-  const id = 'anthropic/claude-fable-5';
+  const id = 'anthropic/claude-fable-5.1';
   vmApi.seedModels([{ id, upstream: id, session: id, agent: 'base3-test', pool: 'standard' }]);
   let body = await (await vmApi.handleModels()).json();
   assert.ok(body.hidden_models.includes(id));
@@ -236,7 +236,7 @@ test('限定型号从当前目录消失时，隐藏名单仍挡住旧额度行�
   const vmApi = createVm();
   vmApi.seedModels([{ id: 'mimo/mimo-v2.5', upstream: 'mimo/mimo-v2.5', session: 'mimo/mimo-v2.5', agent: 'base3-test' }]);
   const body = await (await vmApi.handleModels()).json();
-  assert.ok(body.hidden_models.includes('anthropic/claude-fable-5'));
+  assert.ok(body.hidden_models.includes('anthropic/claude-fable-5.1'));
   assert.ok(body.hidden_models.includes('z-ai/glm-5.2'));
 });
 

@@ -35,11 +35,12 @@ function parseModelAliases(raw) {
 // 真源: https://github.com/CodebuffAI/freebuff (freebuff-private 的 public 镜像)
 // 与 Freebuff Desktop 0.0.51 orchestrator.js 的 FREEBUFF_ROOT_AGENT_ID_BY_MODEL 同源
 // （镜像常量 = 桌面版同源源码，安装包只是编译产物）
-// 需要 4 个源（常量分散定义）：
+// 需要 5 个源（常量分散定义）：
 //   1. free-agents.ts       → FREEBUFF_ROOT_AGENT_ID_BY_MODEL（模型→agent 映射）
 //   2. freebuff-models.ts   → 大部分模型 ID 常量 + 池定义（PREMIUM/GLM）
 //   3. freebuff-model-ids.ts→ deepseek/m3 等 ID 常量（被 models.ts re-export）
 //   4. freebuff-model-entitlements.ts → solar-pro4 的 ID（只在这里声明，models.ts 只 re-export）
+//   5. model-config.ts      → mimoModels.* 成员值（mimo-v2.6-pro 只在这里有字面量）
 // 每源都有 raw 主源 + jsDelivr 备用
 const DYNAMIC_MODELS_SOURCES = [
   "https://raw.githubusercontent.com/CodebuffAI/freebuff/main/common/src/constants/free-agents.ts",
@@ -56,6 +57,14 @@ const DYNAMIC_MODELS_STABLE_IDS_SOURCES = [
 const DYNAMIC_MODELS_ENTITLEMENT_SOURCES = [
   "https://raw.githubusercontent.com/CodebuffAI/freebuff/main/common/src/constants/freebuff-model-entitlements.ts",
   "https://cdn.jsdelivr.net/gh/CodebuffAI/freebuff@main/common/src/constants/freebuff-model-entitlements.ts",
+];
+// model-config.ts 是 `mimoModels` 成员值的唯一声明处。freebuff-models.ts 只写
+//   export const FREEBUFF_MIMO_V26_PRO_MODEL_ID = mimoModels.mimoV26Pro
+// 不拉这个文件就解析不出 mimo/mimo-v2.6-pro（2026-10-03 实测：动态目录 11 行里
+// 静默少一行，publicCatalog 少一行）。可选源：拉失败时 knownDefaults 兜底已知成员。
+const DYNAMIC_MODELS_MODEL_CONFIG_SOURCES = [
+  "https://raw.githubusercontent.com/CodebuffAI/freebuff/main/common/src/constants/model-config.ts",
+  "https://cdn.jsdelivr.net/gh/CodebuffAI/freebuff@main/common/src/constants/model-config.ts",
 ];
 // Releases 兜底源：GitHub Actions 每天生成的解析好的 JSON（无需解析，直接可用）
 // 当官方 3 个源全部失败/解析失败时使用。比 raw.githubusercontent 更稳（GitHub CDN）。
@@ -100,6 +109,8 @@ function parseModelIdConstants(source) {
   const table = {};
   const knownDefaults = {
     mimoV25: "mimo/mimo-v2.5",
+    // model-config.ts 拉不到时的兜底（该文件是 mimoModels 成员值的唯一来源）。
+    mimoV26Pro: "mimo/mimo-v2.6-pro",
   };
   // 先记下对象常量的字符串成员（键为 NAME.成员），供
   //   export const FREEBUFF_SOLAR_PRO_4_MODEL_ID = FREEBUFF_SOLAR_PRO_4_ENTITLEMENT.modelId
@@ -702,12 +713,13 @@ async function performDynamicModelsRefresh() {
   let nextCache = dynamicModelsCache;
   let refreshed = false;
   let source = "cache";
-  // 并行拉 4 个源（每源主 raw + 备 jsDelivr）
-  const [agentsSrc, modelsSrc, stableIdsSrc, entitlementSrc] = await Promise.all([
+  // 并行拉 5 个源（每源主 raw + 备 jsDelivr；model-config 为可选源）
+  const [agentsSrc, modelsSrc, stableIdsSrc, entitlementSrc, modelConfigSrc] = await Promise.all([
     fetchSourceList(DYNAMIC_MODELS_SOURCES),
     fetchSourceList(DYNAMIC_MODELS_MODEL_IDS_SOURCES),
     fetchSourceList(DYNAMIC_MODELS_STABLE_IDS_SOURCES),
     fetchSourceList(DYNAMIC_MODELS_ENTITLEMENT_SOURCES),
+    fetchSourceList(DYNAMIC_MODELS_MODEL_CONFIG_SOURCES),
   ]);
   if (!agentsSrc || !modelsSrc) {
     // 官方源拉取失败：尝试 Releases JSON 兜底
@@ -718,8 +730,10 @@ async function performDynamicModelsRefresh() {
       source = "release";
     }
   } else try {
-    // 合并常量表：models.ts 优先（完整），stableIds.ts 补 deepseek/m3，entitlements.ts 补 solar-pro4
+    // 合并常量表：models.ts 优先（完整），stableIds.ts 补 deepseek/m3，entitlements.ts 补
+    // solar-pro4，model-config.ts 补 mimoModels.* 成员值（可选源，缺省由 knownDefaults 兜底）。
     const modelIdConstants = {
+      ...parseModelIdConstants(modelConfigSrc || ""),
       ...parseModelIdConstants(entitlementSrc || ""),
       ...parseModelIdConstants(stableIdsSrc || ""),
       ...parseModelIdConstants(modelsSrc),
@@ -980,14 +994,21 @@ const MODEL_TIERS = [
   ])],
   ["limited", new Set([
     "z-ai/glm-5.2",
-    "anthropic/claude-fable-5",
+    // 2026-10-03 对齐官方 HEAD：fable-5 的 wire id 已改名为 anthropic/claude-fable-5.1
+    // （FREEBUFF_FABLE_5_1_MODEL_ID），旧 id 上游不再下发。
+    "anthropic/claude-fable-5.1",
   ])],
 ];
 
 // Luna 跟随共享 Premium 归入 US/SG；GLM 5.3 Flash 虽也是 Premium 成员，
 // 但独立 cap 在目录/面板中优先显示为限定 GLM 池。
+// 2026-10-03：luna 被官方暂停后 HEAD 的 premium 成员换成这三行（同池名 premium），
+// 保留暂停中的旧行 —— 它恢复供应时自动回到 us_sg，不用再改代码。
 const POOL_DRIVEN_TIER_MODELS = new Set([
   "openai/gpt-5.6-luna",
+  "openai/gpt-6-luna",
+  "openai/gpt-6.1-sol",
+  "google/gemini-3.8-flash",
 ]);
 // luna 是 premium 的旧兼容池名（见下方额度池说明），上游偶尔还会在旧快照里回它。
 // 不折算的话 luna 拿到 pool='luna' 就两头落空：不等于 "premium" 拿不到 us_sg，
@@ -1023,6 +1044,10 @@ const PAUSED_QUOTA_MODELS = new Set([
   // 被上游识别/替换。代理不能继续把兼容 ID 暴露成可调用模型。
   "deepseek/deepseek-v4-pro",
   "stealth/ox-alpha",
+  // 2026-10-03 对齐官方 HEAD：FREEBUFF_PAUSED_FREE_MODEL_IDS 从 1 个涨到 5 个，
+  // 动态解析会照抄这五个；这里只是拉不到动态源时的静态兜底（fail closed）。
+  "openai/gpt-5.6-luna",
+  "z-ai/glm-5.2",
 ]);
 function pausedModelIds(cache = dynamicModelsCache) {
   const dynamic = cache?.pool?.paused;
@@ -1124,6 +1149,11 @@ const PREMIUM_QUOTA_MODELS = new Set([
   "openai/gpt-5.6-luna-es",
   "meta/muse-spark-1.2-contributor",
   "google/gemini-3.8-flash",
+  // 2026-10-03 对齐官方 HEAD 的派生池（FREEBUFF_MODELS.filter(m => m.premium)）：
+  // gpt-6-luna / gpt-6.1-sol / muse-spark-1.3 / gemini-3.8-flash 为 premium:true。
+  "openai/gpt-6-luna",
+  "openai/gpt-6.1-sol",
+  "meta/muse-spark-1.3-contributor",
 ]);
 const STANDARD_MODELS = new Set([
   "mimo/mimo-v2.5",
@@ -1162,6 +1192,33 @@ function hasSharedTeamLimit(modelId) {
 // 模型选择器用的额度快照头，GET 探测时带它没问题。
 // ---------------------------------------------------------------------------
 const DESKTOP_INCLUDE_RATE_LIMITS = { "x-freebuff-include-unused-rate-limits": "1" };
+
+// ---------------------------------------------------------------------------
+// 会话请求的时区声明（x-fb-timezone）
+// ---------------------------------------------------------------------------
+// 上游按这个头决定账号的"日历日"边界（daily.resetAt）。**只在显式配置时发送**：
+// 代理宿主通常是 UTC 容器或与出口 IP 不一致的本地时区（如 Asia/Shanghai），自动把宿主
+// 时区声明上去可能改变额度重置边界、也和 US/SG 出口不一致；我们尚未实测这种声明的影响，
+// 所以不猜 —— 想对齐上游太平洋日历日的部署显式写 FREEBUFF_TIMEZONE=America/Los_Angeles。
+// UTC / Local / Etc.* / GMT±N 这类"boring"值信息量为零，等于没声明，一律不发。
+let sessionTimeZone = "";
+function resolveSessionTimeZone(env) {
+  const zone = String((env && env.FREEBUFF_TIMEZONE) ?? "").trim();
+  if (!zone) return "";
+  if (zone === "UTC" || zone === "Local" || /^Etc\//i.test(zone) || /^GMT/i.test(zone)) return "";
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: zone });
+    return zone;
+  } catch {
+    return ""; // 不是本运行时认识的 IANA 名：宁可不发，也不发一个会被上游拒/误读的值
+  }
+}
+// 所有 /api/v1/freebuff/session 调用（POST/GET/DELETE，含退款重放）共用的头构造。
+function sessionHeaders(extra) {
+  const headers = { ...(extra || {}) };
+  if (sessionTimeZone) headers["x-fb-timezone"] = sessionTimeZone;
+  return headers;
+}
 
 
 export default {
@@ -1204,6 +1261,8 @@ export default {
       onEgressReject = env && typeof env.FREEBUFF_ON_EGRESS_REJECT === "function"
         ? env.FREEBUFF_ON_EGRESS_REJECT : null;
     }
+    // x-fb-timezone：每请求重算（env 可能带 FREEBUFF_TIMEZONE 覆盖）。
+    sessionTimeZone = resolveSessionTimeZone(env);
     const url = new URL(request.url);
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders() });
 
@@ -2770,8 +2829,11 @@ function accountPoolExhaustion(env, sessionModel = null) {
     state: durableAccountState(acct.token, now)?.state || null,
     lock: scopedCooldownInfo(acct.token, sessionModel, now),
     busy: tokenBusy(acct.token),
+    // freebucks 双账（计划门 + 日/月额度）：见 freebucksGate。null = 无约束/未知。
+    freebucks: freebucksGate(acct.token, sessionModel),
   }));
-  const allUnavailable = details.every((d) => Boolean(d.state || d.lock || d.busy));
+  const allUnavailable = details.every((d) =>
+    Boolean(d.state || d.lock || d.busy || (d.freebucks && d.freebucks.left === 0)));
   const terminalStates = ["banned", "token_invalid", "manual_disabled"];
   if (details.every((d) => terminalStates.includes(d.state))) {
     const states = [...new Set(details.map((d) => d.state))];
@@ -2796,6 +2858,23 @@ function accountPoolExhaustion(env, sessionModel = null) {
     const retryAfterMs = Math.min(...details.map((d) => cooldownRemainingMs(d.lock, now)));
     return { status: 503, type: "upstream_session_unavailable", retryAfterMs, allUnavailable };
   }
+  // 全池都不是坏号，只是这个模型在 freebucks 上买不起（计划门 / 日额度 / 月额度见底）。
+  // 单独成一类：客户端要看到「额度/计划」而不是「账号不可用」，也不该换号重试。
+  const freebucksOnly = details.every((d) =>
+    !d.state && !d.busy && !d.lock && d.freebucks && d.freebucks.left === 0);
+  if (freebucksOnly) {
+    const reasons = [...new Set(details.map((d) => d.freebucks.reason))];
+    const resets = details
+      .map((d) => d.freebucks.resetAtMs)
+      .filter((value) => Number.isFinite(value));
+    return {
+      status: 429,
+      type: "freebucks_exhausted",
+      reason: reasons.length === 1 ? reasons[0] : "mixed",
+      retryAfterMs: resets.length ? Math.max(0, Math.min(...resets) - now) : null,
+      allUnavailable,
+    };
+  }
   return { status: 503, type: "account_pool_unavailable", retryAfterMs: null, allUnavailable };
 }
 
@@ -2814,12 +2893,28 @@ function poolExhaustionResponse(env, sessionModel = null) {
     }, 403);
   }
   if (info.status === 429) {
-    const seconds = Math.max(1, Math.ceil(info.retryAfterMs / 1000));
+    // freebucks 见底的 Retry-After 用上游日重置时刻（拿不到就给 1h 兜底）；
+    // 普通 quota 冷却仍用它自己的 retryAfterMs。
+    const ms = Number.isFinite(info.retryAfterMs)
+      ? info.retryAfterMs
+      : (info.type === "freebucks_exhausted" ? 60 * 60 * 1000 : GENERIC_429_COOLDOWN_MS);
+    const seconds = Math.max(1, Math.ceil(ms / 1000));
+    const freebucksReason = {
+      plan_required: "所在计划不包含该模型",
+      daily_exhausted: "今日 freebucks 额度已用完",
+      monthly_exhausted: "本月 freebucks 额度已用完",
+      mixed: "freebucks 额度已用完",
+    }[info.reason];
+    const message = info.type === "freebucks_exhausted"
+      ? `账号池在 ${sessionModel || "该模型"} 上${freebucksReason || "额度不足"}，换账号也是同一结果；`
+        + `请约 ${seconds}s 后重试，或改用其他模型`
+      : `账号额度已用完,请 ${seconds}s 后重试`;
     return jsonResponse({
       error: {
-        message: `账号额度已用完,请 ${seconds}s 后重试`,
+        message,
         type: info.type,
-        retryAfterMs: info.retryAfterMs,
+        ...(info.reason ? { reason: info.reason } : {}),
+        retryAfterMs: Number.isFinite(info.retryAfterMs) ? info.retryAfterMs : ms,
       },
     }, 429, { "Retry-After": String(seconds), "X-RateLimit-Local": "1" });
   }
@@ -3175,6 +3270,47 @@ function remainingQuota(token, sessionModel) {
   return remaining.length ? Math.min(...remaining) : null;
 }
 
+// 返回 `{ left, reason, resetAtMs }` 或 null（无约束/无法判断）。
+//   left      —— 这个号按 freebucks 还能开几次 `sessionModel`
+//   reason    —— left === 0 时的原因：plan_required / monthly_exhausted / daily_exhausted
+//   resetAtMs —— 日窗口重置时刻（上游 daily.resetAt）
+// 官方 2026-10 的 gate 是两条账：
+//   ① freebucks.planRequiredModelIds 带这个模型 = 该账号（viewer）没有能开它的计划；
+//   ② freebucks.daily.remaining / monthly.remainingUsd 见底。
+// 两者都不是「暂时性」的，换号能拿到不同答案，所以选号阶段就要把它们算成 0。
+function freebucksGate(token, sessionModel) {
+  const h = acctHealth.get(token);
+  const fb = h?.freebucks;
+  if (!fb || typeof fb !== "object") return null;
+  if (!Number.isFinite(Number(h.freebucksCheckedAt))) return null;
+  if (Date.now() - Number(h.freebucksCheckedAt) > HEALTH_OBSERVATION_TTL_MS) return null;
+  // 服务端授权的额度豁免：零余额也能开，不构成约束。
+  if (fb.quotaExempt === true) return null;
+  const model = String(sessionModel || "");
+  const resetAtMs = Date.parse(String(fb.daily?.resetAt || ""));
+  const reset = Number.isFinite(resetAtMs) ? resetAtMs : null;
+  // ① 计划门：server 已经按 viewer 判定「这个模型要付费计划」，比余额更硬。
+  if (Array.isArray(fb.planRequiredModelIds)
+    && fb.planRequiredModelIds.some((id) => String(id) === model)) {
+    return { left: 0, reason: "plan_required", resetAtMs: reset };
+  }
+  // ② 月额度：与日额度并列的一条独立闸（上游 monthly.limitUsd/remainingUsd）。
+  if (fb.monthly && typeof fb.monthly === "object") {
+    const monthlyLeft = Number(fb.monthly.remainingUsd);
+    const monthlyLimit = Number(fb.monthly.limitUsd);
+    if (Number.isFinite(monthlyLeft) && Number.isFinite(monthlyLimit) && monthlyLimit > 0 && monthlyLeft <= 0) {
+      return { left: 0, reason: "monthly_exhausted", resetAtMs: reset };
+    }
+  }
+  const price = Number(fb.prices?.[model]);
+  // 不在报价表里 = 这个模型不上计价表，freebucks 管不着它。
+  if (!Number.isFinite(price) || price <= 0) return null;
+  const remaining = Number(fb.daily?.remaining);
+  if (!Number.isFinite(remaining)) return null;
+  const left = Math.max(0, Math.floor(remaining / price));
+  return { left, reason: left <= 0 ? "daily_exhausted" : null, resetAtMs: reset };
+}
+
 // 这个号按 freebucks 还能开几次 `sessionModel` 的会话。
 //
 // 2026-09 上游把免费模式的计价搬到了 freebucks：每天 100，每个模型一个报价
@@ -3195,19 +3331,8 @@ function remainingQuota(token, sessionModel) {
 // 返回 null = 没有约束或无法判断（没快照、快照过期、上游没给这个模型报价、
 // 服务端授权了 quotaExempt），交给其他维度决定，不猜。
 function freebucksAdmissionsLeft(token, sessionModel) {
-  const h = acctHealth.get(token);
-  const fb = h?.freebucks;
-  if (!fb || typeof fb !== "object") return null;
-  if (!Number.isFinite(Number(h.freebucksCheckedAt))) return null;
-  if (Date.now() - Number(h.freebucksCheckedAt) > HEALTH_OBSERVATION_TTL_MS) return null;
-  // 服务端授权的额度豁免：零余额也能开，不构成约束。
-  if (fb.quotaExempt === true) return null;
-  const price = Number(fb.prices?.[String(sessionModel || "")]);
-  // 不在报价表里 = 这个模型不上计价表，freebucks 管不着它。
-  if (!Number.isFinite(price) || price <= 0) return null;
-  const remaining = Number(fb.daily?.remaining);
-  if (!Number.isFinite(remaining)) return null;
-  return Math.max(0, Math.floor(remaining / price));
+  const gate = freebucksGate(token, sessionModel);
+  return gate ? gate.left : null;
 }
 
 // 「这个号还能开几次这个模型」的合并结论：场次额度行与 freebucks 报价都在回答
@@ -3507,7 +3632,7 @@ async function confirmTokenInvalid(token, sessionModel) {
     "/api/v1/freebuff/session",
     token,
     undefined,
-    DESKTOP_INCLUDE_RATE_LIMITS,
+    sessionHeaders(DESKTOP_INCLUDE_RATE_LIMITS),
     SESSION_TIMEOUT_MS,
     { skipAuthConfirmation: true },
   );
@@ -3539,10 +3664,13 @@ class QuotaExhaustedError extends Error {
 }
 
 class WaitingRoomError extends Error {
-  constructor(retryAfterMs = 30 * 1000) {
+  constructor(retryAfterMs = 30 * 1000, state = "waiting_room_queued") {
     super("session stayed queued (retry later)");
     this.name = "WaitingRoomError";
     this.retryAfterMs = retryAfterMs;
+    // waiting_room_queued = 上游容量队列（等一次通常就过）；
+    // waiting_room_required = 当前 instance 已失效（该重建 session，不该傻等）。
+    this.state = state;
   }
 }
 
@@ -3627,6 +3755,10 @@ const SESSION_REFUSED_STATES = new Set([
   "purchase_claim_released",
   "purchase_in_use",
   "purchase_capacity",
+  // 官方 2026-09 新增：首次 Tab 折扣被服务端改价（`FreebuffSessionAdmissionResponse`
+  // 联合体成员，body 带新的 freebucks 报价）。先重发一次（见 createSession），
+  // 第二次仍拿到它才当拒绝态回客户端 —— 不是账号故障，不冷却不换号。
+  "first_tab_discount_changed",
 ]);
 
 class SessionRefusedError extends Error {
@@ -3722,6 +3854,8 @@ function sessionRefusedResponse(error) {
       + `等它结束后再重试；换账号拿到的是同一个答案。`,
     purchase_capacity: `${model} 的并发槽位已满`
       + `${error?.slotLimit != null ? `（上限 ${error.slotLimit}）` : ""}，请稍后重试。`,
+    first_tab_discount_changed: `${model} 的首次优惠报价刚被上游调整（已重发一次仍被改价），`
+      + `新报价已刷新，请重试；换账号拿到的是同一个报价。`,
   };
   return jsonResponse({
     error: {
@@ -3870,7 +4004,7 @@ function throwIfAdmissionResponse(status, payload, headers, model, quota = null)
   const decision = classifyRateLimit(payload, status, headers, model, Date.now(), quota);
   if (decision.reason === "egress") throw new EgressRejectedError(decision, status);
   if (decision.reason === "waiting_room") {
-    throw new WaitingRoomError(decision.retryAfterMs || 30 * 1000);
+    throw new WaitingRoomError(decision.retryAfterMs || 30 * 1000, decision.state || "waiting_room_queued");
   }
   if (decision.reason !== "quota") return;
   if (status !== 429 && !["rate_limited", "rate_limit_exceeded", "quota_exceeded", "spend_limited"].includes(decision.state)) return;
@@ -3904,9 +4038,71 @@ async function deleteUpstreamSession(token, instanceId, model, { force = false }
   if (!force && last && Date.now() - last < INVALIDATION_WINDOW_MS) return;
   sessionInvalidated.set(key, Date.now());
   try {
-    await enqueueUp("DELETE", "/api/v1/freebuff/session", token, undefined,
-      { "x-freebuff-instance-id": instanceId }, SESSION_TIMEOUT_MS);
+    const resp = await enqueueUp("DELETE", "/api/v1/freebuff/session", token, undefined,
+      sessionHeaders({ "x-freebuff-instance-id": instanceId }), SESSION_TIMEOUT_MS);
+    recordRefundReceipt(token, instanceId, model, resp);
   } catch {}
+}
+
+// ---------------------------------------------------------------------------
+// 提前释放的退款收据（freebucksRefund / freebucksRefundPending）
+// ---------------------------------------------------------------------------
+// DELETE /api/v1/freebuff/session 的响应体带两件事：
+//   freebucksRefund        —— 已结算金额（0 也是「结算为 0」，与未知不同）
+//   freebucksRefundPending —— 结算未完成，要用**同一个 instanceId** 重放 DELETE
+// 旧实现把响应整个丢掉：每次 session 重建 / 换模型 / 失效恢复都会提前释放，
+// 本该退回的 freebucks 就永远没人认领（2026-10-03 对齐 trefeon #13 / HengXin 队列）。
+const PENDING_REFUND_REPLAY_MS = 30 * 1000;
+const PENDING_REFUND_MAX_TRIES = 8;
+const pendingRefunds = new Map(); // `${token}:${instanceId}` -> { token, instanceId, model, at, tries }
+
+function recordRefundReceipt(token, instanceId, model, resp) {
+  const key = token + ":" + instanceId;
+  const data = resp && resp.data;
+  if (!data || typeof data !== "object") return;
+  if (Number.isFinite(Number(data.freebucksRefund))) {
+    const h = acctHealth.get(token) || {};
+    h.lastRefund = { amount: Number(data.freebucksRefund), model: model || null, at: Date.now() };
+    acctHealth.set(token, h);
+    pendingRefunds.delete(key);
+    return;
+  }
+  if (data.freebucksRefundPending === true) {
+    pendingRefunds.set(key, { token, instanceId, model: model || null, at: Date.now(), tries: 0 });
+  }
+}
+
+// 重放同一 instanceId 的 DELETE，直到上游给出终态（金额或不再 pending）。
+// worker 没有常驻定时器，所以由 createSession 的冷路径惰性驱动：闲置账号的
+// pending 要等下次被用到才结算 —— 换来的是不给上游多加后台请求。
+async function replayPendingRefunds(token) {
+  const now = Date.now();
+  for (const [key, entry] of [...pendingRefunds]) {
+    if (entry.token !== token) continue;
+    if (now - entry.at < PENDING_REFUND_REPLAY_MS) continue;
+    if (entry.tries >= PENDING_REFUND_MAX_TRIES) { pendingRefunds.delete(key); continue; }
+    entry.at = now;
+    entry.tries += 1;
+    try {
+      const resp = await enqueueUp("DELETE", "/api/v1/freebuff/session", token, undefined,
+        sessionHeaders({ "x-freebuff-instance-id": entry.instanceId }), SESSION_TIMEOUT_MS);
+      // 404 / 409(invalid|superseded)：实例已经不存在 = 这笔收据到此为止，不再重放。
+      if (resp.status !== 200 || !resp.data || typeof resp.data !== "object") {
+        pendingRefunds.delete(key);
+        continue;
+      }
+      if (Number.isFinite(Number(resp.data.freebucksRefund)) || resp.data.freebucksRefundPending !== true) {
+        const h = acctHealth.get(token) || {};
+        h.lastRefund = {
+          amount: Number.isFinite(Number(resp.data.freebucksRefund)) ? Number(resp.data.freebucksRefund) : 0,
+          model: entry.model,
+          at: Date.now(),
+        };
+        acctHealth.set(token, h);
+        pendingRefunds.delete(key);
+      }
+    } catch { /* 网络失败留待下一轮 */ }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -4260,6 +4456,16 @@ async function fetchStreamWithQuotaGuard(url, init, token, sessionModel, request
 const BEHAVIOR_CACHE_TTL_MS = 30 * 60 * 1000; // 30 分钟
 const behaviorCache = new Map(); // key -> ts
 
+// 客户端行为链（ads 拉取/曝光 + usage 触碰）默认关闭。
+// 2026-10-03 对齐上游基座 pingmike2 的 d74cf9d8 / 1bfbdb6d：官方曝光采样是 100%，
+// 伪造曝光缺 X-Freebuff-Event-Id / X-Freebuff-Render-Delay-Ms 卫生头，免费层不结算
+// 任何东西，只是一条可单独识别的标记；基座因此整条删除。代理保留实现但改为显式
+// 开关（FREEBUFF_CLIENT_BEHAVIOR=true），默认不替账号发这些请求。
+function clientBehaviorEnabled(env) {
+  const raw = String((env && env.FREEBUFF_CLIENT_BEHAVIOR) ?? "").trim().toLowerCase();
+  return raw === "1" || raw === "true" || raw === "yes";
+}
+
 function behaviorDue(key) {
   const ts = behaviorCache.get(key) || 0;
   if (Date.now() - ts > BEHAVIOR_CACHE_TTL_MS) {
@@ -4340,7 +4546,7 @@ function sessionRemainingMs(session, now = Date.now()) {
 async function verifySessionInBackground(token, sessionModel) {
   try {
     const cur = await enqueueUp("GET", "/api/v1/freebuff/session", token, undefined,
-      DESKTOP_INCLUDE_RATE_LIMITS, SESSION_TIMEOUT_MS);
+      sessionHeaders(DESKTOP_INCLUDE_RATE_LIMITS), SESSION_TIMEOUT_MS);
     recordAccountObservation(token, cur.status, cur.data, {
       quota: cur.data?.rateLimitsByModel || null,
       freebucks: cur.data?.freebucks || null,
@@ -4365,14 +4571,21 @@ async function verifySessionInBackground(token, sessionModel) {
   } catch { /* 后台验证失败静默，下次请求自然重建 */ }
 }
 
-async function createSession(token, sessionModel, forceCreate = false, client = null) {
-  // 0) 正常客户端行为：广告链 + usage 触碰（30 分钟节流，失败静默）
-  try {
-    await runNormalClientBehavior(token, stableFingerprint(token));
-  } catch (e) {
-    if (e instanceof TerminalAccountStateError) throw e;
+async function createSession(token, sessionModel, forceCreate = false, client = null, env = null) {
+  // 0) 正常客户端行为：广告链 + usage 触碰（30 分钟节流，失败静默；默认关闭，
+  //    见 clientBehaviorEnabled 的注释）
+  if (clientBehaviorEnabled(env)) {
+    try {
+      await runNormalClientBehavior(token, stableFingerprint(token));
+    } catch (e) {
+      if (e instanceof TerminalAccountStateError) throw e;
+    }
   }
   const key = token + ":" + sessionModel;
+
+  // 0.5) 冷路径：把上一轮提前释放留下的退款收据结算掉（同 instanceId 重放 DELETE）。
+  //      正常情况下 Map 里没有这个 token 的条目，零开销。
+  await replayPendingRefunds(token).catch(() => {});
 
   // 1) 缓存命中 → optimistic reuse（verify window）：
   //    剩余 ≥ SESSION_REUSE_SAFE_MS（60s）直接复用，不打上游；
@@ -4412,7 +4625,7 @@ async function createSession(token, sessionModel, forceCreate = false, client = 
     // 桌面版签名：GET 带 include-unused-rate-limits（模型选择器额度快照头）
     if (!forceCreate) {
       const cur = await enqueueUp("GET", "/api/v1/freebuff/session", token, undefined,
-        DESKTOP_INCLUDE_RATE_LIMITS, SESSION_TIMEOUT_MS);
+        sessionHeaders(DESKTOP_INCLUDE_RATE_LIMITS), SESSION_TIMEOUT_MS);
       recordAccountObservation(token, cur.status, cur.data, {
         quota: cur.data?.rateLimitsByModel || null,
         freebucks: cur.data?.freebucks || null,
@@ -4445,10 +4658,10 @@ async function createSession(token, sessionModel, forceCreate = false, client = 
     //    （服务端 chat gate 不识别多会话实例），所以这里用单会话 + 预生成 instance-id：
     //    既保留桌面版客户端预生成实例的指纹，又确保 chat 能被识别。
     reservation = reserveClientSession(client, flightKey);
-    const postSession = async () => {
+    const postSession = async (discountRetryLeft = 1) => {
       const instId = crypto.randomUUID();
       const resp = await enqueueUp("POST", "/api/v1/freebuff/session", token, undefined,
-        { "x-freebuff-model": sessionModel, "x-freebuff-instance-id": instId, "Content-Type": "application/json" }, SESSION_TIMEOUT_MS);
+        sessionHeaders({ "x-freebuff-model": sessionModel, "x-freebuff-instance-id": instId, "Content-Type": "application/json" }), SESSION_TIMEOUT_MS);
       recordAccountObservation(token, resp.status, resp.data, {
         quota: resp.data?.rateLimitsByModel || null,
         freebucks: resp.data?.freebucks || null,
@@ -4464,6 +4677,12 @@ async function createSession(token, sessionModel, forceCreate = false, client = 
       // model_unavailable：模型全局不可选（联合体里带 availableHours）。不是这个号
       // 的问题，换号只会把同一个结果再要一遍，所以直接抛到最外层回客户端。
       throwIfModelUnavailableResponse(resp, sessionModel);
+      // first_tab_discount_changed：上游刚改了这个号的首次优惠报价，body 里带新报价。
+      // 上面的 recordAccountObservation 已经把新 freebucks 写进健康快照，这里用新报价
+      // 重发一次即可（不是拒绝，也不额外扣 admission —— 同一个 POST 重发）。
+      if (String(resp.data?.status || "") === "first_tab_discount_changed" && discountRetryLeft > 0) {
+        return postSession(discountRetryLeft - 1);
+      }
       // 购买/授权层拒绝（consent_required / purchase_* ）：同样不是这个号的问题，
       // 换号只会把同一个决定再要一遍。直接抛到最外层回客户端。
       throwIfSessionRefusedResponse(resp, sessionModel);
@@ -4510,7 +4729,7 @@ async function createSession(token, sessionModel, forceCreate = false, client = 
       const inst = r.data.instanceId;
       for (let i = 0; i < 8; i++) {
         await sleep(1500);
-        const q = await enqueueUp("GET", "/api/v1/freebuff/session", token, undefined, { "x-freebuff-instance-id": inst }, SESSION_TIMEOUT_MS);
+        const q = await enqueueUp("GET", "/api/v1/freebuff/session", token, undefined, sessionHeaders({ "x-freebuff-instance-id": inst }), SESSION_TIMEOUT_MS);
         recordAccountObservation(token, q.status, q.data, {
           quota: q.data?.rateLimitsByModel || null,
           freebucks: q.data?.freebucks || null,
@@ -4565,14 +4784,34 @@ async function startRun(token, agentId, ancestors = [], sessionModel = null) {
   return r.data.runId;
 }
 
-async function recordStep(token, runId, stepNumber, startTime, children = [], messageId = null) {
-  await enqueueUp("POST", `/api/v1/agent-runs/${runId}/steps`, token,
-    { stepNumber, credits: 0, childRunIds: children, messageId, status: "completed", startTime }, undefined, SESSION_TIMEOUT_MS);
-}
-
-async function finishRun(token, runId, totalSteps) {
-  await enqueueUp("POST", "/api/v1/agent-runs", token,
-    { action: "FINISH", runId, status: "completed", totalSteps, directCredits: 0, totalCredits: 0 }, undefined, SESSION_TIMEOUT_MS);
+// agent-runs 的 FINISH 必须带官方 schema 认的 `steps` 数组：
+//   - `steps[].id` 是 UUID（上游 pendingAgentStepSchema 钉死 `z.string().uuid()`），
+//     非 UUID / 非法 status 会让整个 FINISH 400「Invalid request body」；
+//   - status 只允许 running|completed|skipped —— 失败态写在 run 级 `status`，
+//     此时 steps 必须是空数组（不能塞一个 status:"failed" 的 step）；
+//   - `totalSteps` 与实发 steps 数一致；errorMessage 超长按上游口径截到 5000。
+// 旧实现不带 steps、恒报 completed，而 FINISH 的 400 又被调用方 .catch 吞掉 ——
+// 结果可能是每个 reviewer run 都没真正关掉而且没人知道（2026-10-03 对齐 trefeon #739/#742）。
+async function finishRun(token, runId, { status = "completed", errorMessage = "", steps = null } = {}) {
+  const finalSteps = steps || (status === "completed"
+    ? [{
+      id: crypto.randomUUID(),
+      stepNumber: 1,
+      status: "completed",
+      startTime: utcNow(),
+    }]
+    : []);
+  const body = {
+    action: "FINISH",
+    runId,
+    status,
+    totalSteps: finalSteps.length,
+    directCredits: 0,
+    totalCredits: 0,
+    steps: finalSteps,
+  };
+  if (errorMessage) body.errorMessage = String(errorMessage).slice(0, 5000);
+  await enqueueUp("POST", "/api/v1/agent-runs", token, body, undefined, SESSION_TIMEOUT_MS);
 }
 
 // deepseek 等直接模型：主 run + context-pruner 子 run
@@ -5114,11 +5353,19 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode, requestSig
     let rootRunId = null;
     let reviewerRunId = null;
     let leaseTransferred = false;
+    // run 收尾统一入口：status 必须诚实。失败时 steps 为空数组（见 finishRun 注释），
+    // 绝不能沿用旧的「恒 completed + 无 steps」形状。
+    // ⚠️ 必须声明在 try 外：catch 分支（上游错误 / 429 / 401 / egress 失败…）也要收尾 run。
+    const finishRuns = async (status = "completed", errorMessage = "") => {
+      const opts = { status, ...(errorMessage ? { errorMessage } : {}) };
+      if (reviewerRunId) await finishRun(token, reviewerRunId, opts).catch(() => {});
+      if (rootRunId) await finishRun(token, rootRunId, opts).catch(() => {});
+    };
     try {
       throwIfRequestAborted(requestSignal);
       const t0 = Date.now();
       let effort = "";
-      const sess = await createSession(token, mc.session, false, client);
+      const sess = await createSession(token, mc.session, false, client, env);
       throwIfRequestAborted(requestSignal);
       const root = await startRunChain(token, mc.root_agent || mc.agent, mc.session);
       throwIfRequestAborted(requestSignal);
@@ -5146,8 +5393,7 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode, requestSig
         const text = await resp.text();
         if (isOverloadedFailure(resp.status, text)) {
           callTotals.upstreamError++;
-          if (reviewerRunId) await finishRun(token, reviewerRunId, 1).catch(() => {});
-          if (rootRunId) await finishRun(token, rootRunId, 1).catch(() => {});
+          await finishRuns("failed", "overloaded upstream");
           recordRequest(mc.id, null, false, client);
           return overloadedErrorResponse(retryAfterDelay(resp.headers));
         }
@@ -5163,8 +5409,7 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode, requestSig
         // 410 model_unavailable：模型全局不可选，换号/重建都拿同一个结果。
         // 与 400 同口径就地收尾原文回传，绝不冷却账号（见 ModelUnavailableError）。
         if (isModelUnavailableGate(resp.status, text)) {
-          if (reviewerRunId) await finishRun(token, reviewerRunId, 1).catch(() => {});
-          if (rootRunId) await finishRun(token, rootRunId, 1).catch(() => {});
+          await finishRuns("failed", "model_unavailable");
           recordRequest(mc && mc.id ? mc.id : "", null, false);
           return modelUnavailableResponse(new ModelUnavailableError(mc.session, null, text));
         }
@@ -5173,8 +5418,7 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode, requestSig
           // 冷却+换号只会把整池冷掉（连别的模型一起打不通），换号也是同一个 400，
           // 最后还把上游原文换成"当前没有可用账号"。先收尾 run，再原文回传。
           // 403 free_mode_* gate 也是全池一致的答案，同样就地收尾。
-          if (reviewerRunId) await finishRun(token, reviewerRunId, 1).catch(() => {});
-          if (rootRunId) await finishRun(token, rootRunId, 1).catch(() => {});
+          await finishRuns("failed", lastErrMsg);
           recordRequest(mc && mc.id ? mc.id : "", null, false);
           return jsonResponse({
             error: {
@@ -5192,8 +5436,7 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode, requestSig
       const finalize = async () => {
         if (finalized) return;
         finalized = true;
-        if (reviewerRunId) await finishRun(token, reviewerRunId, 1).catch(() => {});
-        if (rootRunId) await finishRun(token, rootRunId, 1).catch(() => {});
+        await finishRuns("completed");
       };
 
       if (isStream) {
@@ -5247,8 +5490,7 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode, requestSig
       // 还是同一个答案，重建会话更是白扣 admission，所以先收尾 run 再原文回传，
       // 绝不冷却账号（见 ModelUnavailableError）。
       if (e instanceof ModelUnavailableError) {
-        if (reviewerRunId) await finishRun(token, reviewerRunId, 1).catch(() => {});
-        if (rootRunId) await finishRun(token, rootRunId, 1).catch(() => {});
+        await finishRuns("failed", lastErrMsg);
         callTotals.upstreamError++;
         recordRequest(mc && mc.id ? mc.id : "", null, false);
         return modelUnavailableResponse(e);
@@ -5257,8 +5499,7 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode, requestSig
       // purchase_claim_released）：和 model_unavailable 同口径 —— 不是这个号的问题，
       // 换号只会把同一个决定再要一遍，还每次白扣一份 admission。收尾 run 后原文回传。
       if (e instanceof SessionRefusedError) {
-        if (reviewerRunId) await finishRun(token, reviewerRunId, 1).catch(() => {});
-        if (rootRunId) await finishRun(token, rootRunId, 1).catch(() => {});
+        await finishRuns("failed", lastErrMsg);
         callTotals.upstreamError++;
         recordRequest(mc && mc.id ? mc.id : "", null, false);
         return sessionRefusedResponse(e);
@@ -5275,8 +5516,7 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode, requestSig
         pinnedToken = token;
         sameAccountRetries += 1;
       }
-      if (!terminal && reviewerRunId) await finishRun(token, reviewerRunId, 1).catch(() => {});
-      if (!terminal && rootRunId) await finishRun(token, rootRunId, 1).catch(() => {});
+      if (!terminal) await finishRuns("failed", lastErrMsg);
       if (e instanceof QuotaExhaustedError) {
         const ra = e.retryAfterMs || GENERIC_429_COOLDOWN_MS;
         // 团队共享限额（muse-spark）：换号问到的是同一个团队桶，只会白扣 admission。
@@ -5360,6 +5600,9 @@ async function executeChatPooled(env, chatParams, mc, isStream, mode, requestSig
   let lastWaitingRetryAfter = null;
   let lastEgressUnavailable = false;
   let lastModelLocked = null;
+  // 带 tools 的请求撞上「No endpoints found」404 时，去掉 tools 重发一次（只一次）。
+  // 跨账号保留：这是 (模型, 工具集) 组合的上游结果，换号不会变。
+  let toolsStripped = false;
   const attempted = new Set();
   let pinnedToken = null; // 上游抖动后待重试的同一个号
   let sameAccountRetries = 0;
@@ -5438,7 +5681,7 @@ async function executeChatPooled(env, chatParams, mc, isStream, mode, requestSig
       const t0 = Date.now();
       let effort = "";
       // 1) session
-      const sess = await createSession(token, mc.session, false, client);
+      const sess = await createSession(token, mc.session, false, client, env);
       throwIfRequestAborted(requestSignal);
       if (debug) console.log(`[acct ${acctTry + 1}] session=${sess.instanceId}`);
 
@@ -5489,7 +5732,7 @@ async function executeChatPooled(env, chatParams, mc, isStream, mode, requestSig
             }
             await deleteUpstreamSession(token, sessForChat.instanceId, mc.session);
             if (debug) console.log(`[acct ${acctTry + 1}][chat] empty stream, same-model session recovery`);
-            sessForChat = await createSession(token, mc.session, true, client);
+            sessForChat = await createSession(token, mc.session, true, client, env);
             continue;
           }
           throw error;
@@ -5499,6 +5742,18 @@ async function executeChatPooled(env, chatParams, mc, isStream, mode, requestSig
           break;
         }
         errText = await resp.text();
+        // 上游对「带 tools 的请求 + 没有该工具集端点」回 404
+        // {"error":{"message":"No endpoints found for <model>"}}，而同一 body 去掉 tools
+        // 就能跑通（2026-10-03 对齐 trefeon #729/#760）。同会话、同账号去掉 tools/tool_choice
+        // 重发一次；只认这一个 404 形状、只在 tools 非空时重试，其余 404 原样走错误路径。
+        if (resp.status === 404 && !toolsStripped && attempt === 0
+          && Array.isArray(chatParams.tools) && chatParams.tools.length > 0
+          && /No endpoints found/i.test(errText)) {
+          toolsStripped = true;
+          chatParams = { ...chatParams, tools: undefined, tool_choice: undefined };
+          if (debug) console.log(`[acct ${acctTry + 1}][chat] no endpoints for tools, retry without tools`);
+          continue;
+        }
         if (isOverloadedFailure(resp.status, errText)) {
           callTotals.upstreamError++;
           recordRequest(mc.id, null, false, client);
@@ -5507,8 +5762,26 @@ async function executeChatPooled(env, chatParams, mc, isStream, mode, requestSig
         recordAccountObservation(token, resp.status, errText, { headers: resp.headers, model: mc.session });
         throwIfTerminalResponse(token, resp.status, errText);
         if (resp.status === 401) await confirmTokenInvalid(token, mc.session);
-        throwIfAdmissionResponse(resp.status, errText, resp.headers, mc.session,
-          acctHealth.get(token)?.quota || null);
+        try {
+          throwIfAdmissionResponse(resp.status, errText, resp.headers, mc.session,
+            acctHealth.get(token)?.quota || null);
+        } catch (error) {
+          // 等待室（429 waiting_room_queued）是「后端容量暂时满」：同会话等一次通常就过
+          // （2026-10-03 对齐 trefeon #744/#761）。等待 = max(Retry-After, 10s) + 0~30% 抖动，
+          // 整请求最多等一次，且绝不换号、不写冷却 —— 换号问到的是同一个队列。
+          // waiting_room_required(428) 是 session 失效门，由下面的 staleSession 分支处理，不走这里。
+          if (error instanceof WaitingRoomError && error.state === "waiting_room_queued"
+            && attempt === 0 && !requestSignal?.aborted) {
+            const waitMs = Math.min(
+              Math.round(Math.max(Number(error.retryAfterMs) || 0, 10_000) * (1 + Math.random() * 0.3)),
+              45_000,
+            );
+            if (debug) console.log(`[acct ${acctTry + 1}][chat] waiting room, same-session retry in ${waitMs}ms`);
+            await sleep(waitMs);
+            continue;
+          }
+          throw error;
+        }
         // 410 model_unavailable：模型被上游下线/当前时段不可选。endsTheSession 为
         // false —— 会话还是好的，绝不能删会话重建（那是 #1801 的 admission 循环），
         // 也不能冷却这个号或换号。直接抛出去，让外层立刻回客户端。
@@ -5533,7 +5806,7 @@ async function executeChatPooled(env, chatParams, mc, isStream, mode, requestSig
           }
           await deleteUpstreamSession(token, sessForChat.instanceId, mc.session);
           if (debug) console.log(`[acct ${acctTry + 1}][chat] session stale (${resp.status}), recreate…`);
-          sessForChat = await createSession(token, mc.session, true, client);
+          sessForChat = await createSession(token, mc.session, true, client, env);
           continue;
         }
         // 重建后仍失败：该号 session 状态异常，冷却交给外层换号
